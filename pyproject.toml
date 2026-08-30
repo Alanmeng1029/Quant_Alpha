@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "a-share-data-lake"
+version = "0.1.0"
+description = "Local A-share minute-data lake and aggregated daily-bar tooling"
+requires-python = ">=3.11"
+dependencies = [
+  "duckdb>=1.5",
+  "polars>=1.0",
+  "pyarrow>=14",
+]
+
+[project.scripts]
+a-share-data = "a_share_data.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

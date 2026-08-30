@@ -1,0 +1,9 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Local research data and provider files can be large and/or licensed. Keep
+# code, schemas and reproducible commands in Git; keep all local data outside.
+A_stock_database/
