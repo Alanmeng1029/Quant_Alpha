@@ -21,10 +21,11 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--factor-root", required=True, type=Path)
     run.add_argument("--output", required=True, type=Path)
     run.add_argument("--batch-id", required=True, help="Stable ID enables cache and task resume")
-    run.add_argument("--universes", default="csi500,csi300")
+    run.add_argument("--universes", default="csi300_csi500")
     run.add_argument("--tasks")
     run.add_argument("--csi300-config", type=Path, default=Path("configs/factor_eval.yaml"))
     run.add_argument("--csi500-config", type=Path, default=Path("configs/factor_eval_csi500.yaml"))
+    run.add_argument("--csi300-csi500-config", type=Path, default=Path("configs/factor_eval_csi300_csi500.yaml"))
     run.add_argument("--all-config", type=Path, default=Path("configs/factor_eval_all.yaml"))
     run.add_argument("--rebuild-cache", action="store_true")
     run.add_argument("--report-jobs", type=int, default=2)
@@ -42,6 +43,7 @@ def run(args: argparse.Namespace) -> int:
         str(binary), "batch-factor-eval", "--catalog", str(args.catalog), "--factor-root", str(args.factor_root),
         "--output", str(args.output), "--batch-id", args.batch_id, "--universes", args.universes,
         "--csi300-config", str(args.csi300_config), "--csi500-config", str(args.csi500_config),
+        "--csi300-csi500-config", str(args.csi300_csi500_config),
         "--all-config", str(args.all_config),
     ]
     if args.tasks:

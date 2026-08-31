@@ -56,6 +56,32 @@ PYTHONPATH=src /Users/alanmxy/anaconda3/envs/ml311/bin/python -m a_share_data re
 `quant-factor` 用 Python/Polars 生成日频因子；`quant-backtest` 是 Rust
 计算引擎；`quant-report` 只读取结果并渲染 HTML/PDF。
 
+## 正式因子库
+
+研究阶段的因子继续保存在 `lake/derived/factors/**/factor.parquet`，不会自动
+进入正式库。只有人工筛选并注册的日频因子才可进入独立 DuckDB 正式库；分钟
+数据只可作为构建输入，不会作为正式因子值保存。首次创建、导入和启用一个因子：
+
+```bash
+quant-factor-store init --store A_stock_database/lake/production/factor_store.duckdb
+quant-factor-store register --store A_stock_database/lake/production/factor_store.duckdb \
+  --factor-id my_screened_factor_v1 --research-manifest /path/to/manifest.json \
+  --approved-by Alanmxy --approval-note "approved after research review"
+quant-factor-store import-history --store A_stock_database/lake/production/factor_store.duckdb \
+  --factor-id my_screened_factor_v1 --source /path/to/factor.parquet \
+  --start 2026-01-01 --end 2026-08-28
+quant-factor-store activate --store A_stock_database/lake/production/factor_store.duckdb \
+  --factor-id my_screened_factor_v1
+```
+
+每日正式更新由正式计算器生成当天的 `(trade_date, ts_code, factor_value)` Parquet
+后写入；该命令只替换目标交易日的完整截面：
+
+```bash
+quant-factor-store write-day --store A_stock_database/lake/production/factor_store.duckdb \
+  --factor-id my_screened_factor_v1 --trade-date YYYY-MM-DD --source /path/to/daily_factor.parquet
+```
+
 ```bash
 PYTHONPATH=src /Users/alanmxy/anaconda3/envs/ml311/bin/python -m a_share_data build-catalog
 PYTHONPATH=src /Users/alanmxy/anaconda3/envs/ml311/bin/python -m a_share_data.factors build \
@@ -76,15 +102,16 @@ PYTHONPATH=src /Users/alanmxy/anaconda3/envs/ml311/bin/python scripts/verify_gtj
 ## 批量因子预测评估
 
 `batch-factor-eval` 按 Universe 只构建一次市场标签缓存，然后顺序读取因子。
-默认评估中证500和沪深300。全市场及单独 Universe 均保留为显式选项，例如
-`--universes all`、`--universes csi500` 或 `--universes csi300`。
+默认评估一个合并交易池：沪深300 ∪ 中证500（按日去重，约 800 只）。全市场及单独
+Universe 均保留为显式选项，例如 `--universes all`、`--universes csi500` 或
+`--universes csi300`。
 
 ```bash
 PYTHONPATH=src /Users/alanmxy/anaconda3/envs/ml311/bin/python -m a_share_data.batch run \
   --catalog A_stock_database/lake/catalog/a_share.duckdb \
   --factor-root A_stock_database/lake/derived/factors \
   --output results/factor_batches --batch-id first40-cached-v1 \
-  --universes csi500,csi300 --report-jobs 2
+  --universes csi300_csi500 --report-jobs 2
 ```
 
 缓存位于该批次目录的 `_market_labels/<universe>/`，由输入指纹保护；数据或配置变动后使用

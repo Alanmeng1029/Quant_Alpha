@@ -1,0 +1,8 @@
+universe: csi300_csi500
+start: "2018-01-02"
+end: "2026-08-28"
+horizons: [1, 5, 10, 20]
+transaction_cost_bps: 10.0
+portfolio_direction: auto_full_sample_rank_ic
+engine_threads: 8
+memory_limit_mb: 12000

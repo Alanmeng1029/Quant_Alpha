@@ -9,9 +9,11 @@ description = "Local A-share minute-data lake and aggregated daily-bar tooling"
 requires-python = ">=3.11"
 dependencies = [
   "duckdb>=1.5",
+  "lightgbm==4.6.0",
   "jinja2>=3.1",
   "matplotlib>=3.8",
   "numpy>=1.26",
+  "numba>=0.60",
   "pandas>=2.1",
   "polars>=1.0",
   "pyarrow>=14",
@@ -23,8 +25,10 @@ dependencies = [
 [project.scripts]
 a-share-data = "a_share_data.cli:main"
 quant-factor = "a_share_data.factors:main"
+quant-factor-store = "a_share_data.factor_store:main"
 quant-report = "a_share_data.report:main"
 quant-batch = "a_share_data.batch:main"
+quant-predict = "a_share_data.predict:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
