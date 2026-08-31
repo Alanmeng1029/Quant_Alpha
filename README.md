@@ -50,3 +50,43 @@ PYTHONPATH=src /Users/alanmxy/anaconda3/envs/ml311/bin/python -m a_share_data re
 
 `daily_aggregated` 是从分钟数据计算出的日线，不是交易所官方日线；其中
 `missing`、`complete_zero_volume` 都不能解释为停牌。
+
+## 单因子回测
+
+`quant-factor` 用 Python/Polars 生成日频因子；`quant-backtest` 是 Rust
+计算引擎；`quant-report` 只读取结果并渲染 HTML/PDF。
+
+```bash
+PYTHONPATH=src /Users/alanmxy/anaconda3/envs/ml311/bin/python -m a_share_data build-catalog
+PYTHONPATH=src /Users/alanmxy/anaconda3/envs/ml311/bin/python -m a_share_data.factors build \
+  --factor gtja_alpha014_qfq_v1 --start 2018-01-02 --end 2026-08-28
+cargo run --release -p quant-backtest -- factor-eval \
+  --catalog A_stock_database/lake/catalog/a_share.duckdb \
+  --factor A_stock_database/lake/derived/factors/gtja_alpha014_qfq/v1/factor.parquet \
+  --config configs/factor_eval.yaml --output results/gtja_alpha014_qfq_v1
+PYTHONPATH=src /Users/alanmxy/anaconda3/envs/ml311/bin/python -m a_share_data.report render \
+  --input results/gtja_alpha014_qfq_v1/RUN_ID
+
+PYTHONPATH=src /Users/alanmxy/anaconda3/envs/ml311/bin/python scripts/verify_gtja_alpha014.py \
+  --catalog A_stock_database/lake/catalog/a_share.duckdb \
+  --factor A_stock_database/lake/derived/factors/gtja_alpha014_qfq/v1/factor.parquet \
+  --result results/gtja_alpha014_qfq_v1/RUN_ID
+```
+
+## 批量因子预测评估
+
+`batch-factor-eval` 按 Universe 只构建一次市场标签缓存，然后顺序读取因子。
+默认评估中证500和沪深300。全市场及单独 Universe 均保留为显式选项，例如
+`--universes all`、`--universes csi500` 或 `--universes csi300`。
+
+```bash
+PYTHONPATH=src /Users/alanmxy/anaconda3/envs/ml311/bin/python -m a_share_data.batch run \
+  --catalog A_stock_database/lake/catalog/a_share.duckdb \
+  --factor-root A_stock_database/lake/derived/factors \
+  --output results/factor_batches --batch-id first40-cached-v1 \
+  --universes csi500,csi300 --report-jobs 2
+```
+
+缓存位于该批次目录的 `_market_labels/<universe>/`，由输入指纹保护；数据或配置变动后使用
+`--rebuild-cache`。Rust 只落标准 Parquet，Python 在 Rust 完成后生成每个因子的 HTML/PDF、
+`batch_metrics.parquet`、`batch_summary.parquet` 与 `batch_report.html`。

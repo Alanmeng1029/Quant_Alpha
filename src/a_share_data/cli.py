@@ -507,6 +507,7 @@ def cmd_build_daily(args: argparse.Namespace) -> None:
                 sum(volume_lot) AS volume_lot,
                 sum(volume_share) AS volume_share,
                 sum(amount_cny) AS amount_cny,
+                avg(close) AS twap_close,
                 count(*)::INTEGER AS bar_count,
                 sum(CASE WHEN volume_lot = 0 THEN 1 ELSE 0 END)::INTEGER AS zero_volume_bar_count,
                 min(datetime) AS first_bar_time,
@@ -550,6 +551,7 @@ def cmd_build_daily(args: argparse.Namespace) -> None:
                 d.open, d.high, d.low, d.close,
                 d.volume_lot, d.volume_share, d.amount_cny,
                 CASE WHEN d.volume_share > 0 THEN d.amount_cny / d.volume_share ELSE NULL END AS vwap,
+                d.twap_close,
                 d.prev_observed_close,
                 d.raw_close_return,
                 d.bar_count,
@@ -897,6 +899,8 @@ def cmd_build_catalog(args: argparse.Namespace) -> None:
                 CASE WHEN a.validation_status = 'valid' THEN d.high * a.vendor_qfq_ratio END AS qfq_high,
                 CASE WHEN a.validation_status = 'valid' THEN d.low * a.vendor_qfq_ratio END AS qfq_low,
                 CASE WHEN a.validation_status = 'valid' THEN d.close * a.vendor_qfq_ratio END AS qfq_close,
+                CASE WHEN a.validation_status = 'valid' THEN d.vwap * a.vendor_qfq_ratio END AS qfq_vwap,
+                CASE WHEN a.validation_status = 'valid' THEN d.twap_close * a.vendor_qfq_ratio END AS qfq_twap,
                 CASE
                     WHEN d.close IS NOT NULL
                      AND lag(d.close * a.vendor_qfq_ratio) OVER (PARTITION BY d.ts_code ORDER BY d.trade_date) > 0

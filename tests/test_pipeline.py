@@ -51,8 +51,8 @@ class PipelineTest(unittest.TestCase):
 
             conn = duckdb.connect(str(root / "lake" / "catalog" / "a_share.duckdb"), read_only=True)
             try:
-                value = conn.execute("SELECT close, volume_share, qfq_close FROM daily_qfq WHERE trade_date = DATE '2026-01-06'").fetchone()
-                self.assertEqual(value, (12.0, 400, 6.0))
+                value = conn.execute("SELECT close, volume_share, qfq_close, qfq_vwap FROM daily_qfq WHERE trade_date = DATE '2026-01-06'").fetchone()
+                self.assertEqual(value, (12.0, 400, 6.0, 5.875))
                 # The fixture has only two bars per day, so it is correctly
                 # excluded by the full-session eligibility requirement.
                 self.assertEqual(conn.execute("SELECT count(*) FROM trading_universe").fetchone()[0], 0)
