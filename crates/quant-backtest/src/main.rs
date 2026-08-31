@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use duckdb::{AccessMode, Config as DuckDbConfig, Connection, Row};
+use osqp::{CscMatrix, Problem, Settings, Status};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,6 +25,29 @@ enum Command {
     BatchFactorEval(BatchFactorEvalArgs),
     #[command(name = "batch-eval", hide = true)]
     BatchEval(BatchEvalLegacyArgs),
+    OptimizePortfolio(OptimizePortfolioArgs),
+}
+
+#[derive(Parser)]
+struct OptimizePortfolioArgs {
+    #[arg(long)]
+    catalog: PathBuf,
+    #[arg(long)]
+    predictions: PathBuf,
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long)]
+    start: Option<String>,
+    #[arg(long)]
+    end: Option<String>,
+    #[arg(long, default_value_t = 0.10)]
+    max_weight: f64,
+    #[arg(long, default_value_t = 0.05)]
+    industry_tolerance: f64,
+    #[arg(long, default_value_t = 0.10)]
+    turnover_cap: f64,
+    #[arg(long, default_value_t = 10.0)]
+    transaction_cost_bps: f64,
 }
 
 #[derive(Clone, Parser)]
@@ -49,7 +74,7 @@ struct BatchFactorEvalArgs {
     output: PathBuf,
     #[arg(long)]
     batch_id: Option<String>,
-    #[arg(long, value_delimiter = ',', default_values_t = [String::from("csi500"), String::from("csi300")])]
+    #[arg(long, value_delimiter = ',', default_value = "csi300_csi500")]
     universes: Vec<String>,
     #[arg(long, value_delimiter = ',')]
     tasks: Option<Vec<String>>,
@@ -57,6 +82,8 @@ struct BatchFactorEvalArgs {
     csi300_config: PathBuf,
     #[arg(long, default_value = "configs/factor_eval_csi500.yaml")]
     csi500_config: PathBuf,
+    #[arg(long, default_value = "configs/factor_eval_csi300_csi500.yaml")]
+    csi300_csi500_config: PathBuf,
     #[arg(long, default_value = "configs/factor_eval_all.yaml")]
     all_config: PathBuf,
     #[arg(long)]
@@ -76,7 +103,7 @@ struct BatchEvalLegacyArgs {
     batch_id: Option<String>,
     #[arg(long, default_value_t = 1)]
     jobs: usize,
-    #[arg(long, value_delimiter = ',', default_values_t = [String::from("csi500"), String::from("csi300")])]
+    #[arg(long, value_delimiter = ',', default_value = "csi300_csi500")]
     universes: Vec<String>,
     #[arg(long, value_delimiter = ',')]
     tasks: Option<Vec<String>>,
@@ -84,6 +111,8 @@ struct BatchEvalLegacyArgs {
     csi300_config: PathBuf,
     #[arg(long, default_value = "configs/factor_eval_csi500.yaml")]
     csi500_config: PathBuf,
+    #[arg(long, default_value = "configs/factor_eval_csi300_csi500.yaml")]
+    csi300_csi500_config: PathBuf,
     #[arg(long, default_value = "configs/factor_eval_all.yaml")]
     all_config: PathBuf,
     #[arg(long)]
@@ -1214,6 +1243,7 @@ fn run_batch_factor_eval(args: BatchFactorEvalArgs) -> Result<PathBuf> {
         );
     }
     let all_configs = vec![
+        ("csi300_csi500", args.csi300_csi500_config.clone()),
         ("csi300", args.csi300_config.clone()),
         ("csi500", args.csi500_config.clone()),
         ("all", args.all_config.clone()),
@@ -1223,7 +1253,7 @@ fn run_batch_factor_eval(args: BatchFactorEvalArgs) -> Result<PathBuf> {
         .filter(|(universe, _)| args.universes.iter().any(|requested| requested == universe))
         .collect::<Vec<_>>();
     if configs.len() != args.universes.len() {
-        bail!("Unsupported universe in --universes. Use csi300, csi500, or all");
+        bail!("Unsupported universe in --universes. Use csi300_csi500, csi300, csi500, or all");
     }
     let selected_factors = factors
         .into_iter()
@@ -1417,9 +1447,397 @@ fn legacy_batch_args(args: BatchEvalLegacyArgs) -> Result<BatchFactorEvalArgs> {
         tasks: args.tasks,
         csi300_config: args.csi300_config,
         csi500_config: args.csi500_config,
+        csi300_csi500_config: args.csi300_csi500_config,
         all_config: args.all_config,
         rebuild_cache: args.rebuild_cache,
     })
+}
+
+#[derive(Serialize)]
+struct OptimizerWeight {
+    signal_date: String,
+    execution_date: String,
+    ts_code: String,
+    target_weight: f64,
+    alpha_daily: f64,
+    industry: String,
+    solver_status: String,
+}
+#[derive(Serialize)]
+struct OptimizerDay {
+    signal_date: String,
+    execution_date: String,
+    osqp_status: String,
+    iterations: u32,
+    solve_ms: f64,
+    turnover_one_way: f64,
+    max_weight: f64,
+    max_industry_deviation: f64,
+    fallback: bool,
+}
+
+fn sparse_matrix(nrows: usize, ncols: usize, cols: Vec<Vec<(usize, f64)>>) -> CscMatrix<'static> {
+    let mut indptr = Vec::with_capacity(ncols + 1);
+    let mut indices = Vec::new();
+    let mut data = Vec::new();
+    indptr.push(0);
+    for mut col in cols {
+        col.sort_by_key(|x| x.0);
+        for (r, v) in col {
+            if v != 0.0 {
+                indices.push(r);
+                data.push(v);
+            }
+        }
+        indptr.push(data.len());
+    }
+    CscMatrix {
+        nrows,
+        ncols,
+        indptr: Cow::Owned(indptr),
+        indices: Cow::Owned(indices),
+        data: Cow::Owned(data),
+    }
+}
+
+fn heuristic_rebalance(
+    mut weights: Vec<f64>,
+    signals: &[(String, f64)],
+    codes: &[String],
+    index: &HashMap<String, usize>,
+    groups: &BTreeMap<String, Vec<usize>>,
+    max_weight: f64,
+    turnover_cap: f64,
+) -> Vec<f64> {
+    // Deterministic feasible first-pass fallback: transfer weight from the
+    // lowest-alpha to highest-alpha name *inside each industry*.  Industry
+    // totals and the budget are therefore invariant; the sum transferred is
+    // exactly the one-way turnover.
+    let alpha: HashMap<&str, f64> = signals
+        .iter()
+        .map(|(code, value)| (code.as_str(), *value))
+        .collect();
+    let eligible: std::collections::HashSet<&str> = alpha.keys().copied().collect();
+    // Reset to the current point-in-time equal-weight benchmark first.  This
+    // makes the fallback self-contained on universe change days and guarantees
+    // a fully invested published target.
+    weights.fill(0.0);
+    let equal = 1.0 / eligible.len().max(1) as f64;
+    for code in &eligible {
+        weights[index[*code]] = equal;
+    }
+    let mut remaining = turnover_cap;
+    for members in groups.values() {
+        let mut active: Vec<usize> = members
+            .iter()
+            .copied()
+            .filter(|i| eligible.contains(codes[*i].as_str()))
+            .collect();
+        active.sort_by(|a, b| {
+            alpha[codes[*a].as_str()]
+                .partial_cmp(&alpha[codes[*b].as_str()])
+                .unwrap()
+        });
+        let (mut low, mut high) = (0usize, active.len().saturating_sub(1));
+        while low < high && remaining > 1e-12 {
+            let sell = active[low];
+            let buy = active[high];
+            let delta = remaining
+                .min(weights[sell])
+                .min((max_weight - weights[buy]).max(0.0));
+            if delta <= 1e-12 {
+                if weights[sell] <= 1e-12 {
+                    low += 1;
+                }
+                if max_weight - weights[buy] <= 1e-12 {
+                    high = high.saturating_sub(1);
+                }
+                continue;
+            }
+            weights[sell] -= delta;
+            weights[buy] += delta;
+            remaining -= delta;
+        }
+    }
+    weights
+}
+
+fn run_optimizer(args: OptimizePortfolioArgs) -> Result<PathBuf> {
+    // A common positive multiplier preserves the stated objective exactly while
+    // keeping its coefficients near constraint scale for ADMM convergence.
+    const OBJECTIVE_SCALE: f64 = 10_000.0;
+    if !(args.max_weight > 0.0 && args.turnover_cap >= 0.0 && args.industry_tolerance >= 0.0) {
+        bail!("optimizer limits must be non-negative and max-weight positive");
+    }
+    fs::create_dir_all(&args.output)?;
+    let conn = Connection::open_with_flags(
+        &args.catalog,
+        DuckDbConfig::default().access_mode(AccessMode::ReadOnly)?,
+    )?;
+    let p = quote_sql(&args.predictions.canonicalize()?.to_string_lossy());
+    let start = args.start.as_deref().unwrap_or("1900-01-01");
+    let end = args.end.as_deref().unwrap_or("2999-12-31");
+    let mut codes: Vec<String>=conn.prepare("SELECT DISTINCT ts_code FROM index_trading_universe WHERE index_code IN ('000300.SH','000905.SH') ORDER BY ts_code")?.query_map([],|r|r.get(0))?.collect::<std::result::Result<_,_>>()?;
+    if codes.is_empty() {
+        bail!("CSI300/CSI500 master universe is empty");
+    }
+    let n = codes.len();
+    let index: HashMap<String, usize> = codes
+        .iter()
+        .enumerate()
+        .map(|(i, x)| (x.clone(), i))
+        .collect();
+    let mut industry = HashMap::new();
+    for row in conn
+        .prepare("SELECT ts_code, coalesce(industry,'UNKNOWN') FROM instruments")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+    {
+        let (c, i) = row?;
+        industry.insert(c, i);
+    }
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, c) in codes.iter().enumerate() {
+        groups
+            .entry(
+                industry
+                    .get(c)
+                    .cloned()
+                    .unwrap_or_else(|| "UNKNOWN".to_string()),
+            )
+            .or_default()
+            .push(i);
+    }
+    let group_names: Vec<String> = groups.keys().cloned().collect();
+    let g = group_names.len();
+    // rows: budget, w bounds, u bounds, two abs-turnover inequalities, total u, industries.
+    let r_budget = 0;
+    let r_w = 1;
+    let r_u = r_w + n;
+    let r_pos = r_u + n;
+    let r_neg = r_pos + n;
+    let r_sum_u = r_neg + n;
+    let r_ind = r_sum_u + 1;
+    let m = r_ind + g;
+    let vars = 2 * n;
+    let mut a_cols = Vec::with_capacity(vars);
+    for i in 0..n {
+        let mut col = vec![
+            (r_budget, 1.0),
+            (r_w + i, 1.0),
+            (r_pos + i, 1.0),
+            (r_neg + i, -1.0),
+        ];
+        for (j, name) in group_names.iter().enumerate() {
+            if groups[name].binary_search(&i).is_ok() {
+                col.push((r_ind + j, 1.0));
+            }
+        }
+        a_cols.push(col);
+    }
+    for i in 0..n {
+        a_cols.push(vec![
+            (r_u + i, 1.0),
+            (r_pos + i, -1.0),
+            (r_neg + i, -1.0),
+            (r_sum_u, 1.0),
+        ]);
+    }
+    let a = sparse_matrix(m, vars, a_cols);
+    let mut pcols = Vec::with_capacity(vars);
+    for i in 0..vars {
+        pcols.push(if i < n {
+            vec![(i, 1e-6 * OBJECTIVE_SCALE)]
+        } else {
+            // Tiny curvature on u resolves the flat L1 auxiliary face without
+            // altering the stated 10bps turnover economics.
+            vec![(i, 1e-8 * OBJECTIVE_SCALE)]
+        });
+    }
+    let pmat = sparse_matrix(vars, vars, pcols);
+    let mut q = vec![0.0; vars];
+    for x in q[n..].iter_mut() {
+        *x = args.transaction_cost_bps / 10_000.0 * OBJECTIVE_SCALE;
+    }
+    let mut lower = vec![f64::NEG_INFINITY; m];
+    let mut upper = vec![f64::INFINITY; m];
+    upper[r_budget] = 1.0;
+    lower[r_budget] = 1.0;
+    let settings = Settings::default()
+        .verbose(false)
+        // First production pass: daily portfolio limits are percentages, so a
+        // 10bp feasibility tolerance is a useful release gate.  The exported
+        // diagnostics retain all realised deviations for later tightening.
+        .eps_abs(1e-3)
+        .eps_rel(1e-3)
+        .max_iter(100)
+        .polishing(false);
+    let mut problem = Problem::new(pmat, &q, a, &lower, &upper, &settings).context("setup OSQP")?;
+    let query = format!(
+        "SELECT trade_date::VARCHAR AS signal_date, execution_date::VARCHAR, ts_code, alpha_daily FROM read_parquet('{p}') WHERE trade_date BETWEEN DATE '{start}' AND DATE '{end}' AND execution_date IS NOT NULL ORDER BY trade_date, ts_code"
+    );
+    let mut daily: BTreeMap<String, (String, Vec<(String, f64)>)> = BTreeMap::new();
+    for row in conn.prepare(&query)?.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, f64>(3)?,
+        ))
+    })? {
+        let (d, e, c, a) = row?;
+        daily
+            .entry(d)
+            .or_insert_with(|| (e, Vec::new()))
+            .1
+            .push((c, a));
+    }
+    let mut previous = vec![0.0; n];
+    let mut weights = Vec::new();
+    let mut diagnostics = Vec::new();
+    for (day, (execution, signals)) in daily {
+        let eligible: std::collections::HashSet<&str> =
+            signals.iter().map(|x| x.0.as_str()).collect();
+        let equal = 1.0 / eligible.len().max(1) as f64;
+        if previous.iter().all(|x| *x == 0.0) {
+            for (code, _) in &signals {
+                previous[*index.get(code).unwrap()] = equal;
+            }
+        }
+        q[..n].fill(0.0);
+        for (code, alpha) in &signals {
+            q[*index.get(code).unwrap()] = -*alpha * OBJECTIVE_SCALE;
+        }
+        lower.fill(f64::NEG_INFINITY);
+        upper.fill(f64::INFINITY);
+        lower[r_budget] = 1.0;
+        upper[r_budget] = 1.0;
+        for i in 0..n {
+            upper[r_w + i] = if eligible.contains(codes[i].as_str()) {
+                args.max_weight
+            } else {
+                0.0
+            };
+            lower[r_w + i] = 0.0;
+            lower[r_u + i] = 0.0;
+            upper[r_pos + i] = previous[i];
+            upper[r_neg + i] = -previous[i];
+        }
+        lower[r_sum_u] = 0.0;
+        upper[r_sum_u] = 2.0 * args.turnover_cap;
+        for (j, name) in group_names.iter().enumerate() {
+            let count = groups[name]
+                .iter()
+                .filter(|i| eligible.contains(codes[**i].as_str()))
+                .count();
+            let bench = count as f64 * equal;
+            lower[r_ind + j] = (bench - args.industry_tolerance).max(0.0);
+            upper[r_ind + j] = (bench + args.industry_tolerance).min(1.0);
+        }
+        problem.update_lin_cost(&q);
+        problem.update_bounds(&lower, &upper);
+        let result = problem.solve();
+        let status = match &result {
+            Status::Solved(_) => "solved",
+            Status::SolvedInaccurate(_) => "solved_inaccurate",
+            Status::MaxIterationsReached(_) => "max_iterations",
+            Status::TimeLimitReached(_) => "time_limit",
+            Status::PrimalInfeasible(_) => "primal_infeasible",
+            Status::PrimalInfeasibleInaccurate(_) => "primal_infeasible_inaccurate",
+            Status::DualInfeasible(_) => "dual_infeasible",
+            Status::DualInfeasibleInaccurate(_) => "dual_infeasible_inaccurate",
+            Status::NonConvex(_) => "non_convex",
+            Status::__Nonexhaustive => "unknown",
+        }
+        .to_string();
+        let solution = result.x().map(|x| x[..n].to_vec());
+        let fallback = solution.is_none();
+        let next = solution.unwrap_or_else(|| {
+            heuristic_rebalance(
+                previous.clone(),
+                &signals,
+                &codes,
+                &index,
+                &groups,
+                args.max_weight,
+                args.turnover_cap,
+            )
+        });
+        let status = if fallback {
+            "heuristic_fallback".to_string()
+        } else {
+            status
+        };
+        let turnover = next
+            .iter()
+            .zip(&previous)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f64>()
+            / 2.0;
+        let mut max_dev: f64 = 0.0;
+        for (j, name) in group_names.iter().enumerate() {
+            let actual: f64 = groups[name].iter().map(|i| next[*i]).sum();
+            let bench = groups[name]
+                .iter()
+                .filter(|i| eligible.contains(codes[**i].as_str()))
+                .count() as f64
+                * equal;
+            max_dev = max_dev.max((actual - bench).abs());
+        }
+        for (code, alpha) in &signals {
+            let i = index[code];
+            weights.push(OptimizerWeight {
+                signal_date: day.clone(),
+                execution_date: execution.clone(),
+                ts_code: code.clone(),
+                target_weight: next[i],
+                alpha_daily: *alpha,
+                industry: industry
+                    .get(code)
+                    .cloned()
+                    .unwrap_or_else(|| "UNKNOWN".to_string()),
+                solver_status: status.clone(),
+            });
+        }
+        diagnostics.push(OptimizerDay {
+            signal_date: day,
+            execution_date: execution,
+            osqp_status: status,
+            iterations: result.iter(),
+            solve_ms: result.solve_time().as_secs_f64() * 1000.0,
+            turnover_one_way: turnover,
+            max_weight: next.iter().fold(0.0_f64, |a, b| a.max(*b)),
+            max_industry_deviation: max_dev,
+            fallback,
+        });
+        previous = next;
+    }
+    let wt = args.output.join(".target_weights.tsv");
+    let dt = args.output.join(".optimizer_daily.tsv");
+    write_tsv(&weights, &wt)?;
+    write_tsv(&diagnostics, &dt)?;
+    copy_query(
+        &conn,
+        &format!(
+            "SELECT * FROM read_csv('{}', delim='\\t', header=true)",
+            quote_sql(&wt.to_string_lossy())
+        ),
+        &args.output.join("target_weights.parquet"),
+    )?;
+    copy_query(
+        &conn,
+        &format!(
+            "SELECT * FROM read_csv('{}', delim='\\t', header=true)",
+            quote_sql(&dt.to_string_lossy())
+        ),
+        &args.output.join("optimizer_daily.parquet"),
+    )?;
+    let _ = fs::remove_file(wt);
+    let _ = fs::remove_file(dt);
+    write_json_atomic(
+        &args.output.join("summary.json"),
+        &serde_json::json!({"master_universe":n,"industries":g,"days":diagnostics.len(),"max_weight":args.max_weight,"turnover_cap":args.turnover_cap,"industry_tolerance":args.industry_tolerance}),
+    )?;
+    Ok(args.output)
 }
 
 fn main() -> Result<()> {
@@ -1428,6 +1846,7 @@ fn main() -> Result<()> {
         Command::FactorEval(args) => run_factor_eval(args)?,
         Command::BatchFactorEval(args) => run_batch_factor_eval(args)?,
         Command::BatchEval(args) => run_batch_factor_eval(legacy_batch_args(args)?)?,
+        Command::OptimizePortfolio(args) => run_optimizer(args)?,
     };
     println!("{}", output.display());
     Ok(())
