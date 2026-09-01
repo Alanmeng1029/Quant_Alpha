@@ -9,3 +9,8 @@ target/
 # code, schemas and reproducible commands in Git; keep all local data outside.
 A_stock_database/
 results/
+
+# Independently cloned third-party research references. They are intentionally
+# kept outside the project history; record their source and revision separately
+# if a study needs to cite one.
+external/
