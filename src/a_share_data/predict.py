@@ -228,69 +228,6 @@ def run_oos(catalog: Path, feature_root: Path, output: Path, start: str | None =
     (output / "summary.json").write_text(json.dumps(summary,indent=2,default=str)); return summary
 
 
-def build_top_fraction_targets(predictions: Path, output: Path, fraction: float = 0.10, alpha_column: str = "alpha_daily") -> dict:
-    """Select the deterministic top alpha fraction and assign equal target weights.
-
-    Targets are position-to-position: the backtest compares consecutive target
-    weights, so a name retained at the same weight has zero turnover rather
-    than an artificial sell-and-rebuy transaction.
-    """
-    if not 0 < fraction <= 1:
-        raise ValueError("fraction must be in (0, 1]")
-    frame = (
-        pl.read_parquet(predictions)
-        .with_columns(pl.col("trade_date").cast(pl.Date), pl.col("execution_date").cast(pl.Date))
-        .filter(pl.col("execution_date").is_not_null() & pl.col(alpha_column).is_finite() & ~pl.col("ts_code").is_in(INFEASIBLE_EXECUTION_CODES))
-        .sort(["trade_date", alpha_column, "ts_code"], descending=[False, True, False])
-        .with_columns(
-            pl.cum_count("ts_code").over("trade_date").alias("__rank"),
-            pl.len().over("trade_date").alias("__count"),
-        )
-        .filter(pl.col("__rank") <= (pl.col("__count") * fraction).ceil())
-        .with_columns((1.0 / pl.len().over("execution_date")).alias("target_weight"))
-        .select("trade_date", "execution_date", "ts_code", "target_weight", pl.col(alpha_column).alias("alpha_daily"))
-    )
-    if frame.is_empty():
-        raise ValueError("No eligible predictions for top-fraction targets")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    frame.write_parquet(output, compression="zstd")
-    holding_counts = frame.group_by("execution_date").len()["len"]
-    return {
-        "output": str(output), "fraction": fraction, "days": holding_counts.len(),
-        "rows": frame.height, "min_holdings": holding_counts.min(),
-        "median_holdings": holding_counts.median(), "max_holdings": holding_counts.max(),
-    }
-
-
-def optimize_top_n_targets(predictions: Path, output: Path, alpha_column: str, top_n: int = 50, max_weight: float = .10, turnover_penalty_bps: float = 14.1) -> dict:
-    """Top-N long-only rank-alpha portfolio with turnover-aware membership."""
-    if not (top_n > 0 and 0 < max_weight <= 1 and turnover_penalty_bps >= 0):
-        raise ValueError("invalid optimizer limits")
-    source = pl.read_parquet(predictions).with_columns(pl.col("trade_date").cast(pl.Date), pl.col("execution_date").cast(pl.Date))
-    source = source.filter(pl.col("execution_date").is_not_null() & pl.col(alpha_column).is_finite() & ~pl.col("ts_code").is_in(INFEASIBLE_EXECUTION_CODES))
-    rows=[]; previous: dict[str, float] = {}
-    for key, frame in source.partition_by("trade_date", as_dict=True).items():
-        signal_date = key[0] if isinstance(key, tuple) else key
-        ranked = frame.sort([alpha_column, "ts_code"], descending=[True, False])
-        execution_date = ranked["execution_date"][0]
-        all_alpha = dict(ranked.select("ts_code", alpha_column).iter_rows())
-        candidate = set(ranked.head(top_n)["ts_code"].to_list())
-        # Keeping a current name avoids one sell plus one buy.  The bonus is
-        # the stated round-trip cost; it only affects membership, never prices.
-        pool=candidate | set(previous)
-        bonus=turnover_penalty_bps / 10_000.0
-        selected=sorted(pool, key=lambda code: (all_alpha.get(code, float("-inf")) + (bonus if code in previous else 0.0), code), reverse=True)[:top_n]
-        alpha={code:all_alpha[code] for code in selected}
-        ranks={code: top_n-i for i,code in enumerate(sorted(selected, key=lambda c:(all_alpha[c], c), reverse=True))}
-        desired={code: rank/sum(ranks.values()) for code,rank in ranks.items()}
-        if max(desired.values()) > max_weight + 1e-12: raise ValueError("max_weight too low for Top-N rank weights")
-        previous=desired
-        for code,weight in desired.items():
-            rows.append({"trade_date":signal_date,"execution_date":execution_date,"ts_code":code,"target_weight":weight,"alpha_daily":alpha.get(code,0.0),"optimizer":"top_n_rank_turnover_projection"})
-    result=pl.DataFrame(rows); output.parent.mkdir(parents=True, exist_ok=True); result.write_parquet(output, compression="zstd")
-    return {"output":str(output),"days":result.select("trade_date").n_unique(),"rows":result.height,"top_n":top_n,"max_weight":max_weight,"turnover_penalty_bps":turnover_penalty_bps}
-
-
 def optimize_dual_alpha_targets(predictions: Path, output: Path, h1_weight: float = .5, turnover_cap: float = .30, temperature: float = 2.0, max_weight: float = .10) -> dict:
     """Blend cross-sectional h1/h5 alpha, then project targets onto a turnover budget."""
     if not (0 <= h1_weight <= 1 and 0 < turnover_cap <= 1 and temperature > 0 and 0 < max_weight <= 1):
@@ -356,7 +293,36 @@ def backtest_targets(catalog: Path, target_weights: Path, output: Path, buy_bps:
     (output/"portfolio_summary.json").write_text(json.dumps(summary,indent=2)); return summary
 
 
-def render_backtest_report(portfolio_daily: Path, output: Path, title: str = "Portfolio backtest") -> dict:
+def summarize_holdings(target_weights: Path) -> dict:
+    """Summarize realized target-weight concentration on each execution date."""
+    frame = pl.read_parquet(target_weights).filter(pl.col("target_weight") > 0)
+    if frame.is_empty():
+        raise ValueError("target weights are empty")
+    daily = frame.group_by("execution_date").agg(
+        pl.len().alias("holding_count"),
+        pl.col("target_weight").max().alias("max_weight"),
+        (pl.col("target_weight") ** 2).sum().alias("hhi"),
+        pl.col("target_weight").sort(descending=True).head(10).sum().alias("top10_weight"),
+        pl.col("target_weight").sort(descending=True).head(50).sum().alias("top50_weight"),
+    )
+    def values(column: str) -> dict:
+        data = daily[column]
+        return {"min": float(data.min()), "median": float(data.median()), "mean": float(data.mean()), "max": float(data.max())}
+    effective = 1 / daily["hhi"]
+    return {
+        "days": daily.height,
+        "holding_count": values("holding_count"),
+        "max_single_name_weight": values("max_weight"),
+        "effective_number_of_holdings": {
+            "min": float(effective.min()), "median": float(effective.median()),
+            "mean": float(effective.mean()), "max": float(effective.max()),
+        },
+        "top10_weight": values("top10_weight"),
+        "top50_weight": values("top50_weight"),
+    }
+
+
+def render_backtest_report(portfolio_daily: Path, output: Path, title: str = "Portfolio backtest", target_weights: Path | None = None) -> dict:
     """Render a self-contained HTML tear sheet from portfolio_daily.parquet."""
     import matplotlib
     matplotlib.use("Agg")
@@ -375,47 +341,28 @@ def render_backtest_report(portfolio_daily: Path, output: Path, title: str = "Po
     years=len(net)/252
     def ann(value: np.ndarray) -> float: return float(np.prod(1+value)**(1/years)-1) if years else 0.0
     def vol(value: np.ndarray) -> float: return float(np.std(value,ddof=1)*np.sqrt(252)) if len(value)>1 else 0.0
-    metrics={"days":len(frame),"start":str(frame["execution_date"][0]),"end":str(frame["execution_date"][-1]),"gross_total_return":float(gross_nav[-1]-1),"net_total_return":float(net_nav[-1]-1),"csi500_total_return":float(csi_nav[-1]-1),"gross_annualized_return":ann(gross),"net_annualized_return":ann(net),"annualized_volatility":vol(net),"net_sharpe":ann(net)/vol(net) if vol(net) else None,"information_ratio":float(np.mean(net-csi)/np.std(net-csi,ddof=1)*np.sqrt(252)) if np.std(net-csi,ddof=1) else None,"max_drawdown":float(drawdown.min()),"average_buy_turnover":float(frame["buy_turnover"].mean()),"average_sell_turnover":float(frame["sell_turnover"].mean()),"average_fee_bps":float(np.mean(cost)*10_000),"cumulative_fee_paid_on_initial_nav":float(fee[-1]),"average_holding_count":float(frame["holding_count"].mean())}
+    net_excess_wealth = float(net_nav[-1] / csi_nav[-1] - 1)
+    metrics={"days":len(frame),"start":str(frame["execution_date"][0]),"end":str(frame["execution_date"][-1]),"gross_total_return":float(gross_nav[-1]-1),"net_total_return":float(net_nav[-1]-1),"csi500_total_return":float(csi_nav[-1]-1),"net_excess_wealth_vs_csi500":net_excess_wealth,"gross_annualized_return":ann(gross),"net_annualized_return":ann(net),"csi500_annualized_return":ann(csi),"net_annualized_excess_vs_csi500":float((net_nav[-1] / csi_nav[-1]) ** (1 / years) - 1) if years else 0.0,"average_daily_active_return_bps":float(np.mean(net-csi)*10_000),"annualized_tracking_error":vol(net-csi),"net_sharpe":ann(net)/vol(net) if vol(net) else None,"information_ratio":float(np.mean(net-csi)/np.std(net-csi,ddof=1)*np.sqrt(252)) if np.std(net-csi,ddof=1) else None,"max_drawdown":float(drawdown.min()),"average_buy_turnover":float(frame["buy_turnover"].mean()),"average_sell_turnover":float(frame["sell_turnover"].mean()),"average_fee_bps":float(np.mean(cost)*10_000),"cumulative_fee_paid_on_initial_nav":float(fee[-1]),"average_holding_count":float(frame["holding_count"].mean())}
+    holdings = summarize_holdings(target_weights) if target_weights else None
     dates=frame["execution_date"].to_list()
     plt.style.use("seaborn-v0_8-whitegrid")
     fig,ax=plt.subplots(figsize=(12,5)); ax.plot(dates,gross_nav,label="Gross NAV",lw=1.8); ax.plot(dates,net_nav,label="Net NAV",lw=1.8); ax.plot(dates,csi_nav,label="CSI500 NAV",lw=1.5); ax.plot(dates,fee,label="Cumulative fee paid",lw=1.3,ls="--"); ax.set_title(title+" — NAV and fee"); ax.set_ylabel("Initial NAV = 1"); ax.legend(ncol=4,fontsize=9); fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(output/"nav_and_fee.png",dpi=160); plt.close(fig)
     fig,axes=plt.subplots(2,1,figsize=(12,7),sharex=True); axes[0].plot(dates,drawdown,color="#c44e52",lw=1.2); axes[0].fill_between(dates,drawdown,0,color="#c44e52",alpha=.2); axes[0].set_ylabel("Net drawdown"); axes[0].set_title(title+" — drawdown and turnover"); axes[1].plot(dates,frame["buy_turnover"].to_numpy(),label="Buy turnover",lw=1); axes[1].plot(dates,frame["sell_turnover"].to_numpy(),label="Sell turnover",lw=1); axes[1].bar(dates,cost,label="Fee",alpha=.35,width=1); axes[1].set_ylabel("Fraction of NAV"); axes[1].legend(ncol=3,fontsize=9); fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(output/"drawdown_turnover_fee.png",dpi=160); plt.close(fig)
-    table="".join(f"<tr><th>{html.escape(key)}</th><td>{value:.4%}</td></tr>" if isinstance(value,float) and ("return" in key or "drawdown" in key or "turnover" in key) else f"<tr><th>{html.escape(key)}</th><td>{html.escape(str(value))}</td></tr>" for key,value in metrics.items())
-    page=f"""<!doctype html><html><head><meta charset='utf-8'><title>{html.escape(title)}</title><style>body{{font-family:Arial,sans-serif;margin:32px;color:#18212f}}table{{border-collapse:collapse}}th,td{{padding:7px 12px;border:1px solid #d9e1ea;text-align:left}}img{{display:block;max-width:1100px;width:100%;margin:20px 0}}</style></head><body><h1>{html.escape(title)}</h1><p>Return basis: T+1 open to T+2 open; benchmark: CSI500; costs use the portfolio daily ledger.</p><h2>Summary</h2><table>{table}</table><img src='nav_and_fee.png'><img src='drawdown_turnover_fee.png'></body></html>"""
-    (output/"report.html").write_text(page,encoding="utf-8"); (output/"report_summary.json").write_text(json.dumps(metrics,indent=2),encoding="utf-8")
-    return {"output":str(output),"report":str(output/"report.html"),**metrics}
-
-
-def execute_lot_targets(catalog: Path, target_weights: Path, output: Path, initial_capital: float = 10_000_000.0, buy_bps: float = 2.1, sell_bps: float = 7.1) -> dict:
-    """Cash ledger execution at raw opens; buys are rounded down to A-share 100-share lots."""
-    output.mkdir(parents=True, exist_ok=True)
-    targets=pl.read_parquet(target_weights).with_columns(pl.col("execution_date").cast(pl.Date)).filter(~pl.col("ts_code").is_in(INFEASIBLE_EXECUTION_CODES))
-    dates=sorted(targets["execution_date"].unique().to_list())
-    conn=duckdb.connect(str(catalog), read_only=True)
-    try:
-        prices=pl.from_arrow(conn.execute(f"SELECT trade_date,ts_code,open FROM daily_qfq WHERE trade_date BETWEEN DATE '{dates[0]}' AND DATE '{dates[-1]}' AND open>0 AND observation_status='complete_trading'").arrow()).with_columns(pl.col("trade_date").cast(pl.Date))
-    finally: conn.close()
-    price={(d,c):p for d,c,p in prices.iter_rows()}; by_date={(k[0] if isinstance(k,tuple) else k):v for k,v in targets.partition_by("execution_date",as_dict=True).items()}
-    cash=initial_capital; shares:dict[str,int]={}; rows=[]; orders=[]; prior_nav=initial_capital
-    for day in dates:
-        frame=by_date[day]; px={c:price.get((day,c)) for c in set(shares)|set(frame["ts_code"].to_list())}
-        nav_before=cash+sum(q*px.get(c,0) for c,q in shares.items() if px.get(c))
-        target={c:float(w) for c,w in frame.select("ts_code","target_weight").iter_rows()}
-        desired={c:int((target.get(c,0)*nav_before/p//100)*100) if p else 0 for c,p in px.items()}
-        sell_notional=buy_notional=cost=0.0
-        for c,q in list(shares.items()):
-            delta=desired.get(c,0)-q; p=px.get(c)
-            if delta<0 and p:
-                qty=-delta; gross=qty*p; fee=gross*sell_bps/10000; cash+=gross-fee; shares[c]-=qty; sell_notional+=gross; cost+=fee; orders.append({"execution_date":day,"ts_code":c,"side":"sell","shares":qty,"price":p,"fee":fee})
-        for c in sorted(desired):
-            delta=desired[c]-shares.get(c,0); p=px.get(c)
-            if delta>0 and p:
-                affordable=int((cash/(p*(1+buy_bps/10000))//100)*100); qty=min(delta,affordable)
-                if qty:
-                    gross=qty*p; fee=gross*buy_bps/10000; cash-=gross+fee; shares[c]=shares.get(c,0)+qty; buy_notional+=gross; cost+=fee; orders.append({"execution_date":day,"ts_code":c,"side":"buy","shares":qty,"price":p,"fee":fee})
-        nav=cash+sum(q*px.get(c,0) for c,q in shares.items() if px.get(c)); rows.append({"execution_date":day,"nav":nav,"return_since_prior_open":nav/prior_nav-1,"cash":cash,"holding_count":sum(q>0 for q in shares.values()),"buy_notional":buy_notional,"sell_notional":sell_notional,"cost":cost}); prior_nav=nav
-    pl.DataFrame(rows).write_parquet(output/"execution_daily.parquet",compression="zstd"); pl.DataFrame(orders).write_parquet(output/"orders.parquet",compression="zstd")
-    return {"initial_capital":initial_capital,"ending_nav":prior_nav,"total_return":prior_nav/initial_capital-1,"total_cost":sum(r["cost"] for r in rows),"output":str(output)}
+    def row(key: str, value: object) -> str:
+        if isinstance(value, float):
+            if any(marker in key for marker in ("return", "drawdown", "turnover", "weight", "excess_wealth")):
+                value = f"{value:.4%}"
+            else:
+                value = f"{value:.4f}"
+        return f"<tr><th>{html.escape(key)}</th><td>{html.escape(str(value))}</td></tr>"
+    table="".join(row(key,value) for key,value in metrics.items())
+    holdings_table=""
+    if holdings:
+        holdings_table="<h2>Holdings</h2><table>"+"".join(row(key,json.dumps(value,ensure_ascii=False)) for key,value in holdings.items())+"</table>"
+    page=f"""<!doctype html><html><head><meta charset='utf-8'><title>{html.escape(title)}</title><style>body{{font-family:Arial,sans-serif;margin:32px;color:#18212f}}table{{border-collapse:collapse}}th,td{{padding:7px 12px;border:1px solid #d9e1ea;text-align:left}}img{{display:block;max-width:1100px;width:100%;margin:20px 0}}</style></head><body><h1>{html.escape(title)}</h1><p>Return basis: T+1 open to T+2 open; benchmark: CSI500; costs use the portfolio daily ledger.</p><h2>Performance and CSI500 excess</h2><table>{table}</table>{holdings_table}<img src='nav_and_fee.png'><img src='drawdown_turnover_fee.png'></body></html>"""
+    report = {**metrics, "holdings": holdings} if holdings else metrics
+    (output/"report.html").write_text(page,encoding="utf-8"); (output/"report_summary.json").write_text(json.dumps(report,indent=2),encoding="utf-8")
+    return {"output":str(output),"report":str(output/"report.html"),**report}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -423,21 +370,15 @@ def main(argv: list[str] | None = None) -> None:
     def common(x): x.add_argument("--catalog",type=Path,required=True); x.add_argument("--start"); x.add_argument("--end")
     b=sub.add_parser("build-features"); common(b); b.add_argument("--factor-root",type=Path,required=True); b.add_argument("--feature-root",type=Path,required=True); b.add_argument("--factor-ids-file",type=Path); b.add_argument("--replace",action="store_true")
     r=sub.add_parser("run-oos"); common(r); r.add_argument("--feature-root",type=Path,required=True); r.add_argument("--output",type=Path,required=True)
-    s=sub.add_parser("build-top-fraction-targets"); s.add_argument("--predictions",type=Path,required=True); s.add_argument("--output",type=Path,required=True); s.add_argument("--fraction",type=float,default=.10); s.add_argument("--alpha-column",default="alpha_daily")
-    o=sub.add_parser("optimize-top-n"); o.add_argument("--predictions",type=Path,required=True); o.add_argument("--output",type=Path,required=True); o.add_argument("--alpha-column",required=True); o.add_argument("--top-n",type=int,default=50); o.add_argument("--max-weight",type=float,default=.10); o.add_argument("--turnover-penalty-bps",type=float,default=14.1)
     d=sub.add_parser("optimize-dual-alpha"); d.add_argument("--predictions",type=Path,required=True); d.add_argument("--output",type=Path,required=True); d.add_argument("--h1-weight",type=float,default=.5); d.add_argument("--turnover-cap",type=float,default=.30); d.add_argument("--temperature",type=float,default=2.0); d.add_argument("--max-weight",type=float,default=.10)
     bt=sub.add_parser("backtest-portfolio"); bt.add_argument("--catalog",type=Path,required=True); bt.add_argument("--target-weights",type=Path,required=True); bt.add_argument("--output",type=Path,required=True); bt.add_argument("--buy-bps",type=float,default=2.1); bt.add_argument("--sell-bps",type=float,default=7.1)
-    rp=sub.add_parser("render-backtest-report"); rp.add_argument("--portfolio-daily",type=Path,required=True); rp.add_argument("--output",type=Path,required=True); rp.add_argument("--title",default="Portfolio backtest")
-    ex=sub.add_parser("execute-lots"); ex.add_argument("--catalog",type=Path,required=True); ex.add_argument("--target-weights",type=Path,required=True); ex.add_argument("--output",type=Path,required=True); ex.add_argument("--initial-capital",type=float,default=10_000_000.0); ex.add_argument("--buy-bps",type=float,default=2.1); ex.add_argument("--sell-bps",type=float,default=7.1)
+    rp=sub.add_parser("render-backtest-report"); rp.add_argument("--portfolio-daily",type=Path,required=True); rp.add_argument("--output",type=Path,required=True); rp.add_argument("--title",default="Portfolio backtest"); rp.add_argument("--target-weights",type=Path)
     args=p.parse_args(argv)
     if args.command=="build-features": result=build_features(args.catalog,args.factor_root,args.feature_root,args.start,args.end,args.replace,read_factor_ids(args.factor_ids_file))
     elif args.command=="run-oos": result=run_oos(args.catalog,args.feature_root,args.output,args.start,args.end)
-    elif args.command=="build-top-fraction-targets": result=build_top_fraction_targets(args.predictions,args.output,args.fraction,args.alpha_column)
-    elif args.command=="optimize-top-n": result=optimize_top_n_targets(args.predictions,args.output,args.alpha_column,args.top_n,args.max_weight,args.turnover_penalty_bps)
     elif args.command=="optimize-dual-alpha": result=optimize_dual_alpha_targets(args.predictions,args.output,args.h1_weight,args.turnover_cap,args.temperature,args.max_weight)
     elif args.command=="backtest-portfolio": result=backtest_targets(args.catalog,args.target_weights,args.output,args.buy_bps,args.sell_bps)
-    elif args.command=="render-backtest-report": result=render_backtest_report(args.portfolio_daily,args.output,args.title)
-    else: result=execute_lot_targets(args.catalog,args.target_weights,args.output,args.initial_capital,args.buy_bps,args.sell_bps)
+    else: result=render_backtest_report(args.portfolio_daily,args.output,args.title,args.target_weights)
     print(json.dumps(result,ensure_ascii=False,default=str))
 
 if __name__ == "__main__": main()

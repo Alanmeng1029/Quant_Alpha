@@ -5,7 +5,7 @@ from datetime import date, timedelta
 
 import polars as pl
 
-from a_share_data.predict import CORE40, LABEL_LAG, TRAIN_DAYS, build_top_fraction_targets, read_factor_ids, rolling_windows, winsorize_labels
+from a_share_data.predict import CORE40, LABEL_LAG, TRAIN_DAYS, read_factor_ids, rolling_windows, winsorize_labels
 
 
 class PredictionProtocolTests(unittest.TestCase):
@@ -44,25 +44,6 @@ class PredictionProtocolTests(unittest.TestCase):
             path.write_text("wq_alpha001_qfq_v1\nwq_alpha001_qfq_v1\n")
             with self.assertRaises(ValueError):
                 read_factor_ids(path)
-
-    def test_top_fraction_targets_are_equal_weight_and_tie_stable(self) -> None:
-        from pathlib import Path
-        import tempfile
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            predictions = root / "predictions.parquet"
-            rows = [
-                {"trade_date": date(2024, 1, 2), "execution_date": date(2024, 1, 3), "ts_code": code, "alpha_daily": alpha}
-                for code, alpha in [("C", 1.0), ("A", 2.0), ("B", 2.0), ("D", 0.0), ("E", -1.0)]
-            ]
-            pl.DataFrame(rows).write_parquet(predictions)
-            output = root / "targets.parquet"
-            result = build_top_fraction_targets(predictions, output, .40)
-            selected = pl.read_parquet(output)
-            self.assertEqual(result["rows"], 2)
-            self.assertEqual(selected["ts_code"].to_list(), ["A", "B"])
-            self.assertEqual(selected["target_weight"].to_list(), [0.5, 0.5])
-
 
 if __name__ == "__main__":
     unittest.main()

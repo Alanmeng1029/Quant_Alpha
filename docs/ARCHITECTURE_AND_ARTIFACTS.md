@@ -6,7 +6,7 @@
 Data → Factor research + factor production → Model + prediction → Optimizer + backtest
 ```
 
-本文件描述的是截至 2026-09-01 的代码能力和本机已落盘产物。`A_stock_database/` 和 `results/` 都是本地数据，已被 Git 忽略；它们可复现或审阅，但不会随代码提交传播。外部参考仓库位于 `external/`，同样被忽略。
+本文件描述的是截至 2026-09-02 的代码能力和本机已落盘产物。`A_stock_database/` 和 `results/` 都是本地数据，已被 Git 忽略；它们可复现或审阅，但不会随代码提交传播。外部参考仓库位于 `external/`，同样被忽略。
 
 ## 1. Data
 
@@ -79,7 +79,7 @@ Data → Factor research + factor production → Model + prediction → Optimize
 
 ### 职责
 
-把经过筛选的 Core40 日频因子变为严格样本外的个股收益预测，并留下模型、特征、配置与评估证据。
+把候选日频因子变为严格样本外的个股超额收益预测，并留下模型、特征、配置与评估证据。
 
 ### 技术栈
 
@@ -88,47 +88,46 @@ Data → Factor research + factor production → Model + prediction → Optimize
 
 ### 如何实现
 
-1. `quant-predict build-features` 从 40 个长表因子中按每日动态 CSI300 ∪ CSI500 股票池 pivot 出宽表，并用源文件大小和修改时间生成缓存指纹。
+1. `quant-predict build-features` 从候选因子长表中按每日动态 CSI300 ∪ CSI500 股票池 pivot 出宽表，并用源文件大小和修改时间生成缓存指纹。
 2. 每日每个因子先做 1%/99% 截面去极值，再做截面 Z-score；这一步仅使用信号日可见信息。
-3. 标签以 T+1 VWAP 进入，分别计算 1 日和 5 日持有期收益，再减去当日等权截面收益，形成横截面超额收益。
+3. 可执行标签为开盘到开盘：信号日 T 收盘后产生信号，T+1 开盘进入；h1 在 T+2 开盘退出，h5 在 T+6 开盘退出。两者均减去同期 CSI500 开盘到开盘收益，形成超额收益。
 4. 每月首个信号日训练两个 LightGBM：严格使用此前 756 个交易日，且与标签之间留 6 个交易日空档；随后预测该月全体信号日。这避免标签尚未实现时进入训练集。
-5. 最终 alpha 为 `0.25 × pred_h1 + 0.75 × pred_h5 / 5`，并输出逐月模型文件、训练 manifest、预测 Parquet、特征重要度和 OOS 指标。
+5. 输出独立的 `pred_h1` 与 `pred_h5`；组合层再按可调比例合成，不把持有期假设硬编码进模型。
 
 ### 当前模型产物
 
-- 目录：[results/predict/core40-lgbm-cs-zscore-v1](../results/predict/core40-lgbm-cs-zscore-v1)。
+- 目录：[results/predict/open-open-icir33-excluding-000937-v1](../results/predict/open-open-icir33-excluding-000937-v1)。
 - OOS 区间：2021-04-01 至 2026-08-28；`predictions.parquet` 含个股预测和执行日。
 - 训练证据：`models/month=*/h1.txt`、`h5.txt` 和 manifest；另有 `feature_importance.parquet`、`model_timings.parquet`。
-- 指标：[summary.json](../results/predict/core40-lgbm-cs-zscore-v1/summary.json)。融合 alpha 的 1 日 Rank IC 为 0.01984，日化 5 日 Rank IC 为 0.02056；这说明存在弱预测信号，不能直接推出投资收益。
+- 指标：[summary.json](../results/predict/open-open-icir33-excluding-000937-v1/summary.json)。h1 Rank IC 为 0.02865、h5 Rank IC 为 0.02284；这是预测诊断，不能直接推出可投资收益。
+- `000937.SZ` 已列入不可执行黑名单，因为供应商复权因子导致非经济性跳变；其他复权异常尚未做系统性清洗。
 
 ## 4. Optimizer + backtest
 
 ### 职责
 
-将模型预测转换为满足风险/交易约束的目标权重，并用一致的执行价格和成本假设评价组合净收益。
+将 h1/h5 预测转换为带个股上限和换手约束的目标权重，并用一致的开盘执行价格和成本假设评价组合净收益。
 
 ### 技术栈
 
-- Rust：性能敏感的组合优化和批量评估命令。
-- OSQP：二次规划求解器。
-- DuckDB：读取动态股票池、行业和行情。
-- Polars / Python：读取目标权重并执行 T+1 VWAP 投组合回测、产出汇总。
+- Python、NumPy：截面标准化、softmax 目标权重和换手投影。
+- DuckDB、Polars：读取行情、动态股票池并写入日度账本。
+- Matplotlib、HTML：生成净值、成本、换手、持仓和相对 CSI500 超额报告。
 
 ### 如何实现
 
-1. `quant-backtest optimize-portfolio` 从预测 Parquet、CSI300/CSI500 动态股票池和行业信息加载每个信号日截面。
-2. OSQP 解带全投资、个股最大权重、行业相对基准偏离容忍度和单边换手上限的二次规划；目标使用预测 alpha 并扣减交易成本。
-3. 当求解器失败时，使用确定性的行业内高 alpha/低 alpha 权重转移作为可行回退，维持预算与行业合计。
-4. `quant-predict backtest-portfolio` 用 T+1 VWAP 目标权重逐日计算毛收益、相邻调仓日的 L1 换手成本、等权动态股票池基准、净值和回撤。
+1. `quant-predict optimize-dual-alpha` 在每个截面分别标准化 `pred_h1` 与 `pred_h5`，按可调比例（当前 50/50）合成，再经 softmax 形成全投资多头目标。
+2. 目标权重投影到单票最大 10%，再从昨日持仓向目标线性移动；实际单边换手不超过设定上限（当前 30%）。没有行业、中证500权重或预设 Top-N 约束。
+3. `quant-predict backtest-portfolio` 用 T+1 开盘到下一执行日开盘逐日计算毛收益；成交按相邻目标权重之差计算，买入 2.1bp、卖出 7.1bp。
+4. `quant-predict render-backtest-report` 输出 Gross、Fee、Net、CSI500、回撤、换手及持仓集中度；CSI500 是 alpha/收益比较基准，Top10 等权仅是已移除的研究对照。
 
 ### 当前组合产物与解读
 
-- 目录：[results/predict/core40-lgbm-cs-zscore-v1/optimizer](../results/predict/core40-lgbm-cs-zscore-v1/optimizer)。
-- `target_weights.parquet`：优化目标权重；`optimizer_daily.parquet`：求解状态、耗时、换手和约束诊断。
-- [portfolio_daily.parquet](../results/predict/core40-lgbm-cs-zscore-v1/optimizer/portfolio_daily.parquet)：逐日收益与净值；[portfolio_summary.json](../results/predict/core40-lgbm-cs-zscore-v1/optimizer/portfolio_summary.json)：汇总指标。
-- 当前设置为 10% 个股上限、5% 行业容忍度、30% 单边换手上限、10bp 成本。回测 1,311 天后净总收益为 -26.7%，等权基准为 +33.5%，信息比率为 -3.20，最大回撤 -52.0%。
+- 目录：[dual-alpha-30pct](../results/predict/open-open-icir33-excluding-000937-v1/dual-alpha-30pct)。
+- [目标权重](../results/predict/open-open-icir33-excluding-000937-v1/dual-alpha-30pct/target_weights.parquet)、[日度账本](../results/predict/open-open-icir33-excluding-000937-v1/dual-alpha-30pct/weight-backtest/portfolio_daily.parquet)、[回测报告](../results/predict/open-open-icir33-excluding-000937-v1/dual-alpha-30pct/report/report.html)。
+- 1,311 个持有期：净总收益 +151.1%，CSI500 +25.7%，相对财富超额 +99.8%，信息比率 1.13，最大回撤 -31.3%，平均单边换手 17.4%。持股数中位数 796，但有效持股数中位数约 636，因此这是广泛分散的组合而非集中选股策略。
 
-结论：优化与回测链路已经可运行、可复现，并清楚显示当前参数与预测信号在成本后没有可投资性。下一步应先基于 OOS 和成本敏感性筛选/重训模型，再讨论放宽或改变组合约束；不应把当前权重用于实盘。
+该结果仅是研究回测：当前 `daily_qfq` 的复权质量尚未全面审计，且未模拟停牌、涨跌停、冲击成本、订单容量与一手整数执行。不得直接用于实盘。
 
 ## 模块接口总表
 
