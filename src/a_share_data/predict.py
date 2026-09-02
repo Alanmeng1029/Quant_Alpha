@@ -23,6 +23,7 @@ CORE40 = tuple([f"gtja_alpha{i:03d}_qfq_v1" for i in range(1, 21)] + [f"wq_alpha
 TRAIN_DAYS = 756
 LABEL_LAG = 6
 INDEX_CODES = ("000300.SH", "000905.SH")
+INFEASIBLE_EXECUTION_CODES = frozenset({"000937.SZ"})
 
 
 @dataclass(frozen=True)
@@ -137,7 +138,7 @@ def build_labels(catalog: Path, start: str | None = None, end: str | None = None
         raw = pl.from_arrow(conn.execute(query).arrow()).with_columns(pl.col("trade_date").cast(pl.Date))
     finally: conn.close()
     raw = raw.filter((pl.col("trade_date") >= pl.lit(dates[0]).str.to_date()) & (pl.col("trade_date") <= pl.lit(dates[-1]).str.to_date()))
-    return raw.with_columns(
+    return raw.filter(~pl.col("ts_code").is_in(INFEASIBLE_EXECUTION_CODES)).with_columns(
         ((pl.col("excess_h1") + pl.col("excess_h5")) / 2.0).alias("excess_h1_h5_mean")
     )
 
@@ -195,7 +196,7 @@ def run_oos(catalog: Path, feature_root: Path, output: Path, start: str | None =
     if not files: raise FileNotFoundError("Feature cache is empty; run build-features first")
     feature_manifest = json.loads((feature_root / "manifest.json").read_text(encoding="utf-8"))
     factor_ids = tuple(feature_manifest["factor_ids"])
-    features = pl.concat([pl.read_parquet(p) for p in files]).with_columns(pl.col("trade_date").cast(pl.Date))
+    features = pl.concat([pl.read_parquet(p) for p in files]).with_columns(pl.col("trade_date").cast(pl.Date)).filter(~pl.col("ts_code").is_in(INFEASIBLE_EXECUTION_CODES))
     labels = build_labels(catalog, start, end)
     panel = standardize_features(features, factor_ids).join(labels, on=["trade_date", "ts_code"], how="left")
     dates = sorted(str(x) for x in panel.select("trade_date").unique().to_series().to_list())
@@ -238,7 +239,7 @@ def build_top_fraction_targets(predictions: Path, output: Path, fraction: float 
     frame = (
         pl.read_parquet(predictions)
         .with_columns(pl.col("trade_date").cast(pl.Date), pl.col("execution_date").cast(pl.Date))
-        .filter(pl.col("execution_date").is_not_null() & pl.col(alpha_column).is_finite())
+        .filter(pl.col("execution_date").is_not_null() & pl.col(alpha_column).is_finite() & ~pl.col("ts_code").is_in(INFEASIBLE_EXECUTION_CODES))
         .sort(["trade_date", alpha_column, "ts_code"], descending=[False, True, False])
         .with_columns(
             pl.cum_count("ts_code").over("trade_date").alias("__rank"),
@@ -265,7 +266,7 @@ def optimize_top_n_targets(predictions: Path, output: Path, alpha_column: str, t
     if not (top_n > 0 and 0 < max_weight <= 1 and turnover_penalty_bps >= 0):
         raise ValueError("invalid optimizer limits")
     source = pl.read_parquet(predictions).with_columns(pl.col("trade_date").cast(pl.Date), pl.col("execution_date").cast(pl.Date))
-    source = source.filter(pl.col("execution_date").is_not_null() & pl.col(alpha_column).is_finite())
+    source = source.filter(pl.col("execution_date").is_not_null() & pl.col(alpha_column).is_finite() & ~pl.col("ts_code").is_in(INFEASIBLE_EXECUTION_CODES))
     rows=[]; previous: dict[str, float] = {}
     for key, frame in source.partition_by("trade_date", as_dict=True).items():
         signal_date = key[0] if isinstance(key, tuple) else key
@@ -289,10 +290,37 @@ def optimize_top_n_targets(predictions: Path, output: Path, alpha_column: str, t
     return {"output":str(output),"days":result.select("trade_date").n_unique(),"rows":result.height,"top_n":top_n,"max_weight":max_weight,"turnover_penalty_bps":turnover_penalty_bps}
 
 
-def backtest_targets(catalog: Path, target_weights: Path, output: Path, buy_bps: float = 2.1, sell_bps: float = 12.0) -> dict:
+def optimize_dual_alpha_targets(predictions: Path, output: Path, h1_weight: float = .5, turnover_cap: float = .30, temperature: float = 2.0, max_weight: float = .10) -> dict:
+    """Blend cross-sectional h1/h5 alpha, then project targets onto a turnover budget."""
+    if not (0 <= h1_weight <= 1 and 0 < turnover_cap <= 1 and temperature > 0 and 0 < max_weight <= 1):
+        raise ValueError("invalid dual-alpha optimizer parameters")
+    source=pl.read_parquet(predictions).with_columns(pl.col("trade_date").cast(pl.Date),pl.col("execution_date").cast(pl.Date)).filter(pl.col("execution_date").is_not_null() & pl.col("pred_h1").is_finite() & pl.col("pred_h5").is_finite() & ~pl.col("ts_code").is_in(INFEASIBLE_EXECUTION_CODES))
+    previous: dict[str,float]={}; rows=[]
+    for key,frame in source.partition_by("trade_date",as_dict=True).items():
+        signal_date=key[0] if isinstance(key,tuple) else key; execution_date=frame["execution_date"][0]
+        frame=frame.sort("ts_code"); codes=frame["ts_code"].to_list(); a1=frame["pred_h1"].to_numpy(); a5=frame["pred_h5"].to_numpy()
+        def z(value: np.ndarray) -> np.ndarray:
+            std=value.std(); return (value-value.mean())/std if std > 1e-12 else np.zeros_like(value)
+        score=h1_weight*z(a1)+(1-h1_weight)*z(a5); exp=np.exp(np.clip(score/temperature,-30,30)); desired=exp/exp.sum()
+        # Project onto the capped simplex without re-inflating capped names.
+        free=np.ones(len(desired),dtype=bool); remaining=1.0
+        while True:
+            proposal=desired[free] / desired[free].sum() * remaining
+            overflow=proposal > max_weight + 1e-15
+            if not overflow.any():
+                desired[free]=proposal; break
+            indices=np.flatnonzero(free)[overflow]; desired[indices]=max_weight; free[indices]=False; remaining=1.0-desired[~free].sum()
+        old=np.array([previous.get(code,0.0) for code in codes]); l1=float(np.abs(desired-old).sum()); scale=1.0 if not previous else min(1.0,2*turnover_cap/l1)
+        weights=old+scale*(desired-old); previous=dict(zip(codes,weights))
+        for code,w,s1,s5 in zip(codes,weights,a1,a5): rows.append({"trade_date":signal_date,"execution_date":execution_date,"ts_code":code,"target_weight":float(w),"pred_h1":float(s1),"pred_h5":float(s5),"alpha_daily":float(h1_weight*s1+(1-h1_weight)*s5),"optimizer":"dual_alpha_turnover_projection"})
+    result=pl.DataFrame(rows); output.parent.mkdir(parents=True,exist_ok=True); result.write_parquet(output,compression="zstd")
+    return {"output":str(output),"days":result.select("trade_date").n_unique(),"rows":result.height,"h1_weight":h1_weight,"h5_weight":1-h1_weight,"turnover_cap_one_way":turnover_cap,"temperature":temperature,"max_weight":max_weight}
+
+
+def backtest_targets(catalog: Path, target_weights: Path, output: Path, buy_bps: float = 2.1, sell_bps: float = 7.1) -> dict:
     """Open-to-open target backtest with net position trades and CSI500 baseline."""
     output.mkdir(parents=True, exist_ok=True)
-    targets = pl.read_parquet(target_weights).with_columns(pl.col("execution_date").cast(pl.Date))
+    targets = pl.read_parquet(target_weights).with_columns(pl.col("execution_date").cast(pl.Date)).filter(~pl.col("ts_code").is_in(INFEASIBLE_EXECUTION_CODES))
     execution_dates = sorted(targets["execution_date"].drop_nulls().unique().to_list())
     if len(execution_dates) < 2: raise ValueError("Need at least two execution dates")
     conn = duckdb.connect(str(catalog), read_only=True)
@@ -327,10 +355,10 @@ def backtest_targets(catalog: Path, target_weights: Path, output: Path, buy_bps:
     (output/"portfolio_summary.json").write_text(json.dumps(summary,indent=2)); return summary
 
 
-def execute_lot_targets(catalog: Path, target_weights: Path, output: Path, initial_capital: float = 10_000_000.0, buy_bps: float = 2.1, sell_bps: float = 12.0) -> dict:
+def execute_lot_targets(catalog: Path, target_weights: Path, output: Path, initial_capital: float = 10_000_000.0, buy_bps: float = 2.1, sell_bps: float = 7.1) -> dict:
     """Cash ledger execution at raw opens; buys are rounded down to A-share 100-share lots."""
     output.mkdir(parents=True, exist_ok=True)
-    targets=pl.read_parquet(target_weights).with_columns(pl.col("execution_date").cast(pl.Date))
+    targets=pl.read_parquet(target_weights).with_columns(pl.col("execution_date").cast(pl.Date)).filter(~pl.col("ts_code").is_in(INFEASIBLE_EXECUTION_CODES))
     dates=sorted(targets["execution_date"].unique().to_list())
     conn=duckdb.connect(str(catalog), read_only=True)
     try:
@@ -366,13 +394,15 @@ def main(argv: list[str] | None = None) -> None:
     r=sub.add_parser("run-oos"); common(r); r.add_argument("--feature-root",type=Path,required=True); r.add_argument("--output",type=Path,required=True)
     s=sub.add_parser("build-top-fraction-targets"); s.add_argument("--predictions",type=Path,required=True); s.add_argument("--output",type=Path,required=True); s.add_argument("--fraction",type=float,default=.10); s.add_argument("--alpha-column",default="alpha_daily")
     o=sub.add_parser("optimize-top-n"); o.add_argument("--predictions",type=Path,required=True); o.add_argument("--output",type=Path,required=True); o.add_argument("--alpha-column",required=True); o.add_argument("--top-n",type=int,default=50); o.add_argument("--max-weight",type=float,default=.10); o.add_argument("--turnover-penalty-bps",type=float,default=14.1)
-    bt=sub.add_parser("backtest-portfolio"); bt.add_argument("--catalog",type=Path,required=True); bt.add_argument("--target-weights",type=Path,required=True); bt.add_argument("--output",type=Path,required=True); bt.add_argument("--buy-bps",type=float,default=2.1); bt.add_argument("--sell-bps",type=float,default=12.0)
-    ex=sub.add_parser("execute-lots"); ex.add_argument("--catalog",type=Path,required=True); ex.add_argument("--target-weights",type=Path,required=True); ex.add_argument("--output",type=Path,required=True); ex.add_argument("--initial-capital",type=float,default=10_000_000.0); ex.add_argument("--buy-bps",type=float,default=2.1); ex.add_argument("--sell-bps",type=float,default=12.0)
+    d=sub.add_parser("optimize-dual-alpha"); d.add_argument("--predictions",type=Path,required=True); d.add_argument("--output",type=Path,required=True); d.add_argument("--h1-weight",type=float,default=.5); d.add_argument("--turnover-cap",type=float,default=.30); d.add_argument("--temperature",type=float,default=2.0); d.add_argument("--max-weight",type=float,default=.10)
+    bt=sub.add_parser("backtest-portfolio"); bt.add_argument("--catalog",type=Path,required=True); bt.add_argument("--target-weights",type=Path,required=True); bt.add_argument("--output",type=Path,required=True); bt.add_argument("--buy-bps",type=float,default=2.1); bt.add_argument("--sell-bps",type=float,default=7.1)
+    ex=sub.add_parser("execute-lots"); ex.add_argument("--catalog",type=Path,required=True); ex.add_argument("--target-weights",type=Path,required=True); ex.add_argument("--output",type=Path,required=True); ex.add_argument("--initial-capital",type=float,default=10_000_000.0); ex.add_argument("--buy-bps",type=float,default=2.1); ex.add_argument("--sell-bps",type=float,default=7.1)
     args=p.parse_args(argv)
     if args.command=="build-features": result=build_features(args.catalog,args.factor_root,args.feature_root,args.start,args.end,args.replace,read_factor_ids(args.factor_ids_file))
     elif args.command=="run-oos": result=run_oos(args.catalog,args.feature_root,args.output,args.start,args.end)
     elif args.command=="build-top-fraction-targets": result=build_top_fraction_targets(args.predictions,args.output,args.fraction,args.alpha_column)
     elif args.command=="optimize-top-n": result=optimize_top_n_targets(args.predictions,args.output,args.alpha_column,args.top_n,args.max_weight,args.turnover_penalty_bps)
+    elif args.command=="optimize-dual-alpha": result=optimize_dual_alpha_targets(args.predictions,args.output,args.h1_weight,args.turnover_cap,args.temperature,args.max_weight)
     elif args.command=="backtest-portfolio": result=backtest_targets(args.catalog,args.target_weights,args.output,args.buy_bps,args.sell_bps)
     else: result=execute_lot_targets(args.catalog,args.target_weights,args.output,args.initial_capital,args.buy_bps,args.sell_bps)
     print(json.dumps(result,ensure_ascii=False,default=str))
