@@ -223,6 +223,40 @@ def run_oos(catalog: Path, feature_root: Path, output: Path, start: str | None =
     (output / "summary.json").write_text(json.dumps(summary,indent=2,default=str)); return summary
 
 
+def build_top_fraction_targets(predictions: Path, output: Path, fraction: float = 0.10) -> dict:
+    """Select the deterministic top alpha fraction and assign equal target weights.
+
+    Targets are position-to-position: the backtest compares consecutive target
+    weights, so a name retained at the same weight has zero turnover rather
+    than an artificial sell-and-rebuy transaction.
+    """
+    if not 0 < fraction <= 1:
+        raise ValueError("fraction must be in (0, 1]")
+    frame = (
+        pl.read_parquet(predictions)
+        .with_columns(pl.col("trade_date").cast(pl.Date), pl.col("execution_date").cast(pl.Date))
+        .filter(pl.col("execution_date").is_not_null() & pl.col("alpha_daily").is_finite())
+        .sort(["trade_date", "alpha_daily", "ts_code"], descending=[False, True, False])
+        .with_columns(
+            pl.cum_count("ts_code").over("trade_date").alias("__rank"),
+            pl.len().over("trade_date").alias("__count"),
+        )
+        .filter(pl.col("__rank") <= (pl.col("__count") * fraction).ceil())
+        .with_columns((1.0 / pl.len().over("execution_date")).alias("target_weight"))
+        .select("trade_date", "execution_date", "ts_code", "target_weight", "alpha_daily")
+    )
+    if frame.is_empty():
+        raise ValueError("No eligible predictions for top-fraction targets")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    frame.write_parquet(output, compression="zstd")
+    holding_counts = frame.group_by("execution_date").len()["len"]
+    return {
+        "output": str(output), "fraction": fraction, "days": holding_counts.len(),
+        "rows": frame.height, "min_holdings": holding_counts.min(),
+        "median_holdings": holding_counts.median(), "max_holdings": holding_counts.max(),
+    }
+
+
 def backtest_targets(catalog: Path, target_weights: Path, output: Path, cost_bps: float = 10.0) -> dict:
     """T+1 VWAP target-weight backtest, with equal-weight active benchmark."""
     output.mkdir(parents=True, exist_ok=True)
@@ -264,10 +298,12 @@ def main(argv: list[str] | None = None) -> None:
     def common(x): x.add_argument("--catalog",type=Path,required=True); x.add_argument("--start"); x.add_argument("--end")
     b=sub.add_parser("build-features"); common(b); b.add_argument("--factor-root",type=Path,required=True); b.add_argument("--feature-root",type=Path,required=True); b.add_argument("--factor-ids-file",type=Path); b.add_argument("--replace",action="store_true")
     r=sub.add_parser("run-oos"); common(r); r.add_argument("--feature-root",type=Path,required=True); r.add_argument("--output",type=Path,required=True)
+    s=sub.add_parser("build-top-fraction-targets"); s.add_argument("--predictions",type=Path,required=True); s.add_argument("--output",type=Path,required=True); s.add_argument("--fraction",type=float,default=.10)
     bt=sub.add_parser("backtest-portfolio"); bt.add_argument("--catalog",type=Path,required=True); bt.add_argument("--target-weights",type=Path,required=True); bt.add_argument("--output",type=Path,required=True); bt.add_argument("--cost-bps",type=float,default=10.0)
     args=p.parse_args(argv)
     if args.command=="build-features": result=build_features(args.catalog,args.factor_root,args.feature_root,args.start,args.end,args.replace,read_factor_ids(args.factor_ids_file))
     elif args.command=="run-oos": result=run_oos(args.catalog,args.feature_root,args.output,args.start,args.end)
+    elif args.command=="build-top-fraction-targets": result=build_top_fraction_targets(args.predictions,args.output,args.fraction)
     else: result=backtest_targets(args.catalog,args.target_weights,args.output,args.cost_bps)
     print(json.dumps(result,ensure_ascii=False,default=str))
 
