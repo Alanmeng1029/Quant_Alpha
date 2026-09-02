@@ -120,23 +120,24 @@ def build_labels(catalog: Path, start: str | None = None, end: str | None = None
         uni AS (SELECT DISTINCT u.trade_date,u.ts_code FROM index_trading_universe u WHERE index_code IN ('000300.SH','000905.SH')),
         raw AS (SELECT u.trade_date,u.ts_code,
           d1.qfq_open e, d2.qfq_open x1, d6.qfq_open x5,
+          i1.open b1, i2.open b2, i6.open b5,
           d1.amount_cny a1, d2.amount_cny a2, d6.amount_cny a6,
           d1.observation_status s1,d2.observation_status s2,d6.observation_status s6
           FROM uni u JOIN calendar c ON c.trade_date=u.trade_date
           LEFT JOIN calendar ce ON ce.n=c.n+1 LEFT JOIN calendar c2 ON c2.n=c.n+2 LEFT JOIN calendar c6 ON c6.n=c.n+6
           LEFT JOIN daily_qfq d1 ON d1.ts_code=u.ts_code AND d1.trade_date=ce.trade_date
           LEFT JOIN daily_qfq d2 ON d2.ts_code=u.ts_code AND d2.trade_date=c2.trade_date
-          LEFT JOIN daily_qfq d6 ON d6.ts_code=u.ts_code AND d6.trade_date=c6.trade_date)
+          LEFT JOIN daily_qfq d6 ON d6.ts_code=u.ts_code AND d6.trade_date=c6.trade_date
+          LEFT JOIN index_daily i1 ON i1.index_code='000905.SH' AND i1.trade_date=ce.trade_date
+          LEFT JOIN index_daily i2 ON i2.index_code='000905.SH' AND i2.trade_date=c2.trade_date
+          LEFT JOIN index_daily i6 ON i6.index_code='000905.SH' AND i6.trade_date=c6.trade_date)
         SELECT trade_date,ts_code,
-          CASE WHEN e>0 AND x1>0 AND a1>0 AND a2>0 AND s1='complete_trading' AND s2='complete_trading' THEN x1/e-1 END r_h1,
-          CASE WHEN e>0 AND x5>0 AND a1>0 AND a6>0 AND s1='complete_trading' AND s6='complete_trading' THEN x5/e-1 END r_h5 FROM raw"""
+          CASE WHEN e>0 AND x1>0 AND b1>0 AND b2>0 AND a1>0 AND a2>0 AND s1='complete_trading' AND s2='complete_trading' THEN x1/e-b2/b1 END excess_h1,
+          CASE WHEN e>0 AND x5>0 AND b1>0 AND b5>0 AND a1>0 AND a6>0 AND s1='complete_trading' AND s6='complete_trading' THEN x5/e-b5/b1 END excess_h5 FROM raw"""
         raw = pl.from_arrow(conn.execute(query).arrow()).with_columns(pl.col("trade_date").cast(pl.Date))
     finally: conn.close()
     raw = raw.filter((pl.col("trade_date") >= pl.lit(dates[0]).str.to_date()) & (pl.col("trade_date") <= pl.lit(dates[-1]).str.to_date()))
     return raw.with_columns(
-        (pl.col("r_h1") - pl.col("r_h1").mean().over("trade_date")).alias("excess_h1"),
-        (pl.col("r_h5") - pl.col("r_h5").mean().over("trade_date")).alias("excess_h5"),
-    ).with_columns(
         ((pl.col("excess_h1") + pl.col("excess_h5")) / 2.0).alias("excess_h1_h5_mean")
     )
 
@@ -203,27 +204,29 @@ def run_oos(catalog: Path, feature_root: Path, output: Path, start: str | None =
         month = signal[:7]; month_dates=[d for d in dates if d[:7]==month and (not end or d<=end)]
         train = panel.filter(pl.col("trade_date").cast(pl.String).is_in(train_dates)); test = panel.filter(pl.col("trade_date").cast(pl.String).is_in(month_dates))
         if test.height == 0: continue
-        month_start=time.perf_counter(); target="excess_h1_h5_mean"
-        fit=winsorize_labels(train.filter(pl.col(target).is_not_null()), target)
-        x=fit.select(factor_ids).to_numpy(); y=fit[target].to_numpy()
-        model=lgb.train(settings.params(), lgb.Dataset(x, label=y, feature_name=list(factor_ids)), num_boost_round=settings.num_boost_round)
-        model_dir=models / f"month={month}"; model_dir.mkdir(parents=True, exist_ok=True); model.save_model(str(model_dir / "mean_h1_h5.txt"))
-        prediction=model.predict(test.select(factor_ids).to_numpy())
-        importance.extend({"model_month":month,"horizon":"mean_h1_h5","feature":f,"importance":float(v)} for f,v in zip(factor_ids, model.feature_importance()))
-        out=test.select("trade_date","ts_code").with_columns(pl.Series("pred_h1_h5_mean", prediction)).with_columns(pl.col("pred_h1_h5_mean").alias("alpha_daily"),pl.lit(month).alias("model_month"),pl.col("trade_date").shift(-1).over("ts_code").alias("execution_date"))
+        model_dir=models / f"month={month}"; model_dir.mkdir(parents=True, exist_ok=True)
+        month_start=time.perf_counter()
+        out=test.select("trade_date","ts_code")
+        for horizon, target in (("h1", "excess_h1"), ("h5", "excess_h5")):
+            fit=winsorize_labels(train.filter(pl.col(target).is_not_null()), target)
+            model=lgb.train(settings.params(), lgb.Dataset(fit.select(factor_ids).to_numpy(), label=fit[target].to_numpy(), feature_name=list(factor_ids)), num_boost_round=settings.num_boost_round)
+            model.save_model(str(model_dir / f"{horizon}.txt"))
+            out=out.with_columns(pl.Series(f"pred_{horizon}", model.predict(test.select(factor_ids).to_numpy())))
+            importance.extend({"model_month":month,"horizon":horizon,"feature":f,"importance":float(v)} for f,v in zip(factor_ids, model.feature_importance()))
+        out=out.with_columns(((pl.col("pred_h1") + pl.col("pred_h5")) / 2.0).alias("alpha_daily"),pl.lit(month).alias("model_month"),pl.col("trade_date").shift(-1).over("ts_code").alias("execution_date"))
         # execution date is market-calendar based, not per-stock; repair via date mapping.
         next_map={dates[i]:dates[i+1] for i in range(len(dates)-1)}; out=out.with_columns(pl.col("trade_date").cast(pl.String).replace_strict(next_map, default=None).str.to_date().alias("execution_date"))
         records.append(out); timings.append({"model_month":month,"seconds":time.perf_counter()-month_start,"training_start":train_dates[0],"training_end":train_dates[-1],"training_days":len(train_dates)})
-        (models / f"month={month}" / "manifest.json").write_text(json.dumps({"training_start":train_dates[0],"training_end":train_dates[-1],"factor_ids":factor_ids,"feature_hash":hashlib.sha256("|".join(factor_ids).encode()).hexdigest(),"target":target,"settings":asdict(settings)},indent=2))
+        (models / f"month={month}" / "manifest.json").write_text(json.dumps({"training_start":train_dates[0],"training_end":train_dates[-1],"factor_ids":factor_ids,"feature_hash":hashlib.sha256("|".join(factor_ids).encode()).hexdigest(),"targets":["excess_h1","excess_h5"],"settings":asdict(settings)},indent=2))
     pred=pl.concat(records) if records else pl.DataFrame(); pred.write_parquet(output / "predictions.parquet", compression="zstd")
     evaluation=pred.join(labels,on=["trade_date","ts_code"],how="left")
-    summary={"settings":asdict(settings),"factor_ids":factor_ids,"target":"equal_mean_of_excess_h1_and_excess_h5","oos_start":str(pred["trade_date"].min()) if pred.height else None,"oos_end":str(pred["trade_date"].max()) if pred.height else None,"mean_target":_metrics(evaluation,"alpha_daily","excess_h1_h5_mean"),"alpha_h1":_metrics(evaluation,"alpha_daily","excess_h1"),"alpha_h5":_metrics(evaluation,"alpha_daily","excess_h5")}
+    summary={"settings":asdict(settings),"factor_ids":factor_ids,"benchmark":"CSI500 open-to-open","oos_start":str(pred["trade_date"].min()) if pred.height else None,"oos_end":str(pred["trade_date"].max()) if pred.height else None,"mean_alpha":_metrics(evaluation,"alpha_daily","excess_h1_h5_mean"),"h1":_metrics(evaluation,"pred_h1","excess_h1"),"h5":_metrics(evaluation,"pred_h5","excess_h5")}
     pl.DataFrame(timings, schema={"model_month":pl.String,"seconds":pl.Float64,"training_start":pl.String,"training_end":pl.String,"training_days":pl.Int64}).write_parquet(output / "model_timings.parquet")
     pl.DataFrame(importance, schema={"model_month":pl.String,"horizon":pl.String,"feature":pl.String,"importance":pl.Float64}).write_parquet(output / "feature_importance.parquet")
     (output / "summary.json").write_text(json.dumps(summary,indent=2,default=str)); return summary
 
 
-def build_top_fraction_targets(predictions: Path, output: Path, fraction: float = 0.10) -> dict:
+def build_top_fraction_targets(predictions: Path, output: Path, fraction: float = 0.10, alpha_column: str = "alpha_daily") -> dict:
     """Select the deterministic top alpha fraction and assign equal target weights.
 
     Targets are position-to-position: the backtest compares consecutive target
@@ -235,15 +238,15 @@ def build_top_fraction_targets(predictions: Path, output: Path, fraction: float 
     frame = (
         pl.read_parquet(predictions)
         .with_columns(pl.col("trade_date").cast(pl.Date), pl.col("execution_date").cast(pl.Date))
-        .filter(pl.col("execution_date").is_not_null() & pl.col("alpha_daily").is_finite())
-        .sort(["trade_date", "alpha_daily", "ts_code"], descending=[False, True, False])
+        .filter(pl.col("execution_date").is_not_null() & pl.col(alpha_column).is_finite())
+        .sort(["trade_date", alpha_column, "ts_code"], descending=[False, True, False])
         .with_columns(
             pl.cum_count("ts_code").over("trade_date").alias("__rank"),
             pl.len().over("trade_date").alias("__count"),
         )
         .filter(pl.col("__rank") <= (pl.col("__count") * fraction).ceil())
         .with_columns((1.0 / pl.len().over("execution_date")).alias("target_weight"))
-        .select("trade_date", "execution_date", "ts_code", "target_weight", "alpha_daily")
+        .select("trade_date", "execution_date", "ts_code", "target_weight", pl.col(alpha_column).alias("alpha_daily"))
     )
     if frame.is_empty():
         raise ValueError("No eligible predictions for top-fraction targets")
@@ -257,8 +260,37 @@ def build_top_fraction_targets(predictions: Path, output: Path, fraction: float 
     }
 
 
-def backtest_targets(catalog: Path, target_weights: Path, output: Path, cost_bps: float = 10.0) -> dict:
-    """T+1-open to T+2-open target-weight backtest, with EW benchmark."""
+def optimize_top_n_targets(predictions: Path, output: Path, alpha_column: str, top_n: int = 50, max_weight: float = .10, turnover_penalty_bps: float = 14.1) -> dict:
+    """Top-N long-only rank-alpha portfolio with turnover-aware membership."""
+    if not (top_n > 0 and 0 < max_weight <= 1 and turnover_penalty_bps >= 0):
+        raise ValueError("invalid optimizer limits")
+    source = pl.read_parquet(predictions).with_columns(pl.col("trade_date").cast(pl.Date), pl.col("execution_date").cast(pl.Date))
+    source = source.filter(pl.col("execution_date").is_not_null() & pl.col(alpha_column).is_finite())
+    rows=[]; previous: dict[str, float] = {}
+    for key, frame in source.partition_by("trade_date", as_dict=True).items():
+        signal_date = key[0] if isinstance(key, tuple) else key
+        ranked = frame.sort([alpha_column, "ts_code"], descending=[True, False])
+        execution_date = ranked["execution_date"][0]
+        all_alpha = dict(ranked.select("ts_code", alpha_column).iter_rows())
+        candidate = set(ranked.head(top_n)["ts_code"].to_list())
+        # Keeping a current name avoids one sell plus one buy.  The bonus is
+        # the stated round-trip cost; it only affects membership, never prices.
+        pool=candidate | set(previous)
+        bonus=turnover_penalty_bps / 10_000.0
+        selected=sorted(pool, key=lambda code: (all_alpha.get(code, float("-inf")) + (bonus if code in previous else 0.0), code), reverse=True)[:top_n]
+        alpha={code:all_alpha[code] for code in selected}
+        ranks={code: top_n-i for i,code in enumerate(sorted(selected, key=lambda c:(all_alpha[c], c), reverse=True))}
+        desired={code: rank/sum(ranks.values()) for code,rank in ranks.items()}
+        if max(desired.values()) > max_weight + 1e-12: raise ValueError("max_weight too low for Top-N rank weights")
+        previous=desired
+        for code,weight in desired.items():
+            rows.append({"trade_date":signal_date,"execution_date":execution_date,"ts_code":code,"target_weight":weight,"alpha_daily":alpha.get(code,0.0),"optimizer":"top_n_rank_turnover_projection"})
+    result=pl.DataFrame(rows); output.parent.mkdir(parents=True, exist_ok=True); result.write_parquet(output, compression="zstd")
+    return {"output":str(output),"days":result.select("trade_date").n_unique(),"rows":result.height,"top_n":top_n,"max_weight":max_weight,"turnover_penalty_bps":turnover_penalty_bps}
+
+
+def backtest_targets(catalog: Path, target_weights: Path, output: Path, buy_bps: float = 2.1, sell_bps: float = 12.0) -> dict:
+    """Open-to-open target backtest with net position trades and CSI500 baseline."""
     output.mkdir(parents=True, exist_ok=True)
     targets = pl.read_parquet(target_weights).with_columns(pl.col("execution_date").cast(pl.Date))
     execution_dates = sorted(targets["execution_date"].drop_nulls().unique().to_list())
@@ -266,31 +298,65 @@ def backtest_targets(catalog: Path, target_weights: Path, output: Path, cost_bps
     conn = duckdb.connect(str(catalog), read_only=True)
     try:
         prices = pl.from_arrow(conn.execute(f"SELECT trade_date, ts_code, qfq_open FROM daily_qfq WHERE trade_date BETWEEN DATE '{execution_dates[0]}' AND DATE '{execution_dates[-1]}' AND qfq_open > 0").arrow()).with_columns(pl.col("trade_date").cast(pl.Date))
+        benchmark = pl.from_arrow(conn.execute(f"SELECT trade_date, open FROM index_daily WHERE index_code='000905.SH' AND trade_date BETWEEN DATE '{execution_dates[0]}' AND DATE '{execution_dates[-1]}' AND open > 0").arrow()).with_columns(pl.col("trade_date").cast(pl.Date))
     finally: conn.close()
     by_date = {(day[0] if isinstance(day, tuple) else day): frame for day, frame in targets.partition_by("execution_date", as_dict=True).items()}
     price = {(row[0], row[1]): row[2] for row in prices.select("trade_date", "ts_code", "qfq_open").iter_rows()}
+    benchmark_price = dict(benchmark.select("trade_date", "open").iter_rows())
     rows=[]; previous={}; nav=1.0; bench_nav=1.0
     for i, day in enumerate(execution_dates[:-1]):
         next_day=execution_dates[i+1]; frame=by_date[day]; current={code: float(weight) for code,weight in frame.select("ts_code","target_weight").iter_rows() if weight > 0}
-        returns=[]; universe_returns=[]; gross=0.0
-        for code in frame["ts_code"].to_list():
-            p0,p1=price.get((day,code)),price.get((next_day,code))
-            if p0 and p1: universe_returns.append(p1/p0-1)
+        returns=[]; gross=0.0
         for code, weight in current.items():
             p0,p1=price.get((day,code)),price.get((next_day,code))
             if p0 and p1:
                 value=p1/p0-1; gross += weight*value; returns.append(value)
-        bench=float(np.mean(universe_returns)) if universe_returns else 0.0
-        l1=sum(abs(current.get(code,0)-previous.get(code,0)) for code in set(current)|set(previous))
-        cost=0.0 if i==0 else l1*cost_bps/10_000
+        p0,p1=benchmark_price.get(day),benchmark_price.get(next_day)
+        bench=p1/p0-1 if p0 and p1 else 0.0
+        delta={code: current.get(code,0)-previous.get(code,0) for code in set(current)|set(previous)}
+        buy_turnover=sum(max(change,0.0) for change in delta.values())
+        sell_turnover=sum(max(-change,0.0) for change in delta.values())
+        cost=0.0 if i==0 else buy_turnover*buy_bps/10_000 + sell_turnover*sell_bps/10_000
         net=gross-cost; nav*=1+net; bench_nav*=1+bench
-        rows.append({"execution_date":day,"next_execution_date":next_day,"gross_return":gross,"transaction_cost":cost,"net_return":net,"equal_weight_return":bench,"active_return":net-bench,"turnover_one_way":l1/2,"nav":nav,"equal_weight_nav":bench_nav,"holding_count":len(current)})
+        rows.append({"execution_date":day,"next_execution_date":next_day,"gross_return":gross,"transaction_cost":cost,"net_return":net,"csi500_return":bench,"active_return":net-bench,"buy_turnover":buy_turnover,"sell_turnover":sell_turnover,"nav":nav,"csi500_nav":bench_nav,"holding_count":len(current)})
         previous=current
     daily=pl.DataFrame(rows); daily.write_parquet(output/"portfolio_daily.parquet",compression="zstd")
     net=daily["net_return"].to_numpy(); active=daily["active_return"].to_numpy(); years=len(net)/252
     ann_return=nav**(1/years)-1 if years else 0.0; ann_vol=float(np.std(net,ddof=1)*np.sqrt(252)); active_vol=float(np.std(active,ddof=1)*np.sqrt(252)); running=np.maximum.accumulate(daily["nav"].to_numpy()); max_dd=float(np.min(daily["nav"].to_numpy()/running-1))
-    summary={"days":len(rows),"gross_total_return":float(np.prod(1+daily["gross_return"].to_numpy())-1),"net_total_return":nav-1,"equal_weight_total_return":bench_nav-1,"annualized_return":ann_return,"annualized_volatility":ann_vol,"sharpe":ann_return/ann_vol if ann_vol else None,"information_ratio":float(np.mean(active)/np.std(active,ddof=1)*np.sqrt(252)) if np.std(active,ddof=1) else None,"max_drawdown":max_dd,"average_turnover_one_way":float(daily["turnover_one_way"].mean()),"total_transaction_cost":float(daily["transaction_cost"].sum())}
+    summary={"days":len(rows),"gross_total_return":float(np.prod(1+daily["gross_return"].to_numpy())-1),"net_total_return":nav-1,"csi500_total_return":bench_nav-1,"annualized_return":ann_return,"annualized_volatility":ann_vol,"sharpe":ann_return/ann_vol if ann_vol else None,"information_ratio":float(np.mean(active)/np.std(active,ddof=1)*np.sqrt(252)) if np.std(active,ddof=1) else None,"max_drawdown":max_dd,"average_buy_turnover":float(daily["buy_turnover"].mean()),"average_sell_turnover":float(daily["sell_turnover"].mean()),"buy_cost_bps":buy_bps,"sell_cost_bps":sell_bps,"total_transaction_cost":float(daily["transaction_cost"].sum())}
     (output/"portfolio_summary.json").write_text(json.dumps(summary,indent=2)); return summary
+
+
+def execute_lot_targets(catalog: Path, target_weights: Path, output: Path, initial_capital: float = 10_000_000.0, buy_bps: float = 2.1, sell_bps: float = 12.0) -> dict:
+    """Cash ledger execution at raw opens; buys are rounded down to A-share 100-share lots."""
+    output.mkdir(parents=True, exist_ok=True)
+    targets=pl.read_parquet(target_weights).with_columns(pl.col("execution_date").cast(pl.Date))
+    dates=sorted(targets["execution_date"].unique().to_list())
+    conn=duckdb.connect(str(catalog), read_only=True)
+    try:
+        prices=pl.from_arrow(conn.execute(f"SELECT trade_date,ts_code,open FROM daily_qfq WHERE trade_date BETWEEN DATE '{dates[0]}' AND DATE '{dates[-1]}' AND open>0 AND observation_status='complete_trading'").arrow()).with_columns(pl.col("trade_date").cast(pl.Date))
+    finally: conn.close()
+    price={(d,c):p for d,c,p in prices.iter_rows()}; by_date={(k[0] if isinstance(k,tuple) else k):v for k,v in targets.partition_by("execution_date",as_dict=True).items()}
+    cash=initial_capital; shares:dict[str,int]={}; rows=[]; orders=[]; prior_nav=initial_capital
+    for day in dates:
+        frame=by_date[day]; px={c:price.get((day,c)) for c in set(shares)|set(frame["ts_code"].to_list())}
+        nav_before=cash+sum(q*px.get(c,0) for c,q in shares.items() if px.get(c))
+        target={c:float(w) for c,w in frame.select("ts_code","target_weight").iter_rows()}
+        desired={c:int((target.get(c,0)*nav_before/p//100)*100) if p else 0 for c,p in px.items()}
+        sell_notional=buy_notional=cost=0.0
+        for c,q in list(shares.items()):
+            delta=desired.get(c,0)-q; p=px.get(c)
+            if delta<0 and p:
+                qty=-delta; gross=qty*p; fee=gross*sell_bps/10000; cash+=gross-fee; shares[c]-=qty; sell_notional+=gross; cost+=fee; orders.append({"execution_date":day,"ts_code":c,"side":"sell","shares":qty,"price":p,"fee":fee})
+        for c in sorted(desired):
+            delta=desired[c]-shares.get(c,0); p=px.get(c)
+            if delta>0 and p:
+                affordable=int((cash/(p*(1+buy_bps/10000))//100)*100); qty=min(delta,affordable)
+                if qty:
+                    gross=qty*p; fee=gross*buy_bps/10000; cash-=gross+fee; shares[c]=shares.get(c,0)+qty; buy_notional+=gross; cost+=fee; orders.append({"execution_date":day,"ts_code":c,"side":"buy","shares":qty,"price":p,"fee":fee})
+        nav=cash+sum(q*px.get(c,0) for c,q in shares.items() if px.get(c)); rows.append({"execution_date":day,"nav":nav,"return_since_prior_open":nav/prior_nav-1,"cash":cash,"holding_count":sum(q>0 for q in shares.values()),"buy_notional":buy_notional,"sell_notional":sell_notional,"cost":cost}); prior_nav=nav
+    pl.DataFrame(rows).write_parquet(output/"execution_daily.parquet",compression="zstd"); pl.DataFrame(orders).write_parquet(output/"orders.parquet",compression="zstd")
+    return {"initial_capital":initial_capital,"ending_nav":prior_nav,"total_return":prior_nav/initial_capital-1,"total_cost":sum(r["cost"] for r in rows),"output":str(output)}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -298,13 +364,17 @@ def main(argv: list[str] | None = None) -> None:
     def common(x): x.add_argument("--catalog",type=Path,required=True); x.add_argument("--start"); x.add_argument("--end")
     b=sub.add_parser("build-features"); common(b); b.add_argument("--factor-root",type=Path,required=True); b.add_argument("--feature-root",type=Path,required=True); b.add_argument("--factor-ids-file",type=Path); b.add_argument("--replace",action="store_true")
     r=sub.add_parser("run-oos"); common(r); r.add_argument("--feature-root",type=Path,required=True); r.add_argument("--output",type=Path,required=True)
-    s=sub.add_parser("build-top-fraction-targets"); s.add_argument("--predictions",type=Path,required=True); s.add_argument("--output",type=Path,required=True); s.add_argument("--fraction",type=float,default=.10)
-    bt=sub.add_parser("backtest-portfolio"); bt.add_argument("--catalog",type=Path,required=True); bt.add_argument("--target-weights",type=Path,required=True); bt.add_argument("--output",type=Path,required=True); bt.add_argument("--cost-bps",type=float,default=10.0)
+    s=sub.add_parser("build-top-fraction-targets"); s.add_argument("--predictions",type=Path,required=True); s.add_argument("--output",type=Path,required=True); s.add_argument("--fraction",type=float,default=.10); s.add_argument("--alpha-column",default="alpha_daily")
+    o=sub.add_parser("optimize-top-n"); o.add_argument("--predictions",type=Path,required=True); o.add_argument("--output",type=Path,required=True); o.add_argument("--alpha-column",required=True); o.add_argument("--top-n",type=int,default=50); o.add_argument("--max-weight",type=float,default=.10); o.add_argument("--turnover-penalty-bps",type=float,default=14.1)
+    bt=sub.add_parser("backtest-portfolio"); bt.add_argument("--catalog",type=Path,required=True); bt.add_argument("--target-weights",type=Path,required=True); bt.add_argument("--output",type=Path,required=True); bt.add_argument("--buy-bps",type=float,default=2.1); bt.add_argument("--sell-bps",type=float,default=12.0)
+    ex=sub.add_parser("execute-lots"); ex.add_argument("--catalog",type=Path,required=True); ex.add_argument("--target-weights",type=Path,required=True); ex.add_argument("--output",type=Path,required=True); ex.add_argument("--initial-capital",type=float,default=10_000_000.0); ex.add_argument("--buy-bps",type=float,default=2.1); ex.add_argument("--sell-bps",type=float,default=12.0)
     args=p.parse_args(argv)
     if args.command=="build-features": result=build_features(args.catalog,args.factor_root,args.feature_root,args.start,args.end,args.replace,read_factor_ids(args.factor_ids_file))
     elif args.command=="run-oos": result=run_oos(args.catalog,args.feature_root,args.output,args.start,args.end)
-    elif args.command=="build-top-fraction-targets": result=build_top_fraction_targets(args.predictions,args.output,args.fraction)
-    else: result=backtest_targets(args.catalog,args.target_weights,args.output,args.cost_bps)
+    elif args.command=="build-top-fraction-targets": result=build_top_fraction_targets(args.predictions,args.output,args.fraction,args.alpha_column)
+    elif args.command=="optimize-top-n": result=optimize_top_n_targets(args.predictions,args.output,args.alpha_column,args.top_n,args.max_weight,args.turnover_penalty_bps)
+    elif args.command=="backtest-portfolio": result=backtest_targets(args.catalog,args.target_weights,args.output,args.buy_bps,args.sell_bps)
+    else: result=execute_lot_targets(args.catalog,args.target_weights,args.output,args.initial_capital,args.buy_bps,args.sell_bps)
     print(json.dumps(result,ensure_ascii=False,default=str))
 
 if __name__ == "__main__": main()
