@@ -6,6 +6,7 @@ Portfolio construction consumes its stable wide prediction parquet separately.
 from __future__ import annotations
 
 import argparse
+import html
 import hashlib
 import json
 import os
@@ -355,6 +356,36 @@ def backtest_targets(catalog: Path, target_weights: Path, output: Path, buy_bps:
     (output/"portfolio_summary.json").write_text(json.dumps(summary,indent=2)); return summary
 
 
+def render_backtest_report(portfolio_daily: Path, output: Path, title: str = "Portfolio backtest") -> dict:
+    """Render a self-contained HTML tear sheet from portfolio_daily.parquet."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    output.mkdir(parents=True, exist_ok=True)
+    frame=pl.read_parquet(portfolio_daily).with_columns(pl.col("execution_date").cast(pl.Date)).sort("execution_date")
+    required={"gross_return","net_return","transaction_cost","buy_turnover","sell_turnover","csi500_return"}
+    missing=required-set(frame.columns)
+    if missing: raise ValueError(f"portfolio daily file missing: {sorted(missing)}")
+    gross=frame["gross_return"].to_numpy(); net=frame["net_return"].to_numpy(); csi=frame["csi500_return"].to_numpy(); cost=frame["transaction_cost"].to_numpy()
+    gross_nav=np.cumprod(1+gross); net_nav=np.cumprod(1+net); csi_nav=np.cumprod(1+csi); fee=[]; nav=1.0; paid=0.0
+    for ret, fee_rate in zip(gross,cost):
+        paid += nav*fee_rate; nav *= 1+ret-fee_rate; fee.append(paid)
+    drawdown=net_nav/np.maximum.accumulate(net_nav)-1
+    years=len(net)/252
+    def ann(value: np.ndarray) -> float: return float(np.prod(1+value)**(1/years)-1) if years else 0.0
+    def vol(value: np.ndarray) -> float: return float(np.std(value,ddof=1)*np.sqrt(252)) if len(value)>1 else 0.0
+    metrics={"days":len(frame),"start":str(frame["execution_date"][0]),"end":str(frame["execution_date"][-1]),"gross_total_return":float(gross_nav[-1]-1),"net_total_return":float(net_nav[-1]-1),"csi500_total_return":float(csi_nav[-1]-1),"gross_annualized_return":ann(gross),"net_annualized_return":ann(net),"annualized_volatility":vol(net),"net_sharpe":ann(net)/vol(net) if vol(net) else None,"information_ratio":float(np.mean(net-csi)/np.std(net-csi,ddof=1)*np.sqrt(252)) if np.std(net-csi,ddof=1) else None,"max_drawdown":float(drawdown.min()),"average_buy_turnover":float(frame["buy_turnover"].mean()),"average_sell_turnover":float(frame["sell_turnover"].mean()),"average_fee_bps":float(np.mean(cost)*10_000),"cumulative_fee_paid_on_initial_nav":float(fee[-1]),"average_holding_count":float(frame["holding_count"].mean())}
+    dates=frame["execution_date"].to_list()
+    plt.style.use("seaborn-v0_8-whitegrid")
+    fig,ax=plt.subplots(figsize=(12,5)); ax.plot(dates,gross_nav,label="Gross NAV",lw=1.8); ax.plot(dates,net_nav,label="Net NAV",lw=1.8); ax.plot(dates,csi_nav,label="CSI500 NAV",lw=1.5); ax.plot(dates,fee,label="Cumulative fee paid",lw=1.3,ls="--"); ax.set_title(title+" — NAV and fee"); ax.set_ylabel("Initial NAV = 1"); ax.legend(ncol=4,fontsize=9); fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(output/"nav_and_fee.png",dpi=160); plt.close(fig)
+    fig,axes=plt.subplots(2,1,figsize=(12,7),sharex=True); axes[0].plot(dates,drawdown,color="#c44e52",lw=1.2); axes[0].fill_between(dates,drawdown,0,color="#c44e52",alpha=.2); axes[0].set_ylabel("Net drawdown"); axes[0].set_title(title+" — drawdown and turnover"); axes[1].plot(dates,frame["buy_turnover"].to_numpy(),label="Buy turnover",lw=1); axes[1].plot(dates,frame["sell_turnover"].to_numpy(),label="Sell turnover",lw=1); axes[1].bar(dates,cost,label="Fee",alpha=.35,width=1); axes[1].set_ylabel("Fraction of NAV"); axes[1].legend(ncol=3,fontsize=9); fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(output/"drawdown_turnover_fee.png",dpi=160); plt.close(fig)
+    table="".join(f"<tr><th>{html.escape(key)}</th><td>{value:.4%}</td></tr>" if isinstance(value,float) and ("return" in key or "drawdown" in key or "turnover" in key) else f"<tr><th>{html.escape(key)}</th><td>{html.escape(str(value))}</td></tr>" for key,value in metrics.items())
+    page=f"""<!doctype html><html><head><meta charset='utf-8'><title>{html.escape(title)}</title><style>body{{font-family:Arial,sans-serif;margin:32px;color:#18212f}}table{{border-collapse:collapse}}th,td{{padding:7px 12px;border:1px solid #d9e1ea;text-align:left}}img{{display:block;max-width:1100px;width:100%;margin:20px 0}}</style></head><body><h1>{html.escape(title)}</h1><p>Return basis: T+1 open to T+2 open; benchmark: CSI500; costs use the portfolio daily ledger.</p><h2>Summary</h2><table>{table}</table><img src='nav_and_fee.png'><img src='drawdown_turnover_fee.png'></body></html>"""
+    (output/"report.html").write_text(page,encoding="utf-8"); (output/"report_summary.json").write_text(json.dumps(metrics,indent=2),encoding="utf-8")
+    return {"output":str(output),"report":str(output/"report.html"),**metrics}
+
+
 def execute_lot_targets(catalog: Path, target_weights: Path, output: Path, initial_capital: float = 10_000_000.0, buy_bps: float = 2.1, sell_bps: float = 7.1) -> dict:
     """Cash ledger execution at raw opens; buys are rounded down to A-share 100-share lots."""
     output.mkdir(parents=True, exist_ok=True)
@@ -396,6 +427,7 @@ def main(argv: list[str] | None = None) -> None:
     o=sub.add_parser("optimize-top-n"); o.add_argument("--predictions",type=Path,required=True); o.add_argument("--output",type=Path,required=True); o.add_argument("--alpha-column",required=True); o.add_argument("--top-n",type=int,default=50); o.add_argument("--max-weight",type=float,default=.10); o.add_argument("--turnover-penalty-bps",type=float,default=14.1)
     d=sub.add_parser("optimize-dual-alpha"); d.add_argument("--predictions",type=Path,required=True); d.add_argument("--output",type=Path,required=True); d.add_argument("--h1-weight",type=float,default=.5); d.add_argument("--turnover-cap",type=float,default=.30); d.add_argument("--temperature",type=float,default=2.0); d.add_argument("--max-weight",type=float,default=.10)
     bt=sub.add_parser("backtest-portfolio"); bt.add_argument("--catalog",type=Path,required=True); bt.add_argument("--target-weights",type=Path,required=True); bt.add_argument("--output",type=Path,required=True); bt.add_argument("--buy-bps",type=float,default=2.1); bt.add_argument("--sell-bps",type=float,default=7.1)
+    rp=sub.add_parser("render-backtest-report"); rp.add_argument("--portfolio-daily",type=Path,required=True); rp.add_argument("--output",type=Path,required=True); rp.add_argument("--title",default="Portfolio backtest")
     ex=sub.add_parser("execute-lots"); ex.add_argument("--catalog",type=Path,required=True); ex.add_argument("--target-weights",type=Path,required=True); ex.add_argument("--output",type=Path,required=True); ex.add_argument("--initial-capital",type=float,default=10_000_000.0); ex.add_argument("--buy-bps",type=float,default=2.1); ex.add_argument("--sell-bps",type=float,default=7.1)
     args=p.parse_args(argv)
     if args.command=="build-features": result=build_features(args.catalog,args.factor_root,args.feature_root,args.start,args.end,args.replace,read_factor_ids(args.factor_ids_file))
@@ -404,6 +436,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command=="optimize-top-n": result=optimize_top_n_targets(args.predictions,args.output,args.alpha_column,args.top_n,args.max_weight,args.turnover_penalty_bps)
     elif args.command=="optimize-dual-alpha": result=optimize_dual_alpha_targets(args.predictions,args.output,args.h1_weight,args.turnover_cap,args.temperature,args.max_weight)
     elif args.command=="backtest-portfolio": result=backtest_targets(args.catalog,args.target_weights,args.output,args.buy_bps,args.sell_bps)
+    elif args.command=="render-backtest-report": result=render_backtest_report(args.portfolio_daily,args.output,args.title)
     else: result=execute_lot_targets(args.catalog,args.target_weights,args.output,args.initial_capital,args.buy_bps,args.sell_bps)
     print(json.dumps(result,ensure_ascii=False,default=str))
 
