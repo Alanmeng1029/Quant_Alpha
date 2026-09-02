@@ -20,7 +20,6 @@ import numpy as np
 import polars as pl
 
 CORE40 = tuple([f"gtja_alpha{i:03d}_qfq_v1" for i in range(1, 21)] + [f"wq_alpha{i:03d}_qfq_v1" for i in range(1, 21)])
-HORIZONS = (1, 5)
 TRAIN_DAYS = 756
 LABEL_LAG = 6
 INDEX_CODES = ("000300.SH", "000905.SH")
@@ -60,14 +59,28 @@ def _dates(conn: duckdb.DuckDBPyConnection, start: str | None, end: str | None) 
     return [str(x[0]) for x in conn.execute("SELECT trade_date FROM observed_calendar WHERE " + " AND ".join(where) + " ORDER BY trade_date").fetchall()]
 
 
-def build_features(catalog: Path, factor_root: Path, feature_root: Path, start: str | None = None, end: str | None = None, replace: bool = False) -> dict:
-    """Pivot Core40 long factor parquet once, retaining only daily dynamic universe."""
-    paths = [_factor_path(factor_root, f) for f in CORE40]
+def read_factor_ids(path: Path | None) -> tuple[str, ...]:
+    """Read one factor id per line; comments and blank lines are ignored."""
+    if path is None:
+        return CORE40
+    factor_ids = tuple(
+        line.split("#", 1)[0].strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.split("#", 1)[0].strip()
+    )
+    if not factor_ids or len(factor_ids) != len(set(factor_ids)):
+        raise ValueError("factor id file must contain one or more unique factor ids")
+    return factor_ids
+
+
+def build_features(catalog: Path, factor_root: Path, feature_root: Path, start: str | None = None, end: str | None = None, replace: bool = False, factor_ids: tuple[str, ...] = CORE40) -> dict:
+    """Pivot selected long factor parquet files once, retaining the dynamic universe."""
+    paths = [_factor_path(factor_root, f) for f in factor_ids]
     missing = [str(p) for p in paths if not p.exists()]
     if missing: raise FileNotFoundError("Missing Core40 factor files: " + ", ".join(missing[:3]))
     feature_root.mkdir(parents=True, exist_ok=True)
     manifest_path = feature_root / "manifest.json"; digest = _fingerprint(paths)
-    manifest = {"version": 1, "factor_ids": CORE40, "factor_hash": digest, "start": start, "end": end}
+    manifest = {"version": 1, "factor_ids": factor_ids, "factor_hash": digest, "start": start, "end": end}
     expected_years = {d[:4] for d in _dates(duckdb.connect(str(catalog), read_only=True), start, end)}
     if not replace and manifest_path.exists():
         old = json.loads(manifest_path.read_text())
@@ -79,7 +92,7 @@ def build_features(catalog: Path, factor_root: Path, feature_root: Path, start: 
         unions = " UNION ALL ".join(f"SELECT trade_date, ts_code, factor_value, '{fid}' factor_id FROM read_parquet('{_sql(path)}')" for fid, path in zip(CORE40, paths))
         # The cache contract is Float32.  Extreme/invalid raw values are treated as
         # missing rather than allowing one malformed observation to abort a run.
-        columns = ", ".join(f"try_cast(max(factor_value) FILTER (WHERE factor_id='{fid}') AS FLOAT) AS {fid}" for fid in CORE40)
+        columns = ", ".join(f"try_cast(max(factor_value) FILTER (WHERE factor_id='{fid}') AS FLOAT) AS {fid}" for fid in factor_ids)
         query = f"""WITH universe AS (SELECT DISTINCT trade_date, ts_code FROM index_trading_universe u
                          WHERE index_code IN ('000300.SH','000905.SH'){date_filter}), factors AS ({unions})
                      SELECT u.trade_date, u.ts_code, {columns} FROM universe u LEFT JOIN factors f USING(trade_date, ts_code)
@@ -120,7 +133,12 @@ def build_labels(catalog: Path, start: str | None = None, end: str | None = None
         raw = pl.from_arrow(conn.execute(query).arrow()).with_columns(pl.col("trade_date").cast(pl.Date))
     finally: conn.close()
     raw = raw.filter((pl.col("trade_date") >= pl.lit(dates[0]).str.to_date()) & (pl.col("trade_date") <= pl.lit(dates[-1]).str.to_date()))
-    return raw.with_columns((pl.col("r_h1") - pl.col("r_h1").mean().over("trade_date")).alias("excess_h1"), (pl.col("r_h5") - pl.col("r_h5").mean().over("trade_date")).alias("excess_h5"))
+    return raw.with_columns(
+        (pl.col("r_h1") - pl.col("r_h1").mean().over("trade_date")).alias("excess_h1"),
+        (pl.col("r_h5") - pl.col("r_h5").mean().over("trade_date")).alias("excess_h5"),
+    ).with_columns(
+        ((pl.col("excess_h1") + pl.col("excess_h5")) / 2.0).alias("excess_h1_h5_mean")
+    )
 
 
 def winsorize_labels(frame: pl.DataFrame, column: str) -> pl.DataFrame:
@@ -128,28 +146,28 @@ def winsorize_labels(frame: pl.DataFrame, column: str) -> pl.DataFrame:
     return frame.with_columns(pl.col(column).quantile(.01).over("trade_date").alias(low), pl.col(column).quantile(.99).over("trade_date").alias(high)).with_columns(pl.col(column).clip(pl.col(low), pl.col(high)).alias(column)).drop(low, high)
 
 
-def standardize_features(frame: pl.DataFrame) -> pl.DataFrame:
-    """Date-by-date Core40 winsorization and z-score in the dynamic universe.
+def standardize_features(frame: pl.DataFrame, factor_ids: tuple[str, ...] = CORE40) -> pl.DataFrame:
+    """Date-by-date winsorization and z-score in the dynamic universe.
 
     This uses only values observable at the signal close.  Keeping it after the
     raw cache means a future DB source produces identical model inputs.
     """
     result = frame
     bounds = []
-    for feature in CORE40:
+    for feature in factor_ids:
         bounds.extend((
             pl.col(feature).quantile(.01).over("trade_date").alias(f"__{feature}_p01"),
             pl.col(feature).quantile(.99).over("trade_date").alias(f"__{feature}_p99"),
         ))
     result = result.with_columns(bounds)
-    clipped = [pl.col(feature).clip(pl.col(f"__{feature}_p01"), pl.col(f"__{feature}_p99")).alias(f"__{feature}_clip") for feature in CORE40]
+    clipped = [pl.col(feature).clip(pl.col(f"__{feature}_p01"), pl.col(f"__{feature}_p99")).alias(f"__{feature}_clip") for feature in factor_ids]
     result = result.with_columns(clipped)
     zscores = []
-    for feature in CORE40:
+    for feature in factor_ids:
         value = pl.col(f"__{feature}_clip")
         deviation = value.std().over("trade_date")
         zscores.append(pl.when(deviation > 1e-12).then((value - value.mean().over("trade_date")) / deviation).otherwise(None).cast(pl.Float32).alias(feature))
-    return result.with_columns(zscores).drop([f"__{feature}_{suffix}" for feature in CORE40 for suffix in ("p01", "p99", "clip")])
+    return result.with_columns(zscores).drop([f"__{feature}_{suffix}" for feature in factor_ids for suffix in ("p01", "p99", "clip")])
 
 
 def rolling_windows(dates: list[str]) -> list[tuple[str, list[str]]]:
@@ -174,33 +192,34 @@ def run_oos(catalog: Path, feature_root: Path, output: Path, start: str | None =
     output.mkdir(parents=True, exist_ok=True); models = output / "models"; models.mkdir(exist_ok=True)
     files = sorted(feature_root.glob("year=*/features.parquet"));
     if not files: raise FileNotFoundError("Feature cache is empty; run build-features first")
+    feature_manifest = json.loads((feature_root / "manifest.json").read_text(encoding="utf-8"))
+    factor_ids = tuple(feature_manifest["factor_ids"])
     features = pl.concat([pl.read_parquet(p) for p in files]).with_columns(pl.col("trade_date").cast(pl.Date))
     labels = build_labels(catalog, start, end)
-    panel = standardize_features(features).join(labels, on=["trade_date", "ts_code"], how="left")
+    panel = standardize_features(features, factor_ids).join(labels, on=["trade_date", "ts_code"], how="left")
     dates = sorted(str(x) for x in panel.select("trade_date").unique().to_series().to_list())
     windows = rolling_windows(dates); records=[]; timings=[]; importance=[]
     for signal, train_dates in windows:
         month = signal[:7]; month_dates=[d for d in dates if d[:7]==month and (not end or d<=end)]
         train = panel.filter(pl.col("trade_date").cast(pl.String).is_in(train_dates)); test = panel.filter(pl.col("trade_date").cast(pl.String).is_in(month_dates))
         if test.height == 0: continue
-        month_start=time.perf_counter(); predictions={}
-        for h in HORIZONS:
-            target=f"excess_h{h}"; fit=winsorize_labels(train.filter(pl.col(target).is_not_null()), target)
-            x=fit.select(CORE40).to_numpy(); y=fit[target].to_numpy()
-            model=lgb.train(settings.params(), lgb.Dataset(x, label=y, feature_name=list(CORE40)), num_boost_round=settings.num_boost_round)
-            model_dir=models / f"month={month}"; model_dir.mkdir(parents=True, exist_ok=True); model.save_model(str(model_dir / f"h{h}.txt"))
-            predictions[h]=model.predict(test.select(CORE40).to_numpy())
-            importance.extend({"model_month":month,"horizon":h,"feature":f,"importance":float(v)} for f,v in zip(CORE40, model.feature_importance()))
-        out=test.select("trade_date","ts_code").with_columns(pl.Series("pred_h1", predictions[1]),pl.Series("pred_h5",predictions[5])).with_columns((.25*pl.col("pred_h1")+.75*pl.col("pred_h5")/5).alias("alpha_daily"),pl.lit(month).alias("model_month"),pl.col("trade_date").shift(-1).over("ts_code").alias("execution_date"))
+        month_start=time.perf_counter(); target="excess_h1_h5_mean"
+        fit=winsorize_labels(train.filter(pl.col(target).is_not_null()), target)
+        x=fit.select(factor_ids).to_numpy(); y=fit[target].to_numpy()
+        model=lgb.train(settings.params(), lgb.Dataset(x, label=y, feature_name=list(factor_ids)), num_boost_round=settings.num_boost_round)
+        model_dir=models / f"month={month}"; model_dir.mkdir(parents=True, exist_ok=True); model.save_model(str(model_dir / "mean_h1_h5.txt"))
+        prediction=model.predict(test.select(factor_ids).to_numpy())
+        importance.extend({"model_month":month,"horizon":"mean_h1_h5","feature":f,"importance":float(v)} for f,v in zip(factor_ids, model.feature_importance()))
+        out=test.select("trade_date","ts_code").with_columns(pl.Series("pred_h1_h5_mean", prediction)).with_columns(pl.col("pred_h1_h5_mean").alias("alpha_daily"),pl.lit(month).alias("model_month"),pl.col("trade_date").shift(-1).over("ts_code").alias("execution_date"))
         # execution date is market-calendar based, not per-stock; repair via date mapping.
         next_map={dates[i]:dates[i+1] for i in range(len(dates)-1)}; out=out.with_columns(pl.col("trade_date").cast(pl.String).replace_strict(next_map, default=None).str.to_date().alias("execution_date"))
         records.append(out); timings.append({"model_month":month,"seconds":time.perf_counter()-month_start,"training_start":train_dates[0],"training_end":train_dates[-1],"training_days":len(train_dates)})
-        (models / f"month={month}" / "manifest.json").write_text(json.dumps({"training_start":train_dates[0],"training_end":train_dates[-1],"feature_hash":hashlib.sha256("|".join(CORE40).encode()).hexdigest(),"settings":asdict(settings)},indent=2))
+        (models / f"month={month}" / "manifest.json").write_text(json.dumps({"training_start":train_dates[0],"training_end":train_dates[-1],"factor_ids":factor_ids,"feature_hash":hashlib.sha256("|".join(factor_ids).encode()).hexdigest(),"target":target,"settings":asdict(settings)},indent=2))
     pred=pl.concat(records) if records else pl.DataFrame(); pred.write_parquet(output / "predictions.parquet", compression="zstd")
     evaluation=pred.join(labels,on=["trade_date","ts_code"],how="left")
-    summary={"settings":asdict(settings),"oos_start":str(pred["trade_date"].min()) if pred.height else None,"oos_end":str(pred["trade_date"].max()) if pred.height else None,"h1":_metrics(evaluation,"pred_h1","excess_h1"),"h5":_metrics(evaluation,"pred_h5","excess_h5"),"alpha_h1":_metrics(evaluation,"alpha_daily","excess_h1"),"alpha_h5_dailyized":_metrics(evaluation,"alpha_daily","excess_h5")}
+    summary={"settings":asdict(settings),"factor_ids":factor_ids,"target":"equal_mean_of_excess_h1_and_excess_h5","oos_start":str(pred["trade_date"].min()) if pred.height else None,"oos_end":str(pred["trade_date"].max()) if pred.height else None,"mean_target":_metrics(evaluation,"alpha_daily","excess_h1_h5_mean"),"alpha_h1":_metrics(evaluation,"alpha_daily","excess_h1"),"alpha_h5":_metrics(evaluation,"alpha_daily","excess_h5")}
     pl.DataFrame(timings, schema={"model_month":pl.String,"seconds":pl.Float64,"training_start":pl.String,"training_end":pl.String,"training_days":pl.Int64}).write_parquet(output / "model_timings.parquet")
-    pl.DataFrame(importance, schema={"model_month":pl.String,"horizon":pl.Int64,"feature":pl.String,"importance":pl.Float64}).write_parquet(output / "feature_importance.parquet")
+    pl.DataFrame(importance, schema={"model_month":pl.String,"horizon":pl.String,"feature":pl.String,"importance":pl.Float64}).write_parquet(output / "feature_importance.parquet")
     (output / "summary.json").write_text(json.dumps(summary,indent=2,default=str)); return summary
 
 
@@ -243,11 +262,11 @@ def backtest_targets(catalog: Path, target_weights: Path, output: Path, cost_bps
 def main(argv: list[str] | None = None) -> None:
     p=argparse.ArgumentParser(prog="quant-predict"); sub=p.add_subparsers(dest="command",required=True)
     def common(x): x.add_argument("--catalog",type=Path,required=True); x.add_argument("--start"); x.add_argument("--end")
-    b=sub.add_parser("build-features"); common(b); b.add_argument("--factor-root",type=Path,required=True); b.add_argument("--feature-root",type=Path,required=True); b.add_argument("--replace",action="store_true")
+    b=sub.add_parser("build-features"); common(b); b.add_argument("--factor-root",type=Path,required=True); b.add_argument("--feature-root",type=Path,required=True); b.add_argument("--factor-ids-file",type=Path); b.add_argument("--replace",action="store_true")
     r=sub.add_parser("run-oos"); common(r); r.add_argument("--feature-root",type=Path,required=True); r.add_argument("--output",type=Path,required=True)
     bt=sub.add_parser("backtest-portfolio"); bt.add_argument("--catalog",type=Path,required=True); bt.add_argument("--target-weights",type=Path,required=True); bt.add_argument("--output",type=Path,required=True); bt.add_argument("--cost-bps",type=float,default=10.0)
     args=p.parse_args(argv)
-    if args.command=="build-features": result=build_features(args.catalog,args.factor_root,args.feature_root,args.start,args.end,args.replace)
+    if args.command=="build-features": result=build_features(args.catalog,args.factor_root,args.feature_root,args.start,args.end,args.replace,read_factor_ids(args.factor_ids_file))
     elif args.command=="run-oos": result=run_oos(args.catalog,args.feature_root,args.output,args.start,args.end)
     else: result=backtest_targets(args.catalog,args.target_weights,args.output,args.cost_bps)
     print(json.dumps(result,ensure_ascii=False,default=str))

@@ -1669,8 +1669,12 @@ fn run_optimizer(args: OptimizePortfolioArgs) -> Result<PathBuf> {
         // diagnostics retain all realised deviations for later tightening.
         .eps_abs(1e-3)
         .eps_rel(1e-3)
-        .max_iter(100)
-        .polishing(false);
+        // The full CSI300 ∪ CSI500 universe has roughly 1,200 names and more
+        // than 3,000 constraints.  One hundred ADMM iterations was not enough
+        // to obtain a primal solution, so every day silently used the fallback.
+        // Keep the 10bp feasibility tolerance but allow the actual QP to solve.
+        .max_iter(1_000)
+        .polishing(true);
     let mut problem = Problem::new(pmat, &q, a, &lower, &upper, &settings).context("setup OSQP")?;
     let query = format!(
         "SELECT trade_date::VARCHAR AS signal_date, execution_date::VARCHAR, ts_code, alpha_daily FROM read_parquet('{p}') WHERE trade_date BETWEEN DATE '{start}' AND DATE '{end}' AND execution_date IS NOT NULL ORDER BY trade_date, ts_code"
@@ -1749,7 +1753,24 @@ fn run_optimizer(args: OptimizePortfolioArgs) -> Result<PathBuf> {
             Status::__Nonexhaustive => "unknown",
         }
         .to_string();
-        let solution = result.x().map(|x| x[..n].to_vec());
+        // OSQP exposes a primal iterate for max-iteration/time-limit exits, but
+        // `Status::x()` intentionally hides it because it is not certified as
+        // optimal.  Our published constraints allow a 10bp feasibility error,
+        // so retain this near-feasible iterate instead of discarding it in
+        // favour of an unrelated heuristic portfolio.  The status remains in
+        // the output for downstream filtering.
+        let solution = match &result {
+            Status::Solved(solution)
+            | Status::SolvedInaccurate(solution)
+            | Status::MaxIterationsReached(solution)
+            | Status::TimeLimitReached(solution) => Some(solution.x()[..n].to_vec()),
+            Status::PrimalInfeasible(_)
+            | Status::PrimalInfeasibleInaccurate(_)
+            | Status::DualInfeasible(_)
+            | Status::DualInfeasibleInaccurate(_)
+            | Status::NonConvex(_)
+            | Status::__Nonexhaustive => None,
+        };
         let fallback = solution.is_none();
         let next = solution.unwrap_or_else(|| {
             heuristic_rebalance(
