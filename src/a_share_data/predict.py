@@ -89,7 +89,7 @@ def build_features(catalog: Path, factor_root: Path, feature_root: Path, start: 
     conn = duckdb.connect(str(catalog), read_only=True)
     try:
         date_filter = "".join((f" AND u.trade_date >= DATE '{start}'" if start else "", f" AND u.trade_date <= DATE '{end}'" if end else ""))
-        unions = " UNION ALL ".join(f"SELECT trade_date, ts_code, factor_value, '{fid}' factor_id FROM read_parquet('{_sql(path)}')" for fid, path in zip(CORE40, paths))
+        unions = " UNION ALL ".join(f"SELECT trade_date, ts_code, factor_value, '{fid}' factor_id FROM read_parquet('{_sql(path)}')" for fid, path in zip(factor_ids, paths))
         # The cache contract is Float32.  Extreme/invalid raw values are treated as
         # missing rather than allowing one malformed observation to abort a run.
         columns = ", ".join(f"try_cast(max(factor_value) FILTER (WHERE factor_id='{fid}') AS FLOAT) AS {fid}" for fid in factor_ids)
@@ -110,7 +110,7 @@ def build_features(catalog: Path, factor_root: Path, feature_root: Path, start: 
 
 
 def build_labels(catalog: Path, start: str | None = None, end: str | None = None) -> pl.DataFrame:
-    """Executable VWAP labels: entry T+1, exits T+2/T+6, then daily EW excess."""
+    """Executable open-to-open labels: entry T+1, exits T+2/T+6."""
     conn = duckdb.connect(str(catalog), read_only=True)
     try:
         dates = _dates(conn, start, end)
@@ -119,7 +119,7 @@ def build_labels(catalog: Path, start: str | None = None, end: str | None = None
         query = """WITH calendar AS (SELECT trade_date, row_number() over(order by trade_date) n FROM observed_calendar WHERE is_observed_market_day),
         uni AS (SELECT DISTINCT u.trade_date,u.ts_code FROM index_trading_universe u WHERE index_code IN ('000300.SH','000905.SH')),
         raw AS (SELECT u.trade_date,u.ts_code,
-          d1.qfq_vwap e, d2.qfq_vwap x1, d6.qfq_vwap x5,
+          d1.qfq_open e, d2.qfq_open x1, d6.qfq_open x5,
           d1.amount_cny a1, d2.amount_cny a2, d6.amount_cny a6,
           d1.observation_status s1,d2.observation_status s2,d6.observation_status s6
           FROM uni u JOIN calendar c ON c.trade_date=u.trade_date
@@ -258,17 +258,17 @@ def build_top_fraction_targets(predictions: Path, output: Path, fraction: float 
 
 
 def backtest_targets(catalog: Path, target_weights: Path, output: Path, cost_bps: float = 10.0) -> dict:
-    """T+1 VWAP target-weight backtest, with equal-weight active benchmark."""
+    """T+1-open to T+2-open target-weight backtest, with EW benchmark."""
     output.mkdir(parents=True, exist_ok=True)
     targets = pl.read_parquet(target_weights).with_columns(pl.col("execution_date").cast(pl.Date))
     execution_dates = sorted(targets["execution_date"].drop_nulls().unique().to_list())
     if len(execution_dates) < 2: raise ValueError("Need at least two execution dates")
     conn = duckdb.connect(str(catalog), read_only=True)
     try:
-        prices = pl.from_arrow(conn.execute(f"SELECT trade_date, ts_code, qfq_vwap FROM daily_qfq WHERE trade_date BETWEEN DATE '{execution_dates[0]}' AND DATE '{execution_dates[-1]}' AND qfq_vwap > 0").arrow()).with_columns(pl.col("trade_date").cast(pl.Date))
+        prices = pl.from_arrow(conn.execute(f"SELECT trade_date, ts_code, qfq_open FROM daily_qfq WHERE trade_date BETWEEN DATE '{execution_dates[0]}' AND DATE '{execution_dates[-1]}' AND qfq_open > 0").arrow()).with_columns(pl.col("trade_date").cast(pl.Date))
     finally: conn.close()
     by_date = {(day[0] if isinstance(day, tuple) else day): frame for day, frame in targets.partition_by("execution_date", as_dict=True).items()}
-    price = {(row[0], row[1]): row[2] for row in prices.select("trade_date", "ts_code", "qfq_vwap").iter_rows()}
+    price = {(row[0], row[1]): row[2] for row in prices.select("trade_date", "ts_code", "qfq_open").iter_rows()}
     rows=[]; previous={}; nav=1.0; bench_nav=1.0
     for i, day in enumerate(execution_dates[:-1]):
         next_day=execution_dates[i+1]; frame=by_date[day]; current={code: float(weight) for code,weight in frame.select("ts_code","target_weight").iter_rows() if weight > 0}
