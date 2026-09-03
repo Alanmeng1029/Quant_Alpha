@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -69,6 +70,11 @@ class Paths:
     @property
     def index_daily(self) -> Path:
         return self.lake / "canonical" / "index_daily"
+
+    @property
+    def baostock_qfq_daily(self) -> Path:
+        """Direct BaoStock 前复权日线; kept separate from minute-derived bars."""
+        return self.lake / "canonical" / "baostock_qfq_csi300_csi500_v1"
 
     @property
     def quality(self) -> Path:
@@ -681,6 +687,102 @@ def cmd_ingest_adjustment(args: argparse.Namespace) -> None:
         shutil.rmtree(run_root, ignore_errors=True)
 
 
+def cmd_fetch_baostock_qfq_universe(args: argparse.Namespace) -> None:
+    """Fetch BaoStock qfq daily bars for every historical CSI300/CSI500 member.
+
+    This is deliberately a separate canonical dataset.  It never overwrites
+    the supplier adjustment-factor pipeline or its `daily_qfq` view.
+    """
+    try:
+        import baostock as bs
+    except ImportError as exc:
+        raise RuntimeError("BaoStock is required; install the baostock package in the active environment") from exc
+    paths = Paths(Path(args.data_root))
+    if not paths.catalog.exists():
+        raise FileNotFoundError("Catalog does not exist; run build-catalog first")
+    start = args.start
+    end = args.end
+    output = Path(args.output) if args.output else paths.lake / "canonical" / "baostock_qfq_csi300_csi500_v1"
+    output.mkdir(parents=True, exist_ok=True)
+    conn = duckdb.connect(str(paths.catalog), read_only=True)
+    try:
+        all_codes = [row[0] for row in conn.execute(
+            """SELECT DISTINCT ts_code FROM index_trading_universe
+               WHERE index_code IN ('000300.SH', '000905.SH')
+                 AND trade_date BETWEEN ? AND ? ORDER BY ts_code""",
+            [start, end],
+        ).fetchall()]
+    finally:
+        conn.close()
+    if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count:
+        raise ValueError("shard-index must be in [0, shard-count)")
+    codes = [code for index, code in enumerate(all_codes) if index % args.shard_count == args.shard_index]
+    login = bs.login()
+    if login.error_code != "0":
+        raise RuntimeError(f"BaoStock login failed: {login.error_msg}")
+    fields = "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,pctChg,tradestatus,isST"
+    columns = ["trade_date", "baostock_code", "open", "high", "low", "close", "preclose", "volume", "amount", "adjustflag", "turn", "pct_chg", "trade_status", "is_st"]
+    fetched = skipped = 0
+    failures: list[dict[str, str]] = []
+    try:
+        for index, ts_code in enumerate(codes, start=1):
+            destination = output / f"ts_code={ts_code}" / "daily.parquet"
+            if destination.exists() and not args.replace:
+                skipped += 1
+                continue
+            number, exchange = ts_code.split(".")
+            bs_code = f"{exchange.lower()}.{number}"
+            result = None
+            error = ""
+            for attempt in range(args.retries):
+                result = bs.query_history_k_data_plus(bs_code, fields, start, end, frequency="d", adjustflag="2")
+                if result.error_code == "0":
+                    break
+                error = result.error_msg
+                # BaoStock may reset long-lived sockets. Reconnect before a
+                # bounded retry; completed per-stock files remain untouched.
+                try:
+                    bs.logout()
+                finally:
+                    time.sleep(args.retry_delay * (attempt + 1))
+                relogin = bs.login()
+                if relogin.error_code != "0":
+                    error = f"relogin failed: {relogin.error_msg}"
+            if result is None or result.error_code != "0":
+                failures.append({"ts_code": ts_code, "error": error})
+                continue
+            rows: list[list[str]] = []
+            while result.next():
+                rows.append(result.get_row_data())
+            if not rows:
+                failures.append({"ts_code": ts_code, "error": "no rows returned"})
+                continue
+            frame = pl.DataFrame(rows, schema=columns, orient="row").with_columns(
+                pl.lit(ts_code).alias("ts_code"),
+                pl.col("trade_date").str.to_date(),
+                *[pl.col(column).cast(pl.Float64, strict=False) for column in ("open", "high", "low", "close", "preclose", "volume", "amount", "turn", "pct_chg")],
+            ).select("trade_date", "ts_code", "open", "high", "low", "close", "preclose", "volume", "amount", "turn", "pct_chg", "trade_status", "is_st", "adjustflag")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_suffix(".tmp")
+            frame.write_parquet(temporary, compression="zstd")
+            os.replace(temporary, destination)
+            fetched += 1
+            if args.request_delay:
+                time.sleep(args.request_delay)
+            if index % 50 == 0:
+                print(json.dumps({"processed": index, "total": len(codes), "fetched": fetched, "failed": len(failures)}, ensure_ascii=False), flush=True)
+    finally:
+        bs.logout()
+    manifest = {
+        "source": "BaoStock", "adjustflag": "2 (qfq)", "universe": "historical CSI300 union CSI500",
+        "start": start, "end": end, "total_universe_codes": len(all_codes), "requested_codes": len(codes), "fetched_codes": fetched,
+        "skipped_codes": skipped, "failures": failures,
+    }
+    manifest_name = "manifest.json" if args.shard_count == 1 else f"manifest_shard-{args.shard_index}-of-{args.shard_count}.json"
+    (output / manifest_name).write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({"output": str(output), **manifest}, ensure_ascii=False))
+
+
 def daily_glob(paths: Paths) -> Path:
     return paths.canonical_daily / "year=*" / "daily.parquet"
 
@@ -872,9 +974,24 @@ def cmd_build_catalog(args: argparse.Namespace) -> None:
         universe = sql_path(universe_glob(paths))
         index_constituents = sql_path(index_constituent_glob(paths))
         index_daily = sql_path(paths.index_daily / "index_daily.parquet")
+        baostock_qfq = sql_path(paths.baostock_qfq_daily / "ts_code=*" / "daily.parquet")
         validation = sql_path(paths.quality / "validation_results.parquet")
         conn.execute(f"CREATE OR REPLACE VIEW minute_bars AS SELECT * FROM read_parquet('{minute}', hive_partitioning = true)")
         conn.execute(f"CREATE OR REPLACE VIEW daily_aggregated AS SELECT * FROM read_parquet('{daily}', hive_partitioning = true)")
+        # Prefer the direct vendor 前复权 OHLC where it has been downloaded.
+        # The adjustment-factor route remains as a backward-compatible fallback
+        # for a partial download and for existing small test fixtures.
+        if list(paths.baostock_qfq_daily.glob("ts_code=*/daily.parquet")):
+            conn.execute(f"CREATE OR REPLACE VIEW baostock_qfq_daily AS SELECT * FROM read_parquet('{baostock_qfq}', hive_partitioning = true)")
+        else:
+            conn.execute("""
+                CREATE OR REPLACE VIEW baostock_qfq_daily AS
+                SELECT CAST(NULL AS DATE) AS trade_date, CAST(NULL AS VARCHAR) AS ts_code,
+                  CAST(NULL AS DOUBLE) AS open, CAST(NULL AS DOUBLE) AS high,
+                  CAST(NULL AS DOUBLE) AS low, CAST(NULL AS DOUBLE) AS close,
+                  CAST(NULL AS DOUBLE) AS volume, CAST(NULL AS DOUBLE) AS amount
+                WHERE false
+            """)
         if (paths.index_daily / "index_daily.parquet").exists():
             conn.execute(f"CREATE OR REPLACE VIEW index_daily AS SELECT * FROM read_parquet('{index_daily}')")
         else:
@@ -895,20 +1012,23 @@ def cmd_build_catalog(args: argparse.Namespace) -> None:
                 d.*,
                 a.snapshot_date AS adjustment_snapshot_date,
                 a.vendor_qfq_ratio,
-                CASE WHEN a.validation_status = 'valid' THEN d.open * a.vendor_qfq_ratio END AS qfq_open,
-                CASE WHEN a.validation_status = 'valid' THEN d.high * a.vendor_qfq_ratio END AS qfq_high,
-                CASE WHEN a.validation_status = 'valid' THEN d.low * a.vendor_qfq_ratio END AS qfq_low,
-                CASE WHEN a.validation_status = 'valid' THEN d.close * a.vendor_qfq_ratio END AS qfq_close,
-                CASE WHEN a.validation_status = 'valid' THEN d.vwap * a.vendor_qfq_ratio END AS qfq_vwap,
-                CASE WHEN a.validation_status = 'valid' THEN d.twap_close * a.vendor_qfq_ratio END AS qfq_twap,
+                CASE WHEN b.open > 0 THEN b.open WHEN a.validation_status = 'valid' THEN d.open * a.vendor_qfq_ratio END AS qfq_open,
+                CASE WHEN b.high > 0 THEN b.high WHEN a.validation_status = 'valid' THEN d.high * a.vendor_qfq_ratio END AS qfq_high,
+                CASE WHEN b.low > 0 THEN b.low WHEN a.validation_status = 'valid' THEN d.low * a.vendor_qfq_ratio END AS qfq_low,
+                CASE WHEN b.close > 0 THEN b.close WHEN a.validation_status = 'valid' THEN d.close * a.vendor_qfq_ratio END AS qfq_close,
+                CASE WHEN b.close > 0 AND d.volume_share > 0 THEN b.close * d.amount_cny / d.volume_share WHEN a.validation_status = 'valid' THEN d.vwap * a.vendor_qfq_ratio END AS qfq_vwap,
+                CASE WHEN b.close > 0 THEN b.close WHEN a.validation_status = 'valid' THEN d.twap_close * a.vendor_qfq_ratio END AS qfq_twap,
                 CASE
-                    WHEN d.close IS NOT NULL
+                    WHEN b.close > 0
+                     AND lag(b.close) OVER (PARTITION BY d.ts_code ORDER BY d.trade_date) > 0
+                    THEN b.close / lag(b.close) OVER (PARTITION BY d.ts_code ORDER BY d.trade_date) - 1
+                    WHEN b.close IS NULL AND d.close IS NOT NULL
                      AND lag(d.close * a.vendor_qfq_ratio) OVER (PARTITION BY d.ts_code ORDER BY d.trade_date) > 0
-                    THEN d.close * a.vendor_qfq_ratio
-                       / lag(d.close * a.vendor_qfq_ratio) OVER (PARTITION BY d.ts_code ORDER BY d.trade_date) - 1
+                    THEN d.close * a.vendor_qfq_ratio / lag(d.close * a.vendor_qfq_ratio) OVER (PARTITION BY d.ts_code ORDER BY d.trade_date) - 1
                 END AS qfq_return
             FROM daily_aggregated d
             LEFT JOIN latest_adjustment a USING (ts_code, trade_date)
+            LEFT JOIN baostock_qfq_daily b USING (ts_code, trade_date)
             """
         )
         conn.execute("""
@@ -966,7 +1086,7 @@ def cmd_build_catalog(args: argparse.Namespace) -> None:
             SELECT 'trading_universe', min(trade_date), max(trade_date), count(*) FROM trading_universe
             """
         )
-        print(json.dumps({"catalog": str(paths.catalog), "views": 14}, ensure_ascii=False))
+        print(json.dumps({"catalog": str(paths.catalog), "views": 15}, ensure_ascii=False))
     finally:
         conn.close()
 
@@ -1162,6 +1282,19 @@ def build_parser() -> argparse.ArgumentParser:
     adjustment.add_argument("--source-dir", help="Override adjustment CSV directory")
     adjustment.add_argument("--replace", action="store_true", help="Archive and replace an existing snapshot")
     adjustment.set_defaults(handler=cmd_ingest_adjustment)
+
+    baostock_qfq = subparsers.add_parser("fetch-baostock-qfq-universe", help="Fetch BaoStock qfq daily bars for historical CSI300/CSI500 members")
+    add_common_arguments(baostock_qfq)
+    baostock_qfq.add_argument("--start", default="2018-01-01")
+    baostock_qfq.add_argument("--end", default=datetime.now().date().isoformat())
+    baostock_qfq.add_argument("--output", help="Separate output root; defaults to lake/canonical/baostock_qfq_csi300_csi500_v1")
+    baostock_qfq.add_argument("--replace", action="store_true", help="Refetch existing per-stock files")
+    baostock_qfq.add_argument("--shard-count", type=int, default=1, help="Split the historical universe into deterministic download shards")
+    baostock_qfq.add_argument("--shard-index", type=int, default=0, help="Zero-based shard number")
+    baostock_qfq.add_argument("--retries", type=int, default=3, help="Retries after a BaoStock network error")
+    baostock_qfq.add_argument("--retry-delay", type=float, default=2.0, help="Base seconds to wait before reconnecting")
+    baostock_qfq.add_argument("--request-delay", type=float, default=0.0, help="Seconds to pause after each successful stock request")
+    baostock_qfq.set_defaults(handler=cmd_fetch_baostock_qfq_universe)
 
     catalog = subparsers.add_parser("build-catalog", help="Create DuckDB SQL views over Parquet")
     add_common_arguments(catalog)

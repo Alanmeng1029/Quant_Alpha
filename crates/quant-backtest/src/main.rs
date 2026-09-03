@@ -191,7 +191,7 @@ struct LabelSpec {
 fn label_specs(horizons: &[i32]) -> Vec<LabelSpec> {
     let mut specs = Vec::new();
     for horizon in horizons {
-        for label in ["close_to_close", "vwap_to_vwap", "twap_to_twap"] {
+        for label in ["close_to_close", "open_to_open", "vwap_to_vwap", "twap_to_twap"] {
             let prefix = format!("{label}_h{horizon}");
             specs.push(LabelSpec {
                 label,
@@ -444,6 +444,7 @@ fn return_view_sql(horizon: i32, label: &str) -> String {
         );
     }
     let price = match label {
+        "open_to_open" => "qfq_open",
         "vwap_to_vwap" => "qfq_vwap",
         "twap_to_twap" => "qfq_twap",
         _ => unreachable!("validated return label"),
@@ -573,7 +574,7 @@ fn build_label_cache(
         joins.push(format!("LEFT JOIN market_calendar exit_calendar_{horizon} ON exit_calendar_{horizon}.day_index = signal_calendar.day_index + 1 + {horizon}"));
         joins.push(format!("LEFT JOIN daily_qfq exit_day_{horizon} ON exit_day_{horizon}.ts_code = base.ts_code AND exit_day_{horizon}.trade_date = exit_calendar_{horizon}.trade_date"));
         columns.push(format!("CASE WHEN close_target_{horizon}.qfq_close > 0 THEN close_target_{horizon}.qfq_close / base.qfq_close - 1 END AS close_to_close_h{horizon}_raw"));
-        for (label, price) in [("vwap_to_vwap", "qfq_vwap"), ("twap_to_twap", "qfq_twap")] {
+        for (label, price) in [("open_to_open", "qfq_open"), ("vwap_to_vwap", "qfq_vwap"), ("twap_to_twap", "qfq_twap")] {
             columns.push(format!("CASE WHEN entry_day.{price} > 0 AND exit_day_{horizon}.{price} > 0 AND entry_day.observation_status = 'complete_trading' AND exit_day_{horizon}.observation_status = 'complete_trading' AND entry_day.amount_cny > 0 AND exit_day_{horizon}.amount_cny > 0 THEN exit_day_{horizon}.{price} / entry_day.{price} - 1 END AS {label}_h{horizon}_raw"));
         }
     }
@@ -604,8 +605,9 @@ fn build_label_cache(
         benchmark_joins.push(format!("LEFT JOIN market_calendar exit_calendar_{horizon} ON exit_calendar_{horizon}.day_index = signal_calendar.day_index + 1 + {horizon}"));
         benchmark_joins.push(format!("LEFT JOIN index_daily exit_index_{horizon} ON exit_index_{horizon}.index_code = '000905.SH' AND exit_index_{horizon}.trade_date = exit_calendar_{horizon}.trade_date"));
         benchmark_columns.push(format!("CASE WHEN start_index.close > 0 AND close_end_{horizon}.close > 0 THEN close_end_{horizon}.close / start_index.close - 1 END AS close_to_close_h{horizon}_csi500"));
-        for label in ["vwap_to_vwap", "twap_to_twap"] {
-            benchmark_columns.push(format!("CASE WHEN entry_index.close > 0 AND exit_index_{horizon}.close > 0 THEN exit_index_{horizon}.close / entry_index.close - 1 END AS {label}_h{horizon}_csi500"));
+        for label in ["open_to_open", "vwap_to_vwap", "twap_to_twap"] {
+            let price = if label == "open_to_open" { "open" } else { "close" };
+            benchmark_columns.push(format!("CASE WHEN entry_index.{price} > 0 AND exit_index_{horizon}.{price} > 0 THEN exit_index_{horizon}.{price} / entry_index.{price} - 1 END AS {label}_h{horizon}_csi500"));
         }
     }
     let benchmark_query = format!(

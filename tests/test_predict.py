@@ -3,9 +3,12 @@ from __future__ import annotations
 import unittest
 from datetime import date, timedelta
 
+import numpy as np
 import polars as pl
 
-from a_share_data.predict import CORE40, LABEL_LAG, TRAIN_DAYS, read_factor_ids, rolling_windows, winsorize_labels
+from a_share_data.predict import CORE40, LABEL_LAG, TRAIN_DAYS, project_capped_simplex, read_factor_ids, rolling_windows, winsorize_labels
+from a_share_data.ensemble import SelectionSettings, select_features
+from a_share_data.factors import _restrict_storage_universe
 
 
 class PredictionProtocolTests(unittest.TestCase):
@@ -44,6 +47,31 @@ class PredictionProtocolTests(unittest.TestCase):
             path.write_text("wq_alpha001_qfq_v1\nwq_alpha001_qfq_v1\n")
             with self.assertRaises(ValueError):
                 read_factor_ids(path)
+
+    def test_capped_simplex_preserves_budget_and_cap(self) -> None:
+        result = project_capped_simplex(np.array([10.0, 1.0, 1.0]), .5)
+        self.assertAlmostEqual(float(result.sum()), 1.0)
+        self.assertLessEqual(float(result.max()), .5)
+        self.assertAlmostEqual(float(result[0]), .5)
+
+    def test_rolling_selection_filters_low_coverage_and_duplicate_features(self) -> None:
+        rows = []
+        for day in range(8):
+            for code in range(5):
+                value = float(code - 2)
+                rows.append({"trade_date": date(2024, 1, 2) + timedelta(days=day), "ts_code": str(code), "good": value, "duplicate": value, "sparse": value if code == 0 else None, "target": value})
+        selected, diagnostics = select_features(pl.DataFrame(rows), ("good", "duplicate", "sparse"), "target", SelectionSettings(min_coverage=.8, min_abs_icir=0, max_features=3, max_abs_correlation=.8))
+        self.assertIn("good", selected)
+        self.assertNotIn("sparse", selected)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(len(diagnostics), 2)
+
+    def test_factor_storage_keeps_only_daily_index_union_members(self) -> None:
+        day = date(2024, 1, 2)
+        values = pl.DataFrame({"trade_date": [day, day, day], "ts_code": ["A", "B", "C"], "factor_value": [1.0, 2.0, 3.0]})
+        members = pl.DataFrame({"trade_date": [day, day], "ts_code": ["A", "C"]})
+        result = _restrict_storage_universe(values, members)
+        self.assertEqual(result["ts_code"].to_list(), ["A", "C"])
 
 if __name__ == "__main__":
     unittest.main()

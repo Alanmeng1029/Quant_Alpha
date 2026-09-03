@@ -40,6 +40,17 @@ def _kind(frame: pl.DataFrame, preferred: str) -> str:
     return preferred if preferred in values else "raw"
 
 
+def _research_kind(frame: pl.DataFrame) -> str:
+    """Resolve the primary return label, preferring the Open-to-open protocol."""
+    if _has_column(frame, "return_kind") and "open_to_open_raw" in set(frame.get_column("return_kind").unique().to_list()):
+        return "open_to_open_raw"
+    return _kind(frame, "close_to_close_raw")
+
+
+def _research_label(frame: pl.DataFrame) -> str:
+    return "Open-to-open" if _research_kind(frame) == "open_to_open_raw" else "Close-to-close"
+
+
 def _series(frame: pl.DataFrame, expression: pl.Expr) -> tuple[list[object], list[float]]:
     values = frame.select(expression).to_series().to_list()
     return frame["trade_date"].to_list(), [float(value or 0.0) for value in values]
@@ -76,12 +87,13 @@ def _save_page(pdf: canvas.Canvas, image: Path, factor: str) -> None:
 def _plot_report(output: Path, summary: dict[str, object], ic: pl.DataFrame, groups: pl.DataFrame, portfolio: pl.DataFrame, diagnostics: pl.DataFrame) -> list[Path]:
     images: list[Path] = []
     if not diagnostics.is_empty(): diagnostics = diagnostics.sort("trade_date")
-    raw_kind = _kind(ic, "close_to_close_raw")
+    raw_kind = _research_kind(ic)
+    research_label = _research_label(ic)
     raw_ic = ic.filter((pl.col("horizon") == 1) & (pl.col("return_kind") == raw_kind)).sort("trade_date") if not ic.is_empty() else ic
     vwap_ic = ic.filter((pl.col("horizon") == 1) & (pl.col("return_kind") == _kind(ic, "vwap_to_vwap_raw"))).sort("trade_date") if not ic.is_empty() else ic
     twap_ic = ic.filter((pl.col("horizon") == 1) & (pl.col("return_kind") == _kind(ic, "twap_to_twap_raw"))).sort("trade_date") if not ic.is_empty() else ic
-    raw_group_kind = _kind(groups, "close_to_close_raw")
-    excess_group_kind = _kind(groups, "close_to_close_excess_csi500")
+    raw_group_kind = _research_kind(groups)
+    excess_group_kind = "open_to_open_excess_csi500" if raw_group_kind == "open_to_open_raw" else _kind(groups, "close_to_close_excess_csi500")
     raw_groups, excess_groups = _group_panel(groups, raw_group_kind), _group_panel(groups, excess_group_kind)
     raw_top_down, excess_top_down = _top_down(groups, raw_group_kind, True), _top_down(groups, excess_group_kind, True)
     figure, axes = plt.subplots(3, 3, figsize=(16, 13), constrained_layout=True)
@@ -89,7 +101,7 @@ def _plot_report(output: Path, summary: dict[str, object], ic: pl.DataFrame, gro
     if not raw_ic.is_empty():
         x, rank_ic = _series(raw_ic, pl.col("rank_ic").fill_null(0).cum_sum()); axes[0, 0].plot(x, rank_ic, label="Rank IC")
         axes[0, 0].legend(fontsize=8)
-    axes[0, 0].set_title("Research: cumulative close-to-close Rank IC")
+    axes[0, 0].set_title(f"Research: cumulative {research_label} Rank IC")
     if not raw_ic.is_empty():
         dates, values = _series(raw_ic, pl.col("rank_ic").fill_null(0)); axes[0, 1].plot(dates, _rolling_icir(values), linewidth=1)
     axes[0, 1].set_title("Research: 252-day rolling Rank ICIR")
@@ -99,13 +111,13 @@ def _plot_report(output: Path, summary: dict[str, object], ic: pl.DataFrame, gro
     if not diagnostics.is_empty(): axes[1, 0].plot(diagnostics["trade_date"].to_list(), diagnostics["coverage_ratio"].fill_null(0).to_list(), linewidth=.8)
     axes[1, 0].set_ylim(0, 1.05); axes[1, 0].set_title("Factor coverage ratio")
     if not raw_groups.is_empty(): axes[1, 1].bar(raw_groups["group_number"].cast(pl.Utf8).to_list(), raw_groups["mean_return"].to_list())
-    axes[1, 1].set_title("Mean absolute return by decile")
+    axes[1, 1].set_title(f"Mean {research_label} return by decile")
     if not excess_groups.is_empty(): axes[1, 2].bar(excess_groups["group_number"].cast(pl.Utf8).to_list(), excess_groups["mean_return"].to_list(), color="#e07a5f")
     axes[1, 2].set_title("Mean excess return vs CSI500 by decile")
     for group in range(1, 11):
         data = groups.filter((pl.col("horizon") == 1) & (pl.col("return_kind") == raw_group_kind) & (pl.col("group_number") == group)).sort("trade_date")
         if not data.is_empty(): axes[2, 0].plot(data["trade_date"].to_list(), (1 + data["mean_return"].fill_null(0)).cum_prod().to_list(), label=f"G{group}")
-    axes[2, 0].legend(fontsize=7, ncol=2); axes[2, 0].set_title("Absolute cumulative returns: G1 through G10")
+    axes[2, 0].legend(fontsize=7, ncol=2); axes[2, 0].set_title(f"{research_label} cumulative returns: G1 through G10")
     for group in range(1, 11):
         data = groups.filter((pl.col("horizon") == 1) & (pl.col("return_kind") == excess_group_kind) & (pl.col("group_number") == group)).sort("trade_date")
         if not data.is_empty(): axes[2, 1].plot(data["trade_date"].to_list(), (1 + data["mean_return"].fill_null(0)).cum_prod().to_list(), label=f"G{group}")
@@ -125,7 +137,7 @@ def _plot_report(output: Path, summary: dict[str, object], ic: pl.DataFrame, gro
         if not data.is_empty(): axes[1].plot(data["trade_date"].to_list(), data["rank_ic"].fill_null(0).to_list(), label=label)
     axes[1].legend(); axes[1].set_title("Executable daily Rank IC")
     table_rows = []
-    for label, kind in (("Close", "close_to_close_raw"), ("VWAP", "vwap_to_vwap_raw"), ("TWAP", "twap_to_twap_raw")):
+    for label, kind in ((research_label, raw_kind), ("VWAP", "vwap_to_vwap_raw"), ("TWAP", "twap_to_twap_raw")):
         for horizon in (1, 5, 10, 20):
             data = ic.filter((pl.col("return_kind") == _kind(ic, kind)) & (pl.col("horizon") == horizon))["rank_ic"].drop_nulls()
             if data.len() > 0:
@@ -146,17 +158,19 @@ def render(input_dir: Path) -> None:
     summary = json.loads((input_dir / "summary.json").read_text(encoding="utf-8"))
     ic, groups, portfolio, diagnostics = (_read(input_dir / name) for name in ("daily_ic.parquet", "group_returns.parquet", "portfolio_daily.parquet", "factor_diagnostics.parquet"))
     images = _plot_report(input_dir, summary, ic, groups, portfolio, diagnostics)
-    raw_ic = ic.filter((pl.col("horizon") == 1) & (pl.col("return_kind") == _kind(ic, "close_to_close_raw"))) if not ic.is_empty() else ic
+    raw_kind = _research_kind(ic)
+    research_label = _research_label(ic)
+    raw_ic = ic.filter((pl.col("horizon") == 1) & (pl.col("return_kind") == raw_kind)) if not ic.is_empty() else ic
     vwap_ic = ic.filter((pl.col("horizon") == 1) & (pl.col("return_kind") == _kind(ic, "vwap_to_vwap_raw"))) if not ic.is_empty() else ic
     twap_ic = ic.filter((pl.col("horizon") == 1) & (pl.col("return_kind") == _kind(ic, "twap_to_twap_raw"))) if not ic.is_empty() else ic
     metrics = [
         {"label": "有效证券日", "value": f"{summary['rows']:,}"},
-        {"label": "研究型 1日 Rank IC", "value": f"{raw_ic['rank_ic'].mean():.4f}" if not raw_ic.is_empty() else "n/a"},
+        {"label": f"{research_label} 1日 Rank IC", "value": f"{raw_ic['rank_ic'].mean():.4f}" if not raw_ic.is_empty() else "n/a"},
         {"label": "可执行 VWAP 1日 Rank IC", "value": f"{vwap_ic['rank_ic'].mean():.4f}" if not vwap_ic.is_empty() else "n/a"},
         {"label": "可执行 TWAP 1日 Rank IC", "value": f"{twap_ic['rank_ic'].mean():.4f}" if not twap_ic.is_empty() else "n/a"},
     ]
     ic_table = []
-    for label, kind in (("Research close-to-close", "close_to_close_raw"), ("Executable VWAP-to-VWAP", "vwap_to_vwap_raw"), ("Executable TWAP-to-TWAP", "twap_to_twap_raw")):
+    for label, kind in ((f"Research {research_label}", raw_kind), ("Executable VWAP-to-VWAP", "vwap_to_vwap_raw"), ("Executable TWAP-to-TWAP", "twap_to_twap_raw")):
         for horizon in (1, 5, 10, 20):
             values = ic.filter((pl.col("return_kind") == _kind(ic, kind)) & (pl.col("horizon") == horizon))["rank_ic"].drop_nulls() if not ic.is_empty() else pl.Series()
             if values.len() == 0:

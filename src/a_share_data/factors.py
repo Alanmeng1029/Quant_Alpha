@@ -26,6 +26,7 @@ from scipy.stats import rankdata
 
 DEFAULT_DATABASE_DIR = "A_stock_database"
 KEYS = ("trade_date", "ts_code")
+FACTOR_STORAGE_UNIVERSE = "CSI300 union CSI500 daily constituents"
 WQ_REFERENCE = "/Users/alanmxy/大学/大学/alpha101_adjusted.py"
 GTJA_REFERENCE = "/Users/alanmxy/大学/大学/gtja191Alpha.dos"
 WQ_AVAILABLE = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
@@ -55,6 +56,63 @@ def _write_atomic(frame: pl.DataFrame, output: Path) -> None:
     temporary = output.with_suffix(output.suffix + f".{uuid.uuid4().hex}.tmp")
     frame.write_parquet(temporary, compression="zstd", statistics=True)
     os.replace(temporary, output)
+
+
+def _storage_universe(data_root: Path) -> pl.DataFrame:
+    """Daily de-duplicated CSI300 union CSI500 membership for factor storage."""
+    cache = data_root / "lake" / "derived" / "factor_research" / "csi300_csi500_daily_members.parquet"
+    if cache.exists():
+        return pl.read_parquet(cache)
+    reference = data_root / "lake" / "canonical" / "reference"
+    tradable = pl.scan_parquet(str(reference / "trading_universe/year=*/universe.parquet")).select("trade_date", "ts_code")
+    constituents = pl.scan_parquet(str(reference / "index_constituents/year=*/constituents.parquet")).filter(
+        pl.col("index_code").is_in(["000300.SH", "000905.SH"])
+    ).select("ts_code", "as_of_date").unique()
+    members = tradable.sort(["ts_code", "trade_date"]).join_asof(
+        constituents.sort(["ts_code", "as_of_date"]), left_on="trade_date", right_on="as_of_date", by="ts_code", strategy="backward"
+    ).filter(pl.col("as_of_date").is_not_null()).select("trade_date", "ts_code").unique().sort(KEYS).collect()
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    _write_atomic(members, cache)
+    return members
+
+
+def _restrict_storage_universe(frame: pl.DataFrame, members: pl.DataFrame) -> pl.DataFrame:
+    """Trim only the artifact, never the source panel used to calculate it."""
+    return frame.join(members, on=list(KEYS), how="inner").sort(KEYS)
+
+
+def compact_storage_universe(data_root: Path, family: str | None = None, dry_run: bool = False) -> list[dict[str, object]]:
+    """Rewrite existing artifacts to the approved storage universe without recomputing values."""
+    members = _storage_universe(data_root)
+    results: list[dict[str, object]] = []
+    for definition in sorted(REGISTRY.values(), key=lambda item: item.factor_id):
+        if family and definition.family != family:
+            continue
+        output_dir = factor_directory(data_root, definition); output = output_dir / "factor.parquet"
+        if not output.exists():
+            continue
+        source = pl.read_parquet(output)
+        trimmed = _restrict_storage_universe(source, members)
+        result = {"factor_id": definition.factor_id, "before_rows": source.height, "after_rows": trimmed.height, "removed_rows": source.height - trimmed.height, "output": str(output)}
+        if not dry_run:
+            if trimmed.is_empty():
+                raise RuntimeError(f"{definition.factor_id} has no rows in {FACTOR_STORAGE_UNIVERSE}; refusing replacement")
+            _write_atomic(trimmed, output)
+            manifest_path = output_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {"factor_id": definition.factor_id, "version": "v1"}
+            manifest.update({
+                "storage_universe": FACTOR_STORAGE_UNIVERSE,
+                "calculation_universe": manifest.get("calculation_universe", "all valid daily_qfq observations"),
+                "rows": trimmed.height,
+                "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+                "storage_compacted_at": _utc_now(),
+                "storage_compaction": "filtered existing factor values by daily CSI300 union CSI500 membership; formula was not recomputed",
+            })
+            temporary = manifest_path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            os.replace(temporary, manifest_path)
+        results.append(result)
+    return results
 
 
 def rank(frame: pd.DataFrame) -> pd.DataFrame:
@@ -569,9 +627,11 @@ def build_gtja_alpha014(data_root: Path, start: str | None, end: str | None) -> 
     connection = duckdb.connect(str(catalog), read_only=True)
     try: frame = pl.from_arrow(connection.execute(query).arrow())
     finally: connection.close()
+    frame = _restrict_storage_universe(frame, _storage_universe(data_root))
+    if frame.is_empty(): raise RuntimeError(f"{definition.factor_id} has no rows in {FACTOR_STORAGE_UNIVERSE}")
     output_dir = factor_directory(data_root, definition); output = output_dir / "factor.parquet"; _write_atomic(frame, output)
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
-    manifest = {"factor_id": definition.factor_id, "version": "v1", "family": "gtja", "number": 14, "formula": definition.source_formula, "source_file": GTJA_REFERENCE, "adjustment": "qfq close calendar-lag implementation", "lag_semantics": "Five prior observed market sessions; missing stock observations do not compress the lag.", "start": str(frame["trade_date"].min()), "end": str(frame["trade_date"].max()), "rows": frame.height, "sha256": digest, "generated_at": _utc_now(), "validation_status": "reference_oracle"}
+    manifest = {"factor_id": definition.factor_id, "version": "v1", "family": "gtja", "number": 14, "formula": definition.source_formula, "source_file": GTJA_REFERENCE, "adjustment": "qfq close calendar-lag implementation", "lag_semantics": "Five prior observed market sessions; missing stock observations do not compress the lag.", "storage_universe": FACTOR_STORAGE_UNIVERSE, "calculation_universe": "all valid daily_qfq observations", "start": str(frame["trade_date"].min()), "end": str(frame["trade_date"].max()), "rows": frame.height, "sha256": digest, "generated_at": _utc_now(), "validation_status": "reference_oracle"}
     temporary = output_dir.joinpath("manifest.json").with_suffix(".json.tmp"); temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"); os.replace(temporary, output_dir / "manifest.json")
     return {"output": str(output), **manifest}
 
@@ -639,10 +699,12 @@ def build_factor(data_root: Path, definition: FactorDefinition, start: str | Non
     else:
         raise ValueError(f"Unsupported factor engine {engine!r}; use polars or pandas")
     if frame.is_empty(): raise RuntimeError(f"{definition.factor_id} produced no finite rows")
+    frame = _restrict_storage_universe(frame, _storage_universe(data_root))
+    if frame.is_empty(): raise RuntimeError(f"{definition.factor_id} has no rows in {FACTOR_STORAGE_UNIVERSE}")
     if frame.select(pl.struct(["trade_date", "ts_code"]).n_unique()).item() != frame.height: raise RuntimeError(f"{definition.factor_id} primary key is not unique")
     output_dir = factor_directory(data_root, definition); output = output_dir / "factor.parquet"; _write_atomic(frame, output)
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
-    manifest = {"factor_id": definition.factor_id, "version": "v1", "family": definition.family, "number": definition.number, "formula": definition.source_formula, "source_file": definition.source_file, "calculation_engine": engine, "adjustment": "Prices use qfq OHLC/VWAP; volume uses raw volume_share. Raw factor values are not winsorized or standardized.", "input_fields": ["daily_qfq.qfq_open", "daily_qfq.qfq_high", "daily_qfq.qfq_low", "daily_qfq.qfq_close", "daily_qfq.qfq_vwap", "daily_qfq.volume_share", "observed_calendar.trade_date"], "lag_semantics": "Calendar-aligned market sessions; a missing stock observation never compresses a rolling window.", "max_window": definition.max_window, "start": str(frame["trade_date"].min()), "end": str(frame["trade_date"].max()), "rows": frame.height, "sha256": digest, "generated_at": _utc_now(), "validation_status": "pending_reference_oracle"}
+    manifest = {"factor_id": definition.factor_id, "version": "v1", "family": definition.family, "number": definition.number, "formula": definition.source_formula, "source_file": definition.source_file, "calculation_engine": engine, "adjustment": "Prices use qfq OHLC/VWAP; volume uses raw volume_share. Raw factor values are not winsorized or standardized.", "input_fields": ["daily_qfq.qfq_open", "daily_qfq.qfq_high", "daily_qfq.qfq_low", "daily_qfq.qfq_close", "daily_qfq.qfq_vwap", "daily_qfq.volume_share", "observed_calendar.trade_date"], "lag_semantics": "Calendar-aligned market sessions; a missing stock observation never compresses a rolling window.", "storage_universe": FACTOR_STORAGE_UNIVERSE, "calculation_universe": "all valid daily_qfq observations", "max_window": definition.max_window, "start": str(frame["trade_date"].min()), "end": str(frame["trade_date"].max()), "rows": frame.height, "sha256": digest, "generated_at": _utc_now(), "validation_status": "pending_reference_oracle"}
     manifest_path = output_dir / "manifest.json"; temporary = manifest_path.with_suffix(".json.tmp"); temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"); os.replace(temporary, manifest_path)
     return {"output": str(output), **manifest}
 
@@ -662,6 +724,7 @@ def build_parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status", help="Show built factor artifacts"); status.add_argument("--data-root", default=DEFAULT_DATABASE_DIR)
     build = commands.add_parser("build", help="Build one supported factor"); build.add_argument("--family", required=True, choices=["wq", "gtja"]); build.add_argument("--number", required=True, type=int); build.add_argument("--data-root", default=DEFAULT_DATABASE_DIR); build.add_argument("--start", type=_parse_date); build.add_argument("--end", type=_parse_date); build.add_argument("--engine", choices=["polars", "pandas"], default="polars")
     batch = commands.add_parser("build-batch", help="Build multiple factors from one calendar-aligned panel"); batch.add_argument("--family", required=True, choices=["wq", "gtja"]); batch.add_argument("--numbers", required=True, help="Comma-separated IDs or ranges, for example 1-20,25"); batch.add_argument("--data-root", default=DEFAULT_DATABASE_DIR); batch.add_argument("--start", type=_parse_date); batch.add_argument("--end", type=_parse_date); batch.add_argument("--engine", choices=["polars", "pandas"], default="polars")
+    compact = commands.add_parser("compact-universe", help="Filter existing factor artifacts to daily CSI300 union CSI500 members"); compact.add_argument("--data-root", default=DEFAULT_DATABASE_DIR); compact.add_argument("--family", choices=["wq", "gtja"]); compact.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -672,6 +735,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "status":
         root = Path(args.data_root); rows = [{"factor_id": d.factor_id, "registry_status": d.status, "polars_status": d.polars_status, "artifact_exists": (factor_directory(root, d) / "factor.parquet").exists(), "artifact": str(factor_directory(root, d) / "factor.parquet")} for d in REGISTRY.values()]; print(json.dumps(rows, ensure_ascii=False, indent=2)); return
     root = Path(args.data_root)
+    if args.command == "compact-universe":
+        print(json.dumps(compact_storage_universe(root, args.family, args.dry_run), ensure_ascii=False, indent=2)); return
     if args.command == "build":
         result = build_gtja_alpha014(root, args.start, args.end) if args.engine == "pandas" and args.family == "gtja" and args.number == 14 else build_factor(root, _definition(args.family, args.number), args.start, args.end, engine=args.engine)
         print(json.dumps(result, ensure_ascii=False)); return

@@ -59,7 +59,7 @@ Data → Factor research + factor production → Model + prediction → Optimize
 
 - `quant-factor` 读取 `daily_qfq` 和交易日历，先补齐“交易日 × 证券”网格，再在每只证券内执行滚动窗口，避免缺失股票日压缩时间窗口。
 - 因子算子包括截面 rank/scale、lag/delta、滚动统计、相关/协方差、线性衰减、时序 rank 等；默认使用 Polars 列式执行，Pandas 路径用于兼容与核验。
-- 因子原始值保存为 `lake/derived/factors/<factor>/v1/factor.parquet`，并随附 `manifest.json`：公式、输入字段、引擎、时间区间、行数与 SHA-256。
+- 因子先在完整有效 `daily_qfq` 截面上计算（保留公式中的截面 rank 语义），再仅将逐日 CSI300 ∪ CSI500 成分写入 `lake/derived/factors/<factor>/v1/factor.parquet`。不保存全市场因子值；`manifest.json` 必须记录计算截面、存储股票池、公式、输入字段、引擎、时间区间、行数与 SHA-256。
 - `quant-backtest batch-factor-eval` 对每个 Universe 只生成一次市场标签缓存，再顺序评估因子；Python 报告模块生成 HTML/PDF 与汇总表。
 
 **生产侧**

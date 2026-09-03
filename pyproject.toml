@@ -22,6 +22,9 @@ dependencies = [
   "scipy>=1.11",
 ]
 
+[project.optional-dependencies]
+deep-learning = ["torch>=2.2,<2.3"]
+
 [project.scripts]
 a-share-data = "a_share_data.cli:main"
 quant-factor = "a_share_data.factors:main"

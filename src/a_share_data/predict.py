@@ -20,6 +20,8 @@ import lightgbm as lgb
 import numpy as np
 import polars as pl
 
+from a_share_data.ensemble import SelectionSettings, fit_predict_neural, select_features
+
 CORE40 = tuple([f"gtja_alpha{i:03d}_qfq_v1" for i in range(1, 21)] + [f"wq_alpha{i:03d}_qfq_v1" for i in range(1, 21)])
 TRAIN_DAYS = 756
 LABEL_LAG = 6
@@ -39,6 +41,14 @@ class LgbmSettings:
                 "num_leaves": self.num_leaves, "seed": self.seed, "feature_fraction_seed": self.seed,
                 "bagging_seed": self.seed, "data_random_seed": self.seed, "deterministic": True,
                 "force_row_wise": True, "num_threads": 0, "verbosity": -1}
+
+
+@dataclass(frozen=True)
+class EnsembleSettings:
+    models: tuple[str, ...] = ("lgbm", "mlp", "transformer")
+    refit_months: int = 3
+    neural_epochs: int = 8
+    neural_max_samples: int = 60_000
 
 
 def _factor_path(root: Path, factor_id: str) -> Path:
@@ -75,6 +85,14 @@ def read_factor_ids(path: Path | None) -> tuple[str, ...]:
     return factor_ids
 
 
+def all_factor_ids(factor_root: Path) -> tuple[str, ...]:
+    """Discover the current factor artifacts without using their future returns."""
+    found = tuple(sorted(f"{path.parent.parent.name}_v1" for path in factor_root.glob("*_qfq/v1/factor.parquet")))
+    if not found:
+        raise FileNotFoundError(f"No factor artifacts found under {factor_root}")
+    return found
+
+
 def build_features(catalog: Path, factor_root: Path, feature_root: Path, start: str | None = None, end: str | None = None, replace: bool = False, factor_ids: tuple[str, ...] = CORE40) -> dict:
     """Pivot selected long factor parquet files once, retaining the dynamic universe."""
     paths = [_factor_path(factor_root, f) for f in factor_ids]
@@ -89,26 +107,27 @@ def build_features(catalog: Path, factor_root: Path, feature_root: Path, start: 
         if old == manifest and all((feature_root / f"year={y}" / "features.parquet").exists() for y in expected_years):
             return {"cache_hit": True, "years": sorted(expected_years), "factor_hash": digest}
     conn = duckdb.connect(str(catalog), read_only=True)
+    rows = 0
     try:
-        date_filter = "".join((f" AND u.trade_date >= DATE '{start}'" if start else "", f" AND u.trade_date <= DATE '{end}'" if end else ""))
-        unions = " UNION ALL ".join(f"SELECT trade_date, ts_code, factor_value, '{fid}' factor_id FROM read_parquet('{_sql(path)}')" for fid, path in zip(factor_ids, paths))
-        # The cache contract is Float32.  Extreme/invalid raw values are treated as
-        # missing rather than allowing one malformed observation to abort a run.
+        # Pivot one calendar year at a time.  This keeps the all-factor cache
+        # bounded in memory and pushes the date predicate into every parquet scan.
         columns = ", ".join(f"try_cast(max(factor_value) FILTER (WHERE factor_id='{fid}') AS FLOAT) AS {fid}" for fid in factor_ids)
-        query = f"""WITH universe AS (SELECT DISTINCT trade_date, ts_code FROM index_trading_universe u
-                         WHERE index_code IN ('000300.SH','000905.SH'){date_filter}), factors AS ({unions})
-                     SELECT u.trade_date, u.ts_code, {columns} FROM universe u LEFT JOIN factors f USING(trade_date, ts_code)
-                     GROUP BY u.trade_date, u.ts_code ORDER BY u.trade_date, u.ts_code"""
-        frame = pl.from_arrow(conn.execute(query).arrow())
+        for year in sorted(expected_years):
+            lower = max(start or f"{year}-01-01", f"{year}-01-01")
+            upper = min(end or f"{year}-12-31", f"{year}-12-31")
+            unions = " UNION ALL ".join(f"SELECT trade_date, ts_code, factor_value, '{fid}' factor_id FROM read_parquet('{_sql(path)}') WHERE trade_date BETWEEN DATE '{lower}' AND DATE '{upper}'" for fid, path in zip(factor_ids, paths))
+            query = f"""WITH universe AS (SELECT DISTINCT trade_date, ts_code FROM index_trading_universe
+                             WHERE index_code IN ('000300.SH','000905.SH') AND trade_date BETWEEN DATE '{lower}' AND DATE '{upper}'), factors AS ({unions})
+                         SELECT u.trade_date, u.ts_code, {columns} FROM universe u LEFT JOIN factors f USING(trade_date, ts_code)
+                         GROUP BY u.trade_date, u.ts_code ORDER BY u.trade_date, u.ts_code"""
+            part = pl.from_arrow(conn.execute(query).arrow())
+            rows += part.height
+            dest = feature_root / f"year={year}"; dest.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix="features.", suffix=".parquet", dir=dest); os.close(fd)
+            part.write_parquet(tmp, compression="zstd"); os.replace(tmp, dest / "features.parquet")
     finally: conn.close()
-    frame = frame.with_columns(pl.col("trade_date").dt.year().alias("__year"))
-    for year, part in frame.partition_by("__year", as_dict=True).items():
-        y = year[0] if isinstance(year, tuple) else year
-        dest = feature_root / f"year={y}"; dest.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix="features.", suffix=".parquet", dir=dest); os.close(fd)
-        part.drop("__year").write_parquet(tmp, compression="zstd"); os.replace(tmp, dest / "features.parquet")
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
-    return {"cache_hit": False, "rows": frame.height, "years": sorted(expected_years), "factor_hash": digest}
+    return {"cache_hit": False, "rows": rows, "years": sorted(expected_years), "factor_hash": digest}
 
 
 def build_labels(catalog: Path, start: str | None = None, end: str | None = None) -> pl.DataFrame:
@@ -191,7 +210,7 @@ def _metrics(frame: pl.DataFrame, prediction: str, target: str) -> dict:
     return {"observations": valid.height, "days": daily.height, "mean_rank_ic": mean, "mean_pearson_ic": daily.select(pl.mean("pearson_ic")).item(), "icir": mean / std if std and np.isfinite(std) else None, "positive_ic_ratio": daily.select((pl.col("rank_ic")>0).mean()).item(), "mae": err.select(pl.col("e").abs().mean()).item(), "rmse": err.select((pl.col("e")**2).mean().sqrt()).item()}
 
 
-def run_oos(catalog: Path, feature_root: Path, output: Path, start: str | None = None, end: str | None = None, settings: LgbmSettings = LgbmSettings()) -> dict:
+def run_oos(catalog: Path, feature_root: Path, output: Path, start: str | None = None, end: str | None = None, settings: LgbmSettings = LgbmSettings(), ensemble: EnsembleSettings = EnsembleSettings(), selection: SelectionSettings = SelectionSettings(), oos_start: str | None = None) -> dict:
     output.mkdir(parents=True, exist_ok=True); models = output / "models"; models.mkdir(exist_ok=True)
     files = sorted(feature_root.glob("year=*/features.parquet"));
     if not files: raise FileNotFoundError("Feature cache is empty; run build-features first")
@@ -201,36 +220,86 @@ def run_oos(catalog: Path, feature_root: Path, output: Path, start: str | None =
     labels = build_labels(catalog, start, end)
     panel = standardize_features(features, factor_ids).join(labels, on=["trade_date", "ts_code"], how="left")
     dates = sorted(str(x) for x in panel.select("trade_date").unique().to_series().to_list())
-    windows = rolling_windows(dates); records=[]; timings=[]; importance=[]
-    for signal, train_dates in windows:
-        month = signal[:7]; month_dates=[d for d in dates if d[:7]==month and (not end or d<=end)]
+    invalid_models=set(ensemble.models)-{"lgbm","mlp","transformer"}
+    if invalid_models or not ensemble.models: raise ValueError(f"unsupported models: {sorted(invalid_models)}")
+    windows = rolling_windows(dates); records=[]; timings=[]; importance=[]; selections=[]
+    for window_index, (signal, train_dates) in enumerate(windows):
+        if window_index % ensemble.refit_months: continue
+        if oos_start and signal < oos_start: continue
+        month = signal[:7]
+        all_months=sorted({date[:7] for date in dates}); month_index=all_months.index(month)
+        test_months=set(all_months[month_index:month_index + ensemble.refit_months])
+        month_dates=[d for d in dates if d[:7] in test_months and (not end or d<=end)]
         train = panel.filter(pl.col("trade_date").cast(pl.String).is_in(train_dates)); test = panel.filter(pl.col("trade_date").cast(pl.String).is_in(month_dates))
         if test.height == 0: continue
         model_dir=models / f"month={month}"; model_dir.mkdir(parents=True, exist_ok=True)
         month_start=time.perf_counter()
         out=test.select("trade_date","ts_code")
-        for horizon, target in (("h1", "excess_h1"), ("h5", "excess_h5")):
-            fit=winsorize_labels(train.filter(pl.col(target).is_not_null()), target)
-            model=lgb.train(settings.params(), lgb.Dataset(fit.select(factor_ids).to_numpy(), label=fit[target].to_numpy(), feature_name=list(factor_ids)), num_boost_round=settings.num_boost_round)
-            model.save_model(str(model_dir / f"{horizon}.txt"))
-            out=out.with_columns(pl.Series(f"pred_{horizon}", model.predict(test.select(factor_ids).to_numpy())))
-            importance.extend({"model_month":month,"horizon":horizon,"feature":f,"importance":float(v)} for f,v in zip(factor_ids, model.feature_importance()))
-        out=out.with_columns(((pl.col("pred_h1") + pl.col("pred_h5")) / 2.0).alias("alpha_daily"),pl.lit(month).alias("model_month"),pl.col("trade_date").shift(-1).over("ts_code").alias("execution_date"))
+        selected, diagnostics = select_features(train, factor_ids, "excess_h1_h5_mean", selection)
+        selections.extend({"model_month":month, "feature":row["feature"], "selected":row["feature"] in selected, **row} for row in diagnostics)
+        fit_h1=winsorize_labels(train.filter(pl.col("excess_h1").is_not_null()), "excess_h1")
+        fit_h5=winsorize_labels(train.filter(pl.col("excess_h5").is_not_null()), "excess_h5")
+        if "lgbm" in ensemble.models:
+            for horizon, target, fit in (("h1", "excess_h1", fit_h1), ("h5", "excess_h5", fit_h5)):
+                model=lgb.train(settings.params(), lgb.Dataset(fit.select(selected).to_numpy(), label=fit[target].to_numpy(), feature_name=list(selected)), num_boost_round=settings.num_boost_round)
+                model.save_model(str(model_dir / f"lgbm_{horizon}.txt"))
+                out=out.with_columns(pl.Series(f"lgbm_{horizon}", model.predict(test.select(selected).to_numpy())))
+                importance.extend({"model_month":month,"horizon":horizon,"feature":f,"importance":float(v)} for f,v in zip(selected, model.feature_importance()))
+        neural_fit=winsorize_labels(winsorize_labels(train.drop_nulls(["excess_h1", "excess_h5"]), "excess_h1"), "excess_h5")
+        for model_name in (name for name in ensemble.models if name in {"mlp", "transformer"}):
+            prediction=fit_predict_neural(model_name, neural_fit.select(selected).to_numpy(), neural_fit.select("excess_h1", "excess_h5").to_numpy(), test.select(selected).to_numpy(), settings.seed + window_index, ensemble.neural_epochs, ensemble.neural_max_samples)
+            out=out.with_columns(pl.Series(f"{model_name}_h1", prediction[:,0]), pl.Series(f"{model_name}_h5", prediction[:,1]))
+        out=out.with_columns(pl.lit(month).alias("model_month"))
         # execution date is market-calendar based, not per-stock; repair via date mapping.
         next_map={dates[i]:dates[i+1] for i in range(len(dates)-1)}; out=out.with_columns(pl.col("trade_date").cast(pl.String).replace_strict(next_map, default=None).str.to_date().alias("execution_date"))
-        records.append(out); timings.append({"model_month":month,"seconds":time.perf_counter()-month_start,"training_start":train_dates[0],"training_end":train_dates[-1],"training_days":len(train_dates)})
-        (models / f"month={month}" / "manifest.json").write_text(json.dumps({"training_start":train_dates[0],"training_end":train_dates[-1],"factor_ids":factor_ids,"feature_hash":hashlib.sha256("|".join(factor_ids).encode()).hexdigest(),"targets":["excess_h1","excess_h5"],"settings":asdict(settings)},indent=2))
-    pred=pl.concat(records) if records else pl.DataFrame(); pred.write_parquet(output / "predictions.parquet", compression="zstd")
+        records.append(out); timings.append({"model_month":month,"seconds":time.perf_counter()-month_start,"training_start":train_dates[0],"training_end":train_dates[-1],"training_days":len(train_dates),"selected_features":len(selected)})
+        (models / f"month={month}" / "manifest.json").write_text(json.dumps({"training_start":train_dates[0],"training_end":train_dates[-1],"factor_ids":selected,"feature_hash":hashlib.sha256("|".join(selected).encode()).hexdigest(),"targets":["excess_h1","excess_h5"],"lgbm_settings":asdict(settings),"ensemble_settings":asdict(ensemble),"selection_settings":asdict(selection)},indent=2))
+    pred=pl.concat(records) if records else pl.DataFrame()
+    prediction_columns=[f"{name}_{horizon}" for name in ensemble.models for horizon in ("h1","h5")]
+    zscores=[]
+    for column in prediction_columns:
+        zscores.append(pl.when(pl.col(column).std().over("trade_date") > 1e-12).then((pl.col(column)-pl.col(column).mean().over("trade_date"))/pl.col(column).std().over("trade_date")).otherwise(0.0).alias(f"__z_{column}"))
+    if pred.height:
+        pred=pred.with_columns(zscores).with_columns(
+            (sum((pl.col(f"__z_{name}_h1") for name in ensemble.models), pl.lit(0.0)) / len(ensemble.models)).alias("pred_h1"),
+            (sum((pl.col(f"__z_{name}_h5") for name in ensemble.models), pl.lit(0.0)) / len(ensemble.models)).alias("pred_h5"),
+        ).with_columns(((pl.col("pred_h1") + pl.col("pred_h5")) / 2.0).alias("alpha_daily"))
+    pred.write_parquet(output / "predictions.parquet", compression="zstd")
     evaluation=pred.join(labels,on=["trade_date","ts_code"],how="left")
-    summary={"settings":asdict(settings),"factor_ids":factor_ids,"benchmark":"CSI500 open-to-open","oos_start":str(pred["trade_date"].min()) if pred.height else None,"oos_end":str(pred["trade_date"].max()) if pred.height else None,"mean_alpha":_metrics(evaluation,"alpha_daily","excess_h1_h5_mean"),"h1":_metrics(evaluation,"pred_h1","excess_h1"),"h5":_metrics(evaluation,"pred_h5","excess_h5")}
-    pl.DataFrame(timings, schema={"model_month":pl.String,"seconds":pl.Float64,"training_start":pl.String,"training_end":pl.String,"training_days":pl.Int64}).write_parquet(output / "model_timings.parquet")
+    summary={"lgbm_settings":asdict(settings),"ensemble_settings":asdict(ensemble),"selection_settings":asdict(selection),"factor_ids":factor_ids,"benchmark":"CSI500 open-to-open","oos_start":str(pred["trade_date"].min()) if pred.height else None,"oos_end":str(pred["trade_date"].max()) if pred.height else None,"mean_alpha":_metrics(evaluation,"alpha_daily","excess_h1_h5_mean"),"h1":_metrics(evaluation,"pred_h1","excess_h1"),"h5":_metrics(evaluation,"pred_h5","excess_h5")}
+    pl.DataFrame(timings, schema={"model_month":pl.String,"seconds":pl.Float64,"training_start":pl.String,"training_end":pl.String,"training_days":pl.Int64,"selected_features":pl.Int64}).write_parquet(output / "model_timings.parquet")
     pl.DataFrame(importance, schema={"model_month":pl.String,"horizon":pl.String,"feature":pl.String,"importance":pl.Float64}).write_parquet(output / "feature_importance.parquet")
+    pl.DataFrame(selections).write_parquet(output / "rolling_feature_selection.parquet")
     (output / "summary.json").write_text(json.dumps(summary,indent=2,default=str)); return summary
 
 
-def optimize_dual_alpha_targets(predictions: Path, output: Path, h1_weight: float = .5, turnover_cap: float = .30, temperature: float = 2.0, max_weight: float = .10) -> dict:
-    """Blend cross-sectional h1/h5 alpha, then project targets onto a turnover budget."""
-    if not (0 <= h1_weight <= 1 and 0 < turnover_cap <= 1 and temperature > 0 and 0 < max_weight <= 1):
+def project_capped_simplex(weights: np.ndarray, max_weight: float) -> np.ndarray:
+    """Normalize non-negative scores under a fully invested single-name cap."""
+    if len(weights) * max_weight < 1 - 1e-12:
+        raise ValueError("max_weight makes a fully invested portfolio infeasible")
+    result = np.maximum(weights.astype(float, copy=True), 0.0)
+    if result.sum() <= 0:
+        raise ValueError("at least one positive target weight is required")
+    result /= result.sum()
+    free = result > 0
+    remaining = 1.0
+    while True:
+        if not free.any() or result[free].sum() <= 0:
+            raise ValueError("too few retained names for the requested maximum weight")
+        proposal = result[free] / result[free].sum() * remaining
+        overflow = proposal > max_weight + 1e-15
+        if not overflow.any():
+            result[free] = proposal
+            return result
+        indices = np.flatnonzero(free)[overflow]
+        result[indices] = max_weight
+        free[indices] = False
+        remaining = 1.0 - result[~free].sum()
+
+
+def optimize_dual_alpha_targets(predictions: Path, output: Path, h1_weight: float = .5, turnover_cap: float = .30, temperature: float = 2.0, max_weight: float = .10, min_weight: float = 0.0) -> dict:
+    """Blend h1/h5 alpha, cap turnover, then enforce a hard minimum live weight."""
+    if not (0 <= h1_weight <= 1 and 0 < turnover_cap <= 1 and temperature > 0 and 0 <= min_weight <= max_weight <= 1):
         raise ValueError("invalid dual-alpha optimizer parameters")
     source=pl.read_parquet(predictions).with_columns(pl.col("trade_date").cast(pl.Date),pl.col("execution_date").cast(pl.Date)).filter(pl.col("execution_date").is_not_null() & pl.col("pred_h1").is_finite() & pl.col("pred_h5").is_finite() & ~pl.col("ts_code").is_in(INFEASIBLE_EXECUTION_CODES))
     previous: dict[str,float]={}; rows=[]
@@ -239,57 +308,105 @@ def optimize_dual_alpha_targets(predictions: Path, output: Path, h1_weight: floa
         frame=frame.sort("ts_code"); codes=frame["ts_code"].to_list(); a1=frame["pred_h1"].to_numpy(); a5=frame["pred_h5"].to_numpy()
         def z(value: np.ndarray) -> np.ndarray:
             std=value.std(); return (value-value.mean())/std if std > 1e-12 else np.zeros_like(value)
-        score=h1_weight*z(a1)+(1-h1_weight)*z(a5); exp=np.exp(np.clip(score/temperature,-30,30)); desired=exp/exp.sum()
-        # Project onto the capped simplex without re-inflating capped names.
-        free=np.ones(len(desired),dtype=bool); remaining=1.0
-        while True:
-            proposal=desired[free] / desired[free].sum() * remaining
-            overflow=proposal > max_weight + 1e-15
-            if not overflow.any():
-                desired[free]=proposal; break
-            indices=np.flatnonzero(free)[overflow]; desired[indices]=max_weight; free[indices]=False; remaining=1.0-desired[~free].sum()
+        score=h1_weight*z(a1)+(1-h1_weight)*z(a5); exp=np.exp(np.clip(score/temperature,-30,30)); desired=project_capped_simplex(exp,max_weight)
         old=np.array([previous.get(code,0.0) for code in codes]); l1=float(np.abs(desired-old).sum()); scale=1.0 if not previous else min(1.0,2*turnover_cap/l1)
         weights=old+scale*(desired-old); previous=dict(zip(codes,weights))
-        for code,w,s1,s5 in zip(codes,weights,a1,a5): rows.append({"trade_date":signal_date,"execution_date":execution_date,"ts_code":code,"target_weight":float(w),"pred_h1":float(s1),"pred_h5":float(s5),"alpha_daily":float(h1_weight*s1+(1-h1_weight)*s5),"optimizer":"dual_alpha_turnover_projection"})
+        # The minimum is applied to the executed target, not merely the
+        # unconstrained alpha target.  Removed micro-positions are redistributed
+        # proportionally and the single-name cap remains hard.
+        if min_weight:
+            keep = weights >= min_weight
+            minimum_names = int(np.ceil(1 / max_weight))
+            if int(keep.sum()) < minimum_names:
+                keep[np.argsort(weights)[-minimum_names:]] = True
+            weights = project_capped_simplex(np.where(keep, weights, 0.0), max_weight)
+            previous = dict(zip(codes, weights))
+        for code,w,s1,s5 in zip(codes,weights,a1,a5):
+            if w > 0:
+                rows.append({"trade_date":signal_date,"execution_date":execution_date,"ts_code":code,"target_weight":float(w),"pred_h1":float(s1),"pred_h5":float(s5),"alpha_daily":float(h1_weight*s1+(1-h1_weight)*s5),"optimizer":"dual_alpha_turnover_projection"})
     result=pl.DataFrame(rows); output.parent.mkdir(parents=True,exist_ok=True); result.write_parquet(output,compression="zstd")
-    return {"output":str(output),"days":result.select("trade_date").n_unique(),"rows":result.height,"h1_weight":h1_weight,"h5_weight":1-h1_weight,"turnover_cap_one_way":turnover_cap,"temperature":temperature,"max_weight":max_weight}
+    return {"output":str(output),"days":result.select("trade_date").n_unique(),"rows":result.height,"h1_weight":h1_weight,"h5_weight":1-h1_weight,"turnover_cap_one_way":turnover_cap,"temperature":temperature,"max_weight":max_weight,"min_weight":min_weight}
 
 
-def backtest_targets(catalog: Path, target_weights: Path, output: Path, buy_bps: float = 2.1, sell_bps: float = 7.1) -> dict:
-    """Open-to-open target backtest with net position trades and CSI500 baseline."""
+def backtest_targets(catalog: Path, target_weights: Path, output: Path, buy_bps: float = 2.1, sell_bps: float = 7.1, initial_capital: float = 10_000_000.0, lot_size: int = 100, return_basis: str = "qfq") -> dict:
+    """Open-to-open backtest using real-price lots and qfq or raw-price marking."""
+    if initial_capital <= 0 or lot_size <= 0 or return_basis not in {"qfq", "raw"}:
+        raise ValueError("initial_capital and lot_size must be positive; return_basis must be qfq or raw")
     output.mkdir(parents=True, exist_ok=True)
     targets = pl.read_parquet(target_weights).with_columns(pl.col("execution_date").cast(pl.Date)).filter(~pl.col("ts_code").is_in(INFEASIBLE_EXECUTION_CODES))
     execution_dates = sorted(targets["execution_date"].drop_nulls().unique().to_list())
     if len(execution_dates) < 2: raise ValueError("Need at least two execution dates")
     conn = duckdb.connect(str(catalog), read_only=True)
     try:
-        prices = pl.from_arrow(conn.execute(f"SELECT trade_date, ts_code, qfq_open FROM daily_qfq WHERE trade_date BETWEEN DATE '{execution_dates[0]}' AND DATE '{execution_dates[-1]}' AND qfq_open > 0").arrow()).with_columns(pl.col("trade_date").cast(pl.Date))
+        prices = pl.from_arrow(conn.execute(f"SELECT trade_date, ts_code, open AS raw_open, qfq_open FROM daily_qfq WHERE trade_date BETWEEN DATE '{execution_dates[0]}' AND DATE '{execution_dates[-1]}' AND open > 0 AND qfq_open > 0").arrow()).with_columns(pl.col("trade_date").cast(pl.Date))
         benchmark = pl.from_arrow(conn.execute(f"SELECT trade_date, open FROM index_daily WHERE index_code='000905.SH' AND trade_date BETWEEN DATE '{execution_dates[0]}' AND DATE '{execution_dates[-1]}' AND open > 0").arrow()).with_columns(pl.col("trade_date").cast(pl.Date))
     finally: conn.close()
     by_date = {(day[0] if isinstance(day, tuple) else day): frame for day, frame in targets.partition_by("execution_date", as_dict=True).items()}
-    price = {(row[0], row[1]): row[2] for row in prices.select("trade_date", "ts_code", "qfq_open").iter_rows()}
+    price = {(day, code): (raw, qfq / raw) for day, code, raw, qfq in prices.select("trade_date", "ts_code", "raw_open", "qfq_open").iter_rows()}
     benchmark_price = dict(benchmark.select("trade_date", "open").iter_rows())
-    rows=[]; previous={}; nav=1.0; bench_nav=1.0
+    rows=[]; positions=[]; executions=[]; shares: dict[str, float] = {}; factors: dict[str, float] = {}; last_value: dict[str, float] = {}; cash=initial_capital; nav=1.0; bench_nav=1.0
     for i, day in enumerate(execution_dates[:-1]):
-        next_day=execution_dates[i+1]; frame=by_date[day]; current={code: float(weight) for code,weight in frame.select("ts_code","target_weight").iter_rows() if weight > 0}
-        returns=[]; gross=0.0
-        for code, weight in current.items():
-            p0,p1=price.get((day,code)),price.get((next_day,code))
-            if p0 and p1:
-                value=p1/p0-1; gross += weight*value; returns.append(value)
+        next_day=execution_dates[i+1]; frame=by_date[day]
+        quote = {code: price[(day, code)] for code in set(shares) | set(frame["ts_code"].to_list()) if (day, code) in price}
+        for code, quantity in list(shares.items()):
+            if return_basis == "qfq" and code in quote and code in factors:
+                shares[code] = quantity * quote[code][1] / factors[code]
+                factors[code] = quote[code][1]
+        equity = cash + sum(quantity * quote[code][0] if code in quote else last_value.get(code, 0.0) for code, quantity in shares.items())
+        if equity <= 0: raise RuntimeError(f"non-positive equity on {day}")
+        targets = {code: float(weight) for code, weight in frame.select("ts_code", "target_weight").iter_rows() if weight > 0 and code in quote}
+        desired = {code: float(np.floor(equity * weight / quote[code][0] / lot_size) * lot_size) for code, weight in targets.items()}
+        # Sells are financed first.  Quantities produced by a corporate action
+        # may be fractional; they remain sellable even though new buys are lots.
+        sold = 0.0
+        for code, quantity in list(shares.items()):
+            if code not in quote:
+                continue
+            delta = max(quantity - desired.get(code, 0.0), 0.0)
+            if delta:
+                value = delta * quote[code][0]; cash += value * (1 - sell_bps / 10_000); sold += value
+                shares[code] = quantity - delta
+                executions.append({"execution_date": day, "ts_code": code, "side": "sell", "raw_open": quote[code][0], "shares": delta, "notional": value})
+        buys = {code: float(np.floor(max(desired[code] - shares.get(code, 0.0), 0.0) / lot_size) * lot_size) for code in desired}
+        buy_cost = sum(quantity * quote[code][0] * (1 + buy_bps / 10_000) for code, quantity in buys.items())
+        if buy_cost > cash and buy_cost > 0:
+            scale = cash / buy_cost
+            buys = {code: float(np.floor(quantity * scale / lot_size) * lot_size) for code, quantity in buys.items()}
+            buy_cost = sum(quantity * quote[code][0] * (1 + buy_bps / 10_000) for code, quantity in buys.items())
+        bought = 0.0
+        for code, quantity in buys.items():
+            if quantity:
+                value = quantity * quote[code][0]; shares[code] = shares.get(code, 0.0) + quantity
+                cash -= value * (1 + buy_bps / 10_000); bought += value
+                executions.append({"execution_date": day, "ts_code": code, "side": "buy", "raw_open": quote[code][0], "shares": quantity, "notional": value})
+        shares = {code: quantity for code, quantity in shares.items() if quantity > 1e-10}
+        for code, quantity in shares.items():
+            if code in quote:
+                factors[code] = quote[code][1]
+                last_value[code] = quantity * quote[code][0]
+                positions.append({"execution_date": day, "ts_code": code, "raw_open": quote[code][0], "qfq_ratio": quote[code][1], "shares": quantity, "market_value": last_value[code], "target_weight": targets.get(code, 0.0), "realized_weight": last_value[code] / equity})
+        transaction_cost = bought * buy_bps / 10_000 + sold * sell_bps / 10_000
+        # qfq/raw is the quantity adjustment needed to keep actual-share value
+        # economically continuous through splits, dividends, and rights issues.
+        ending_value = cash
+        for code, quantity in shares.items():
+            current_quote, next_quote = quote.get(code), price.get((next_day, code))
+            if current_quote and next_quote:
+                adjusted_quantity = quantity * next_quote[1] / current_quote[1] if return_basis == "qfq" else quantity
+                ending_value += adjusted_quantity * next_quote[0]
+            else:
+                ending_value += last_value.get(code, quantity * current_quote[0] if current_quote else 0.0)
         p0,p1=benchmark_price.get(day),benchmark_price.get(next_day)
         bench=p1/p0-1 if p0 and p1 else 0.0
-        delta={code: current.get(code,0)-previous.get(code,0) for code in set(current)|set(previous)}
-        buy_turnover=sum(max(change,0.0) for change in delta.values())
-        sell_turnover=sum(max(-change,0.0) for change in delta.values())
-        cost=0.0 if i==0 else buy_turnover*buy_bps/10_000 + sell_turnover*sell_bps/10_000
-        net=gross-cost; nav*=1+net; bench_nav*=1+bench
-        rows.append({"execution_date":day,"next_execution_date":next_day,"gross_return":gross,"transaction_cost":cost,"net_return":net,"csi500_return":bench,"active_return":net-bench,"buy_turnover":buy_turnover,"sell_turnover":sell_turnover,"nav":nav,"csi500_nav":bench_nav,"holding_count":len(current)})
-        previous=current
+        gross=(ending_value - equity + transaction_cost) / equity; net=ending_value / equity - 1
+        nav=ending_value / initial_capital; bench_nav*=1+bench
+        rows.append({"execution_date":day,"next_execution_date":next_day,"gross_return":gross,"transaction_cost":transaction_cost / equity,"net_return":net,"csi500_return":bench,"active_return":net-bench,"buy_turnover":bought / equity,"sell_turnover":sold / equity,"nav":nav,"csi500_nav":bench_nav,"holding_count":len(shares),"cash":cash,"cash_weight":cash / equity,"equity":ending_value})
     daily=pl.DataFrame(rows); daily.write_parquet(output/"portfolio_daily.parquet",compression="zstd")
+    pl.DataFrame(positions).write_parquet(output/"executed_positions.parquet", compression="zstd")
+    pl.DataFrame(executions).write_parquet(output/"executions.parquet", compression="zstd")
     net=daily["net_return"].to_numpy(); active=daily["active_return"].to_numpy(); years=len(net)/252
     ann_return=nav**(1/years)-1 if years else 0.0; ann_vol=float(np.std(net,ddof=1)*np.sqrt(252)); active_vol=float(np.std(active,ddof=1)*np.sqrt(252)); running=np.maximum.accumulate(daily["nav"].to_numpy()); max_dd=float(np.min(daily["nav"].to_numpy()/running-1))
-    summary={"days":len(rows),"gross_total_return":float(np.prod(1+daily["gross_return"].to_numpy())-1),"net_total_return":nav-1,"csi500_total_return":bench_nav-1,"annualized_return":ann_return,"annualized_volatility":ann_vol,"sharpe":ann_return/ann_vol if ann_vol else None,"information_ratio":float(np.mean(active)/np.std(active,ddof=1)*np.sqrt(252)) if np.std(active,ddof=1) else None,"max_drawdown":max_dd,"average_buy_turnover":float(daily["buy_turnover"].mean()),"average_sell_turnover":float(daily["sell_turnover"].mean()),"buy_cost_bps":buy_bps,"sell_cost_bps":sell_bps,"total_transaction_cost":float(daily["transaction_cost"].sum())}
+    summary={"days":len(rows),"initial_capital":initial_capital,"lot_size":lot_size,"return_basis":return_basis,"gross_total_return":float(np.prod(1+daily["gross_return"].to_numpy())-1),"net_total_return":nav-1,"csi500_total_return":bench_nav-1,"annualized_return":ann_return,"annualized_volatility":ann_vol,"sharpe":ann_return/ann_vol if ann_vol else None,"information_ratio":float(np.mean(active)/np.std(active,ddof=1)*np.sqrt(252)) if np.std(active,ddof=1) else None,"max_drawdown":max_dd,"average_buy_turnover":float(daily["buy_turnover"].mean()),"average_sell_turnover":float(daily["sell_turnover"].mean()),"average_cash_weight":float(daily["cash_weight"].mean()),"final_cash":float(cash),"buy_cost_bps":buy_bps,"sell_cost_bps":sell_bps,"total_transaction_cost":float(daily["transaction_cost"].sum())}
     (output/"portfolio_summary.json").write_text(json.dumps(summary,indent=2)); return summary
 
 
@@ -334,7 +451,7 @@ def render_backtest_report(portfolio_daily: Path, output: Path, title: str = "Po
     missing=required-set(frame.columns)
     if missing: raise ValueError(f"portfolio daily file missing: {sorted(missing)}")
     gross=frame["gross_return"].to_numpy(); net=frame["net_return"].to_numpy(); csi=frame["csi500_return"].to_numpy(); cost=frame["transaction_cost"].to_numpy()
-    gross_nav=np.cumprod(1+gross); net_nav=np.cumprod(1+net); csi_nav=np.cumprod(1+csi); fee=[]; nav=1.0; paid=0.0
+    gross_nav=np.cumprod(1+gross); net_nav=frame["nav"].to_numpy() if "nav" in frame.columns else np.cumprod(1+net); csi_nav=np.cumprod(1+csi); fee=[]; nav=1.0; paid=0.0
     for ret, fee_rate in zip(gross,cost):
         paid += nav*fee_rate; nav *= 1+ret-fee_rate; fee.append(paid)
     drawdown=net_nav/np.maximum.accumulate(net_nav)-1
@@ -342,11 +459,16 @@ def render_backtest_report(portfolio_daily: Path, output: Path, title: str = "Po
     def ann(value: np.ndarray) -> float: return float(np.prod(1+value)**(1/years)-1) if years else 0.0
     def vol(value: np.ndarray) -> float: return float(np.std(value,ddof=1)*np.sqrt(252)) if len(value)>1 else 0.0
     net_excess_wealth = float(net_nav[-1] / csi_nav[-1] - 1)
-    metrics={"days":len(frame),"start":str(frame["execution_date"][0]),"end":str(frame["execution_date"][-1]),"gross_total_return":float(gross_nav[-1]-1),"net_total_return":float(net_nav[-1]-1),"csi500_total_return":float(csi_nav[-1]-1),"net_excess_wealth_vs_csi500":net_excess_wealth,"gross_annualized_return":ann(gross),"net_annualized_return":ann(net),"csi500_annualized_return":ann(csi),"net_annualized_excess_vs_csi500":float((net_nav[-1] / csi_nav[-1]) ** (1 / years) - 1) if years else 0.0,"average_daily_active_return_bps":float(np.mean(net-csi)*10_000),"annualized_tracking_error":vol(net-csi),"net_sharpe":ann(net)/vol(net) if vol(net) else None,"information_ratio":float(np.mean(net-csi)/np.std(net-csi,ddof=1)*np.sqrt(252)) if np.std(net-csi,ddof=1) else None,"max_drawdown":float(drawdown.min()),"average_buy_turnover":float(frame["buy_turnover"].mean()),"average_sell_turnover":float(frame["sell_turnover"].mean()),"average_fee_bps":float(np.mean(cost)*10_000),"cumulative_fee_paid_on_initial_nav":float(fee[-1]),"average_holding_count":float(frame["holding_count"].mean())}
+    net_ann = float(net_nav[-1] ** (1 / years) - 1) if years else 0.0
+    metrics={"days":len(frame),"start":str(frame["execution_date"][0]),"end":str(frame["execution_date"][-1]),"gross_total_return":float(gross_nav[-1]-1),"net_total_return":float(net_nav[-1]-1),"csi500_total_return":float(csi_nav[-1]-1),"net_excess_wealth_vs_csi500":net_excess_wealth,"gross_annualized_return":ann(gross),"net_annualized_return":net_ann,"csi500_annualized_return":ann(csi),"net_annualized_excess_vs_csi500":float((net_nav[-1] / csi_nav[-1]) ** (1 / years) - 1) if years else 0.0,"average_daily_active_return_bps":float(np.mean(net-csi)*10_000),"annualized_tracking_error":vol(net-csi),"net_sharpe":net_ann/vol(net) if vol(net) else None,"information_ratio":float(np.mean(net-csi)/np.std(net-csi,ddof=1)*np.sqrt(252)) if np.std(net-csi,ddof=1) else None,"max_drawdown":float(drawdown.min()),"average_buy_turnover":float(frame["buy_turnover"].mean()),"average_sell_turnover":float(frame["sell_turnover"].mean()),"average_fee_bps":float(np.mean(cost)*10_000),"cumulative_fee_paid_on_initial_nav":float(fee[-1]),"average_holding_count":float(frame["holding_count"].mean())}
     holdings = summarize_holdings(target_weights) if target_weights else None
     dates=frame["execution_date"].to_list()
     plt.style.use("seaborn-v0_8-whitegrid")
-    fig,ax=plt.subplots(figsize=(12,5)); ax.plot(dates,gross_nav,label="Gross NAV",lw=1.8); ax.plot(dates,net_nav,label="Net NAV",lw=1.8); ax.plot(dates,csi_nav,label="CSI500 NAV",lw=1.5); ax.plot(dates,fee,label="Cumulative fee paid",lw=1.3,ls="--"); ax.set_title(title+" — NAV and fee"); ax.set_ylabel("Initial NAV = 1"); ax.legend(ncol=4,fontsize=9); fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(output/"nav_and_fee.png",dpi=160); plt.close(fig)
+    gross_net_gap = gross_nav - net_nav
+    fig,axes=plt.subplots(2,1,figsize=(12,7),sharex=True,gridspec_kw={"height_ratios":[3,1]}); axes[0].plot(dates,gross_nav,label="Gross NAV",lw=1.8,color="#457b9d"); axes[0].plot(dates,net_nav,label="Net NAV",lw=1.8,color="#e76f51"); axes[0].plot(dates,csi_nav,label="CSI500 NAV",lw=1.5,color="#6b7280"); axes[0].fill_between(dates,net_nav,gross_nav,color="#e9c46a",alpha=.35,label="Cost drag"); axes[0].set_title(title+" — NAV and transaction-cost drag"); axes[0].set_ylabel("Initial NAV = 1"); axes[0].legend(ncol=4,fontsize=9); axes[1].plot(dates,gross_net_gap,label="Gross − Net NAV",lw=1.5,color="#e9c46a"); axes[1].plot(dates,fee,label="Cumulative fee paid",lw=1.2,ls="--",color="#9b5de5"); axes[1].set_ylabel("Initial NAV"); axes[1].legend(ncol=2,fontsize=9); fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(output/"nav_and_fee.png",dpi=160); plt.close(fig)
+    excess_nav = net_nav - csi_nav
+    cumulative_active = np.cumsum(net - csi)
+    fig,axes=plt.subplots(2,1,figsize=(12,7),sharex=True,gridspec_kw={"height_ratios":[2,1]}); axes[0].plot(dates,excess_nav,color="#2a9d8f",lw=1.8,label="Net NAV − CSI500 NAV"); axes[0].fill_between(dates,excess_nav,0,color="#2a9d8f",alpha=.18); axes[0].axhline(0,color="#6b7280",lw=.8); axes[0].set_ylabel("Excess NAV (initial NAV)"); axes[0].set_title(title+" — CSI500 excess return / NAV"); axes[0].legend(fontsize=9); axes[1].plot(dates,cumulative_active,color="#457b9d",lw=1.3,label="Cumulative daily active return"); axes[1].axhline(0,color="#6b7280",lw=.8); axes[1].set_ylabel("Sum of active returns"); axes[1].legend(fontsize=9); fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(output/"excess_performance.png",dpi=160); plt.close(fig)
     fig,axes=plt.subplots(2,1,figsize=(12,7),sharex=True); axes[0].plot(dates,drawdown,color="#c44e52",lw=1.2); axes[0].fill_between(dates,drawdown,0,color="#c44e52",alpha=.2); axes[0].set_ylabel("Net drawdown"); axes[0].set_title(title+" — drawdown and turnover"); axes[1].plot(dates,frame["buy_turnover"].to_numpy(),label="Buy turnover",lw=1); axes[1].plot(dates,frame["sell_turnover"].to_numpy(),label="Sell turnover",lw=1); axes[1].bar(dates,cost,label="Fee",alpha=.35,width=1); axes[1].set_ylabel("Fraction of NAV"); axes[1].legend(ncol=3,fontsize=9); fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(output/"drawdown_turnover_fee.png",dpi=160); plt.close(fig)
     def row(key: str, value: object) -> str:
         if isinstance(value, float):
@@ -359,7 +481,7 @@ def render_backtest_report(portfolio_daily: Path, output: Path, title: str = "Po
     holdings_table=""
     if holdings:
         holdings_table="<h2>Holdings</h2><table>"+"".join(row(key,json.dumps(value,ensure_ascii=False)) for key,value in holdings.items())+"</table>"
-    page=f"""<!doctype html><html><head><meta charset='utf-8'><title>{html.escape(title)}</title><style>body{{font-family:Arial,sans-serif;margin:32px;color:#18212f}}table{{border-collapse:collapse}}th,td{{padding:7px 12px;border:1px solid #d9e1ea;text-align:left}}img{{display:block;max-width:1100px;width:100%;margin:20px 0}}</style></head><body><h1>{html.escape(title)}</h1><p>Return basis: T+1 open to T+2 open; benchmark: CSI500; costs use the portfolio daily ledger.</p><h2>Performance and CSI500 excess</h2><table>{table}</table>{holdings_table}<img src='nav_and_fee.png'><img src='drawdown_turnover_fee.png'></body></html>"""
+    page=f"""<!doctype html><html><head><meta charset='utf-8'><title>{html.escape(title)}</title><style>body{{font-family:Arial,sans-serif;margin:32px;color:#18212f}}table{{border-collapse:collapse}}th,td{{padding:7px 12px;border:1px solid #d9e1ea;text-align:left}}img{{display:block;max-width:1100px;width:100%;margin:20px 0}}</style></head><body><h1>{html.escape(title)}</h1><p>Return basis: T+1 open to T+2 open; benchmark: CSI500; costs use the portfolio daily ledger.</p><h2>Performance and CSI500 excess</h2><table>{table}</table>{holdings_table}<img src='nav_and_fee.png'><img src='excess_performance.png'><img src='drawdown_turnover_fee.png'></body></html>"""
     report = {**metrics, "holdings": holdings} if holdings else metrics
     (output/"report.html").write_text(page,encoding="utf-8"); (output/"report_summary.json").write_text(json.dumps(report,indent=2),encoding="utf-8")
     return {"output":str(output),"report":str(output/"report.html"),**report}
@@ -368,16 +490,18 @@ def render_backtest_report(portfolio_daily: Path, output: Path, title: str = "Po
 def main(argv: list[str] | None = None) -> None:
     p=argparse.ArgumentParser(prog="quant-predict"); sub=p.add_subparsers(dest="command",required=True)
     def common(x): x.add_argument("--catalog",type=Path,required=True); x.add_argument("--start"); x.add_argument("--end")
-    b=sub.add_parser("build-features"); common(b); b.add_argument("--factor-root",type=Path,required=True); b.add_argument("--feature-root",type=Path,required=True); b.add_argument("--factor-ids-file",type=Path); b.add_argument("--replace",action="store_true")
-    r=sub.add_parser("run-oos"); common(r); r.add_argument("--feature-root",type=Path,required=True); r.add_argument("--output",type=Path,required=True)
-    d=sub.add_parser("optimize-dual-alpha"); d.add_argument("--predictions",type=Path,required=True); d.add_argument("--output",type=Path,required=True); d.add_argument("--h1-weight",type=float,default=.5); d.add_argument("--turnover-cap",type=float,default=.30); d.add_argument("--temperature",type=float,default=2.0); d.add_argument("--max-weight",type=float,default=.10)
-    bt=sub.add_parser("backtest-portfolio"); bt.add_argument("--catalog",type=Path,required=True); bt.add_argument("--target-weights",type=Path,required=True); bt.add_argument("--output",type=Path,required=True); bt.add_argument("--buy-bps",type=float,default=2.1); bt.add_argument("--sell-bps",type=float,default=7.1)
+    b=sub.add_parser("build-features"); common(b); b.add_argument("--factor-root",type=Path,required=True); b.add_argument("--feature-root",type=Path,required=True); b.add_argument("--factor-ids-file",type=Path); b.add_argument("--all-factor-artifacts",action="store_true"); b.add_argument("--replace",action="store_true")
+    r=sub.add_parser("run-oos"); common(r); r.add_argument("--oos-start"); r.add_argument("--feature-root",type=Path,required=True); r.add_argument("--output",type=Path,required=True); r.add_argument("--models",nargs="+",choices=["lgbm","mlp","transformer"],default=["lgbm","mlp","transformer"]); r.add_argument("--refit-months",type=int,default=3); r.add_argument("--neural-epochs",type=int,default=8); r.add_argument("--neural-max-samples",type=int,default=60_000); r.add_argument("--max-features",type=int,default=40); r.add_argument("--min-coverage",type=float,default=.85); r.add_argument("--min-abs-icir",type=float,default=.5); r.add_argument("--max-abs-correlation",type=float,default=.90)
+    d=sub.add_parser("optimize-dual-alpha"); d.add_argument("--predictions",type=Path,required=True); d.add_argument("--output",type=Path,required=True); d.add_argument("--h1-weight",type=float,default=.5); d.add_argument("--turnover-cap",type=float,default=.30); d.add_argument("--temperature",type=float,default=2.0); d.add_argument("--max-weight",type=float,default=.10); d.add_argument("--min-weight",type=float,default=0.0)
+    bt=sub.add_parser("backtest-portfolio"); bt.add_argument("--catalog",type=Path,required=True); bt.add_argument("--target-weights",type=Path,required=True); bt.add_argument("--output",type=Path,required=True); bt.add_argument("--buy-bps",type=float,default=2.1); bt.add_argument("--sell-bps",type=float,default=7.1); bt.add_argument("--initial-capital",type=float,default=10_000_000); bt.add_argument("--lot-size",type=int,default=100); bt.add_argument("--return-basis",choices=["qfq","raw"],default="qfq")
     rp=sub.add_parser("render-backtest-report"); rp.add_argument("--portfolio-daily",type=Path,required=True); rp.add_argument("--output",type=Path,required=True); rp.add_argument("--title",default="Portfolio backtest"); rp.add_argument("--target-weights",type=Path)
     args=p.parse_args(argv)
-    if args.command=="build-features": result=build_features(args.catalog,args.factor_root,args.feature_root,args.start,args.end,args.replace,read_factor_ids(args.factor_ids_file))
-    elif args.command=="run-oos": result=run_oos(args.catalog,args.feature_root,args.output,args.start,args.end)
-    elif args.command=="optimize-dual-alpha": result=optimize_dual_alpha_targets(args.predictions,args.output,args.h1_weight,args.turnover_cap,args.temperature,args.max_weight)
-    elif args.command=="backtest-portfolio": result=backtest_targets(args.catalog,args.target_weights,args.output,args.buy_bps,args.sell_bps)
+    if args.command=="build-features":
+        if args.factor_ids_file and args.all_factor_artifacts: raise ValueError("choose factor ids file or all-factor-artifacts, not both")
+        result=build_features(args.catalog,args.factor_root,args.feature_root,args.start,args.end,args.replace,all_factor_ids(args.factor_root) if args.all_factor_artifacts else read_factor_ids(args.factor_ids_file))
+    elif args.command=="run-oos": result=run_oos(args.catalog,args.feature_root,args.output,args.start,args.end,ensemble=EnsembleSettings(tuple(args.models),args.refit_months,args.neural_epochs,args.neural_max_samples),selection=SelectionSettings(args.min_coverage,args.min_abs_icir,args.max_features,args.max_abs_correlation),oos_start=args.oos_start)
+    elif args.command=="optimize-dual-alpha": result=optimize_dual_alpha_targets(args.predictions,args.output,args.h1_weight,args.turnover_cap,args.temperature,args.max_weight,args.min_weight)
+    elif args.command=="backtest-portfolio": result=backtest_targets(args.catalog,args.target_weights,args.output,args.buy_bps,args.sell_bps,args.initial_capital,args.lot_size,args.return_basis)
     else: result=render_backtest_report(args.portfolio_daily,args.output,args.title,args.target_weights)
     print(json.dumps(result,ensure_ascii=False,default=str))
 
