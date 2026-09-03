@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import polars as pl
@@ -54,8 +55,21 @@ def select_features(train: pl.DataFrame, features: tuple[str, ...], target: str,
     return tuple(selected), stats
 
 
-def fit_predict_neural(kind: str, train_x: np.ndarray, train_y: np.ndarray, test_x: np.ndarray, seed: int, epochs: int = 8, max_samples: int = 60_000) -> np.ndarray:
-    """Fit a small two-target MLP or feature-token Transformer on CPU/GPU."""
+def fit_predict_neural(
+    kind: str,
+    train_x: np.ndarray,
+    train_y: np.ndarray,
+    test_x: np.ndarray,
+    seed: int,
+    epochs: int = 20,
+    max_samples: int = 60_000,
+    train_dates: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Fit a two-horizon neural model with a time-ordered validation split.
+
+    The MLP intentionally uses residual blocks: factor selection may change the
+    input width at each refit, while the 256-wide residual trunk stays stable.
+    """
     try:
         import torch
         from torch import nn
@@ -64,15 +78,63 @@ def fit_predict_neural(kind: str, train_x: np.ndarray, train_y: np.ndarray, test
         raise RuntimeError("MLP/Transformer require the optional 'deep-learning' dependency") from exc
     if kind not in {"mlp", "transformer"}:
         raise ValueError(f"unsupported neural model: {kind}")
-    rng = np.random.default_rng(seed)
-    if len(train_x) > max_samples:
-        index = rng.choice(len(train_x), size=max_samples, replace=False)
-        train_x, train_y = train_x[index], train_y[index]
     torch.manual_seed(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+    rng = np.random.default_rng(seed)
+    if train_dates is not None:
+        dates = np.asarray(train_dates).astype("datetime64[D]")
+        validation_dates = np.unique(dates)[-63:]
+        validation_mask = np.isin(dates, validation_dates)
+    else:
+        validation_mask = np.zeros(len(train_x), dtype=bool)
+        validation_mask[-max(1, len(train_x) // 10):] = True
+    fit_mask = ~validation_mask
+    if not fit_mask.any() or not validation_mask.any():
+        raise ValueError("neural model needs both training and validation observations")
+    fit_indices = np.flatnonzero(fit_mask)
+    if max_samples > 0 and len(fit_indices) > max_samples:
+        fit_indices = rng.choice(fit_indices, size=max_samples, replace=False)
+    x_fit = np.nan_to_num(train_x[fit_indices], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    y_fit = train_y[fit_indices].astype(np.float32, copy=False)
+    x_val = np.nan_to_num(train_x[validation_mask], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    y_val = train_y[validation_mask].astype(np.float32, copy=False)
+    target_mean = y_fit.mean(axis=0, keepdims=True)
+    target_std = y_fit.std(axis=0, keepdims=True)
+    target_std[target_std < 1e-7] = 1.0
+    y_fit = (y_fit - target_mean) / target_std
+    y_val = (y_val - target_mean) / target_std
     width = train_x.shape[1]
     if kind == "mlp":
-        model = nn.Sequential(nn.Linear(width, 96), nn.LayerNorm(96), nn.GELU(), nn.Dropout(.10), nn.Linear(96, 48), nn.GELU(), nn.Linear(48, 2))
+        class ResidualBlock(nn.Module):
+            def __init__(self, dimension: int = 256) -> None:
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.LayerNorm(dimension), nn.Linear(dimension, dimension * 2),
+                    nn.GELU(), nn.Dropout(.10), nn.Linear(dimension * 2, dimension),
+                )
+
+            def forward(self, value: Any) -> Any:
+                return value + self.net(value)
+
+        class ResidualMlp(nn.Module):
+            def __init__(self, count: int) -> None:
+                super().__init__()
+                self.trunk = nn.Sequential(
+                    nn.Linear(count, 256), nn.LayerNorm(256), nn.GELU(),
+                    ResidualBlock(), ResidualBlock(), ResidualBlock(), nn.LayerNorm(256),
+                )
+                self.head_h1 = nn.Linear(256, 1)
+                self.head_h5 = nn.Linear(256, 1)
+
+            def forward(self, value: Any) -> Any:
+                encoded = self.trunk(value)
+                return torch.cat((self.head_h1(encoded), self.head_h5(encoded)), dim=1)
+        model = ResidualMlp(width)
     else:
         class FeatureTransformer(nn.Module):
             def __init__(self, count: int) -> None:
@@ -87,15 +149,39 @@ def fit_predict_neural(kind: str, train_x: np.ndarray, train_y: np.ndarray, test
                 return self.head(self.encoder(token).mean(dim=1))
         model = FeatureTransformer(width)
     model.to(device)
-    loader = DataLoader(TensorDataset(torch.tensor(np.nan_to_num(train_x), dtype=torch.float32), torch.tensor(train_y, dtype=torch.float32)), batch_size=2048, shuffle=True)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    loss_fn = nn.HuberLoss(delta=.02)
+    batch_size = 8192 if device.type in {"mps", "cuda"} else 2048
+    loader = DataLoader(
+        TensorDataset(torch.from_numpy(x_fit), torch.from_numpy(y_fit)),
+        batch_size=batch_size, shuffle=True, pin_memory=device.type == "cuda",
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=7e-4, weight_decay=2e-4)
+    loss_fn = nn.HuberLoss(delta=1.0)
+    best_state: dict[str, Any] | None = None
+    best_loss = float("inf")
+    stale = 0
     model.train()
-    for _ in range(epochs):
+    for epoch in range(epochs):
         for xb, yb in loader:
             optimizer.zero_grad(set_to_none=True)
             loss = loss_fn(model(xb.to(device)), yb.to(device))
             loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
+        model.eval()
+        with torch.no_grad():
+            value = loss_fn(model(torch.from_numpy(x_val).to(device)), torch.from_numpy(y_val).to(device)).item()
+        if value < best_loss - 1e-5:
+            best_loss, stale = value, 0
+            best_state = {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+        else:
+            stale += 1
+            if stale >= 4:
+                break
+        model.train()
+    if best_state is not None:
+        model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
-        return model(torch.tensor(np.nan_to_num(test_x), dtype=torch.float32, device=device)).cpu().numpy()
+        prediction = model(torch.from_numpy(np.nan_to_num(test_x, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)).to(device)).cpu().numpy()
+    return prediction * target_std + target_mean, {
+        "backend": device.type, "fit_samples": int(len(x_fit)), "validation_samples": int(len(x_val)),
+        "best_validation_huber": float(best_loss), "epochs_completed": epoch + 1,
+    }

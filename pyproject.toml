@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-deep-learning = ["torch>=2.2,<2.3"]
+deep-learning = ["torch>=2.14,<2.15"]
 
 [project.scripts]
 a-share-data = "a_share_data.cli:main"

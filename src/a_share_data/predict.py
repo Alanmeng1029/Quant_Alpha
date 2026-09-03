@@ -45,9 +45,9 @@ class LgbmSettings:
 
 @dataclass(frozen=True)
 class EnsembleSettings:
-    models: tuple[str, ...] = ("lgbm", "mlp", "transformer")
+    models: tuple[str, ...] = ("lgbm",)
     refit_months: int = 3
-    neural_epochs: int = 8
+    neural_epochs: int = 20
     neural_max_samples: int = 60_000
 
 
@@ -246,14 +246,20 @@ def run_oos(catalog: Path, feature_root: Path, output: Path, start: str | None =
                 out=out.with_columns(pl.Series(f"lgbm_{horizon}", model.predict(test.select(selected).to_numpy())))
                 importance.extend({"model_month":month,"horizon":horizon,"feature":f,"importance":float(v)} for f,v in zip(selected, model.feature_importance()))
         neural_fit=winsorize_labels(winsorize_labels(train.drop_nulls(["excess_h1", "excess_h5"]), "excess_h1"), "excess_h5")
+        neural_metadata=[]
         for model_name in (name for name in ensemble.models if name in {"mlp", "transformer"}):
-            prediction=fit_predict_neural(model_name, neural_fit.select(selected).to_numpy(), neural_fit.select("excess_h1", "excess_h5").to_numpy(), test.select(selected).to_numpy(), settings.seed + window_index, ensemble.neural_epochs, ensemble.neural_max_samples)
+            prediction, metadata=fit_predict_neural(
+                model_name, neural_fit.select(selected).to_numpy(), neural_fit.select("excess_h1", "excess_h5").to_numpy(),
+                test.select(selected).to_numpy(), settings.seed + window_index, ensemble.neural_epochs, ensemble.neural_max_samples,
+                neural_fit.get_column("trade_date").to_numpy(),
+            )
             out=out.with_columns(pl.Series(f"{model_name}_h1", prediction[:,0]), pl.Series(f"{model_name}_h5", prediction[:,1]))
+            neural_metadata.append({"model":model_name, **metadata})
         out=out.with_columns(pl.lit(month).alias("model_month"))
         # execution date is market-calendar based, not per-stock; repair via date mapping.
         next_map={dates[i]:dates[i+1] for i in range(len(dates)-1)}; out=out.with_columns(pl.col("trade_date").cast(pl.String).replace_strict(next_map, default=None).str.to_date().alias("execution_date"))
         records.append(out); timings.append({"model_month":month,"seconds":time.perf_counter()-month_start,"training_start":train_dates[0],"training_end":train_dates[-1],"training_days":len(train_dates),"selected_features":len(selected)})
-        (models / f"month={month}" / "manifest.json").write_text(json.dumps({"training_start":train_dates[0],"training_end":train_dates[-1],"factor_ids":selected,"feature_hash":hashlib.sha256("|".join(selected).encode()).hexdigest(),"targets":["excess_h1","excess_h5"],"lgbm_settings":asdict(settings),"ensemble_settings":asdict(ensemble),"selection_settings":asdict(selection)},indent=2))
+        (models / f"month={month}" / "manifest.json").write_text(json.dumps({"training_start":train_dates[0],"training_end":train_dates[-1],"factor_ids":selected,"feature_hash":hashlib.sha256("|".join(selected).encode()).hexdigest(),"targets":["excess_h1","excess_h5"],"lgbm_settings":asdict(settings),"ensemble_settings":asdict(ensemble),"selection_settings":asdict(selection),"neural":neural_metadata},indent=2))
     pred=pl.concat(records) if records else pl.DataFrame()
     prediction_columns=[f"{name}_{horizon}" for name in ensemble.models for horizon in ("h1","h5")]
     zscores=[]
@@ -344,7 +350,7 @@ def backtest_targets(catalog: Path, target_weights: Path, output: Path, buy_bps:
     by_date = {(day[0] if isinstance(day, tuple) else day): frame for day, frame in targets.partition_by("execution_date", as_dict=True).items()}
     price = {(day, code): (raw, qfq / raw) for day, code, raw, qfq in prices.select("trade_date", "ts_code", "raw_open", "qfq_open").iter_rows()}
     benchmark_price = dict(benchmark.select("trade_date", "open").iter_rows())
-    rows=[]; positions=[]; executions=[]; shares: dict[str, float] = {}; factors: dict[str, float] = {}; last_value: dict[str, float] = {}; cash=initial_capital; nav=1.0; bench_nav=1.0
+    rows=[]; positions=[]; executions=[]; shares: dict[str, float] = {}; factors: dict[str, float] = {}; last_value: dict[str, float] = {}; cash=initial_capital; nav=1.0; bench_nav=1.0; previous_ending_value=initial_capital
     for i, day in enumerate(execution_dates[:-1]):
         next_day=execution_dates[i+1]; frame=by_date[day]
         quote = {code: price[(day, code)] for code in set(shares) | set(frame["ts_code"].to_list()) if (day, code) in price}
@@ -398,9 +404,15 @@ def backtest_targets(catalog: Path, target_weights: Path, output: Path, buy_bps:
                 ending_value += last_value.get(code, quantity * current_quote[0] if current_quote else 0.0)
         p0,p1=benchmark_price.get(day),benchmark_price.get(next_day)
         bench=p1/p0-1 if p0 and p1 else 0.0
-        gross=(ending_value - equity + transaction_cost) / equity; net=ending_value / equity - 1
+        # Returns must chain from the preceding end-of-day portfolio value.  The
+        # tradable pre-trade value may differ around corporate actions because
+        # qfq share-equivalence is refreshed at the open; using it as a return
+        # denominator made compounded daily NAV disagree with the cash ledger.
+        gross=(ending_value - previous_ending_value + transaction_cost) / previous_ending_value
+        net=ending_value / previous_ending_value - 1
         nav=ending_value / initial_capital; bench_nav*=1+bench
-        rows.append({"execution_date":day,"next_execution_date":next_day,"gross_return":gross,"transaction_cost":transaction_cost / equity,"net_return":net,"csi500_return":bench,"active_return":net-bench,"buy_turnover":bought / equity,"sell_turnover":sold / equity,"nav":nav,"csi500_nav":bench_nav,"holding_count":len(shares),"cash":cash,"cash_weight":cash / equity,"equity":ending_value})
+        rows.append({"execution_date":day,"next_execution_date":next_day,"gross_return":gross,"transaction_cost":transaction_cost / previous_ending_value,"net_return":net,"csi500_return":bench,"active_return":net-bench,"buy_turnover":bought / equity,"sell_turnover":sold / equity,"nav":nav,"csi500_nav":bench_nav,"holding_count":len(shares),"cash":cash,"cash_weight":cash / equity,"equity":ending_value})
+        previous_ending_value=ending_value
     daily=pl.DataFrame(rows); daily.write_parquet(output/"portfolio_daily.parquet",compression="zstd")
     pl.DataFrame(positions).write_parquet(output/"executed_positions.parquet", compression="zstd")
     pl.DataFrame(executions).write_parquet(output/"executions.parquet", compression="zstd")
@@ -491,7 +503,7 @@ def main(argv: list[str] | None = None) -> None:
     p=argparse.ArgumentParser(prog="quant-predict"); sub=p.add_subparsers(dest="command",required=True)
     def common(x): x.add_argument("--catalog",type=Path,required=True); x.add_argument("--start"); x.add_argument("--end")
     b=sub.add_parser("build-features"); common(b); b.add_argument("--factor-root",type=Path,required=True); b.add_argument("--feature-root",type=Path,required=True); b.add_argument("--factor-ids-file",type=Path); b.add_argument("--all-factor-artifacts",action="store_true"); b.add_argument("--replace",action="store_true")
-    r=sub.add_parser("run-oos"); common(r); r.add_argument("--oos-start"); r.add_argument("--feature-root",type=Path,required=True); r.add_argument("--output",type=Path,required=True); r.add_argument("--models",nargs="+",choices=["lgbm","mlp","transformer"],default=["lgbm","mlp","transformer"]); r.add_argument("--refit-months",type=int,default=3); r.add_argument("--neural-epochs",type=int,default=8); r.add_argument("--neural-max-samples",type=int,default=60_000); r.add_argument("--max-features",type=int,default=40); r.add_argument("--min-coverage",type=float,default=.85); r.add_argument("--min-abs-icir",type=float,default=.5); r.add_argument("--max-abs-correlation",type=float,default=.90)
+    r=sub.add_parser("run-oos"); common(r); r.add_argument("--oos-start"); r.add_argument("--feature-root",type=Path,required=True); r.add_argument("--output",type=Path,required=True); r.add_argument("--models",nargs="+",choices=["lgbm","mlp","transformer"],default=["lgbm"]); r.add_argument("--refit-months",type=int,default=3); r.add_argument("--neural-epochs",type=int,default=20); r.add_argument("--neural-max-samples",type=int,default=60_000); r.add_argument("--max-features",type=int,default=40); r.add_argument("--min-coverage",type=float,default=.85); r.add_argument("--min-abs-icir",type=float,default=.5); r.add_argument("--max-abs-correlation",type=float,default=.90)
     d=sub.add_parser("optimize-dual-alpha"); d.add_argument("--predictions",type=Path,required=True); d.add_argument("--output",type=Path,required=True); d.add_argument("--h1-weight",type=float,default=.5); d.add_argument("--turnover-cap",type=float,default=.30); d.add_argument("--temperature",type=float,default=2.0); d.add_argument("--max-weight",type=float,default=.10); d.add_argument("--min-weight",type=float,default=0.0)
     bt=sub.add_parser("backtest-portfolio"); bt.add_argument("--catalog",type=Path,required=True); bt.add_argument("--target-weights",type=Path,required=True); bt.add_argument("--output",type=Path,required=True); bt.add_argument("--buy-bps",type=float,default=2.1); bt.add_argument("--sell-bps",type=float,default=7.1); bt.add_argument("--initial-capital",type=float,default=10_000_000); bt.add_argument("--lot-size",type=int,default=100); bt.add_argument("--return-basis",choices=["qfq","raw"],default="qfq")
     rp=sub.add_parser("render-backtest-report"); rp.add_argument("--portfolio-daily",type=Path,required=True); rp.add_argument("--output",type=Path,required=True); rp.add_argument("--title",default="Portfolio backtest"); rp.add_argument("--target-weights",type=Path)
