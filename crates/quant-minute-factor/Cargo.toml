@@ -1,0 +1,22 @@
+[package]
+name = "quant-minute-factor"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "quant-minute-factor"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+arrow = "59"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+duckdb = { version = "1.4", features = ["bundled"] }
+parquet = { version = "59", features = ["zstd"] }
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

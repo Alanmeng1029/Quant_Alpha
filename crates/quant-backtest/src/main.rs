@@ -23,6 +23,7 @@ struct Cli {
 enum Command {
     FactorEval(FactorEvalArgs),
     BatchFactorEval(BatchFactorEvalArgs),
+    BatchWideFactorEval(BatchWideFactorEvalArgs),
     #[command(name = "batch-eval", hide = true)]
     BatchEval(BatchEvalLegacyArgs),
     OptimizePortfolio(OptimizePortfolioArgs),
@@ -90,10 +91,41 @@ struct BatchFactorEvalArgs {
     rebuild_cache: bool,
 }
 
+/// Evaluate every factor column of one wide minute-factor dataset against the
+/// shared per-universe market-label cache.  Output layout matches
+/// batch-factor-eval so the existing reporter and resume logic apply.
+#[derive(Parser)]
+struct BatchWideFactorEvalArgs {
+    #[arg(long)]
+    catalog: PathBuf,
+    /// Wide dataset root produced by quant-minute-factor (year=/...parquet).
+    #[arg(long)]
+    factor_dataset: PathBuf,
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long)]
+    batch_id: Option<String>,
+    #[arg(long, value_delimiter = ',', default_value = "csi300_csi500")]
+    universes: Vec<String>,
+    #[arg(long, value_delimiter = ',')]
+    tasks: Option<Vec<String>>,
+    #[arg(long, value_delimiter = ',')]
+    factors: Option<Vec<String>>,
+    #[arg(long, default_value = "configs/factor_eval.yaml")]
+    csi300_config: PathBuf,
+    #[arg(long, default_value = "configs/factor_eval_csi500.yaml")]
+    csi500_config: PathBuf,
+    #[arg(long, default_value = "configs/factor_eval_csi300_csi500.yaml")]
+    csi300_csi500_config: PathBuf,
+    #[arg(long, default_value = "configs/factor_eval_all.yaml")]
+    all_config: PathBuf,
+    #[arg(long)]
+    rebuild_cache: bool,
+}
+
 /// Compatibility spelling for the pre-cache process-per-factor runner.
 #[derive(Parser)]
-struct BatchEvalLegacyArgs {
-    #[arg(long)]
+struct BatchEvalLegacyArgs {    #[arg(long)]
     catalog: PathBuf,
     #[arg(long)]
     factor_root: PathBuf,
@@ -763,9 +795,56 @@ fn build_cached_ic_and_groups(conn: &Connection, specs: &[LabelSpec], output: &P
     Ok(())
 }
 
+/// SQL selecting `(trade_date, ts_code, factor_value)` from a long factor file.
+fn long_cohort_sql(factor: &Path) -> Result<String> {
+    let factor_path = quote_sql(&factor.canonicalize()?.to_string_lossy());
+    Ok(format!(
+        "SELECT trade_date, ts_code, factor_value FROM read_parquet('{factor_path}')"
+    ))
+}
+
+/// Factor columns of a wide dataset (everything except keys/partition cols).
+fn discover_wide_columns(conn: &Connection, dataset: &Path) -> Result<Vec<String>> {
+    let glob = dataset
+        .canonicalize()?
+        .join("**")
+        .join("*.parquet");
+    let glob = quote_sql(&glob.to_string_lossy());
+    let mut statement = conn.prepare(&format!(
+        "DESCRIBE SELECT * FROM read_parquet('{glob}', hive_partitioning = true)"
+    ))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut columns = Vec::new();
+    for name in rows {
+        let name = name?;
+        if !matches!(name.as_str(), "trade_date" | "ts_code" | "year") {
+            columns.push(name);
+        }
+    }
+    columns.sort();
+    if columns.is_empty() {
+        bail!("No factor columns found in wide dataset {}", dataset.display());
+    }
+    Ok(columns)
+}
+
+fn wide_cohort_sql(dataset: &Path, column: &str) -> Result<String> {
+    let glob = dataset
+        .canonicalize()?
+        .join("**")
+        .join("*.parquet");
+    let glob = quote_sql(&glob.to_string_lossy());
+    let column = column.replace('"', "\"\"");
+    Ok(format!(
+        "SELECT trade_date, ts_code, \"{column}\" AS factor_value FROM read_parquet('{glob}', hive_partitioning = true)"
+    ))
+}
+
 fn evaluate_cached_factor(
     conn: &Connection,
-    factor: &Path,
+    cohort_sql: &str,
+    factor_label: &str,
+    factor_display_path: &Path,
     catalog: &Path,
     universe: &str,
     config: &Config,
@@ -773,13 +852,12 @@ fn evaluate_cached_factor(
     output: &Path,
 ) -> Result<()> {
     fs::create_dir_all(output)?;
-    let factor_path = quote_sql(&factor.canonicalize()?.to_string_lossy());
     conn.execute_batch("DROP TABLE IF EXISTS factor_cohort;")?;
     conn.execute_batch(&format!(
         r#"
         CREATE TEMP TABLE factor_cohort AS
         SELECT f.trade_date, f.ts_code, f.factor_value
-        FROM read_parquet('{factor_path}') f
+        FROM ({cohort_sql}) f
         JOIN cache_panel p USING (trade_date, ts_code)
         WHERE isfinite(f.factor_value);
     "#
@@ -798,7 +876,7 @@ fn evaluate_cached_factor(
         ),
     )?;
     let summary = Summary {
-        factor_id: factor_id(factor), factor_path: factor.canonicalize()?.display().to_string(), catalog: catalog.canonicalize()?.display().to_string(),
+        factor_id: factor_label.to_string(), factor_path: factor_display_path.canonicalize()?.display().to_string(), catalog: catalog.canonicalize()?.display().to_string(),
         universe: universe.to_string(), start: config.start.clone().unwrap_or_else(|| "dataset minimum".to_string()), end: config.end.clone().unwrap_or_else(|| "dataset maximum".to_string()),
         horizons, transaction_cost_bps: config.transaction_cost_bps.unwrap_or(0.0),
         portfolio_direction: "not_applicable_batch_factor_prediction_report".to_string(), rows, daily_ic_rows, portfolio_rows: 0,
@@ -1371,15 +1449,19 @@ fn run_batch_factor_eval(args: BatchFactorEvalArgs) -> Result<PathBuf> {
             }
             let started = Instant::now();
             let stage = stage_path(&batch_root, id, universe);
-            let result = evaluate_cached_factor(
-                &conn,
-                factor,
-                &args.catalog,
-                universe,
-                &config,
-                &cache_manifest,
-                &stage,
-            );
+            let result = long_cohort_sql(factor).and_then(|cohort_sql| {
+                evaluate_cached_factor(
+                    &conn,
+                    &cohort_sql,
+                    id,
+                    factor,
+                    &args.catalog,
+                    universe,
+                    &config,
+                    &cache_manifest,
+                    &stage,
+                )
+            });
             match result {
                 Ok(()) => {
                     if output.exists() {
@@ -1421,6 +1503,226 @@ fn run_batch_factor_eval(args: BatchFactorEvalArgs) -> Result<PathBuf> {
         &serde_json::json!({
             "batch_id": batch_id, "catalog": args.catalog, "factor_root": args.factor_root, "tasks": task_count,
             "execution": "batch-factor-eval-v2: one market-label cache and one DuckDB connection per universe; factors evaluated sequentially",
+            "universes": args.universes, "cache_timings": cache_timings,
+            "total_elapsed_seconds": batch_started.elapsed().as_secs_f64(), "has_failures": failed,
+        }),
+    )?;
+    if failed {
+        bail!(
+            "Batch completed with failures; inspect {}",
+            batch_root.join("task_status.json").display()
+        );
+    }
+    Ok(batch_root)
+}
+
+/// Evaluate every column of one wide minute-factor dataset.  Per universe the
+/// wide files and the market-label cache are each read once; the columns are
+/// then evaluated sequentially inside a single DuckDB connection so output
+/// layout, resume, and reports match batch-factor-eval.
+fn run_batch_wide_factor_eval(args: BatchWideFactorEvalArgs) -> Result<PathBuf> {
+    let batch_started = Instant::now();
+    let batch_id = args
+        .batch_id
+        .clone()
+        .unwrap_or_else(|| chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string());
+    let batch_root = args.output.join(&batch_id);
+    fs::create_dir_all(&batch_root)?;
+    if !args
+        .factor_dataset
+        .join("manifest.json")
+        .exists()
+    {
+        bail!(
+            "Wide dataset manifest missing under {}",
+            args.factor_dataset.display()
+        );
+    }
+    let planning = Connection::open_with_flags(
+        &args.catalog,
+        DuckDbConfig::default().access_mode(AccessMode::ReadOnly)?,
+    )?;
+    let mut columns = discover_wide_columns(&planning, &args.factor_dataset)?;
+    if let Some(requested) = &args.factors {
+        columns.retain(|column| requested.contains(column));
+        if columns.len() != requested.len() {
+            bail!(
+                "Some --factors entries were not found in the wide dataset; available: {columns:?}"
+            );
+        }
+    }
+    let all_configs = vec![
+        ("csi300_csi500", args.csi300_csi500_config.clone()),
+        ("csi300", args.csi300_config.clone()),
+        ("csi500", args.csi500_config.clone()),
+        ("all", args.all_config.clone()),
+    ];
+    let configs = all_configs
+        .into_iter()
+        .filter(|(universe, _)| args.universes.iter().any(|requested| requested == universe))
+        .collect::<Vec<_>>();
+    if configs.len() != args.universes.len() {
+        bail!("Unsupported universe in --universes. Use csi300_csi500, csi300, csi500, or all");
+    }
+    let requested_tasks = args.tasks.clone().unwrap_or_default();
+    let task_count = columns
+        .iter()
+        .flat_map(|column| {
+            configs
+                .iter()
+                .map(move |(universe, _)| format!("{column}/{universe}"))
+        })
+        .filter(|task| requested_tasks.is_empty() || requested_tasks.contains(task))
+        .count();
+    if !requested_tasks.is_empty() && task_count != requested_tasks.len() {
+        bail!("At least one --tasks entry did not match a wide factor column and selected universe");
+    }
+    write_json_atomic(
+        &batch_root.join("batch_manifest.json"),
+        &serde_json::json!({
+            "batch_id": batch_id, "catalog": args.catalog, "factor_dataset": args.factor_dataset,
+            "factor_columns": columns, "tasks": task_count,
+            "execution": "batch-wide-factor-eval-v2: one market-label cache and one wide-dataset pass per universe; columns evaluated sequentially",
+            "universes": args.universes,
+        }),
+    )?;
+
+    let mut statuses = Vec::<BatchTaskStatus>::new();
+    let mut cache_timings = Vec::<CacheTiming>::new();
+    let mut failed = false;
+    for (universe, config_path) in configs {
+        let config: Config = serde_yaml::from_str(
+            &fs::read_to_string(&config_path)
+                .with_context(|| format!("read config {}", config_path.display()))?,
+        )?;
+        if config.universe.as_deref().unwrap_or("all") != universe {
+            bail!(
+                "Config {} declares a different universe than requested {universe}",
+                config_path.display()
+            );
+        }
+        let started_cache = Instant::now();
+        let conn = Connection::open_with_flags(
+            &args.catalog,
+            DuckDbConfig::default().access_mode(AccessMode::ReadOnly)?,
+        )
+        .context("open DuckDB catalog read-only")?;
+        set_duckdb_options(&conn, &config, &batch_root.join("_duckdb_tmp").join(universe))?;
+        let cache = ensure_label_cache(
+            &conn,
+            &batch_root,
+            &args.catalog,
+            universe,
+            &config,
+            args.rebuild_cache,
+        );
+        let (cache_root, cache_manifest, cache_reused) = match cache {
+            Ok(cache) => cache,
+            Err(error) => {
+                failed = true;
+                cache_timings.push(CacheTiming {
+                    universe: universe.to_string(),
+                    cache_reused: false,
+                    elapsed_seconds: started_cache.elapsed().as_secs_f64(),
+                    error: Some(format!("{error:#}")),
+                });
+                for column in &columns {
+                    let task = format!("{column}/{universe}");
+                    if !requested_tasks.is_empty() && !requested_tasks.contains(&task) {
+                        continue;
+                    }
+                    statuses.push(BatchTaskStatus {
+                        factor_id: column.clone(),
+                        universe: universe.to_string(),
+                        status: "failed".to_string(),
+                        output: batch_root.join(column).join(universe).display().to_string(),
+                        elapsed_seconds: started_cache.elapsed().as_secs_f64(),
+                        error: Some(format!("market-label cache: {error:#}")),
+                    });
+                }
+                write_json_atomic(&batch_root.join("task_status.json"), &statuses)?;
+                continue;
+            }
+        };
+        cache_timings.push(CacheTiming {
+            universe: universe.to_string(),
+            cache_reused,
+            elapsed_seconds: started_cache.elapsed().as_secs_f64(),
+            error: None,
+        });
+        install_cache_views(&conn, &cache_root)?;
+        for column in &columns {
+            let task = format!("{column}/{universe}");
+            if !requested_tasks.is_empty() && !requested_tasks.contains(&task) {
+                continue;
+            }
+            let output = batch_root.join(column).join(universe);
+            if cache_reused && !args.rebuild_cache && batch_result_is_complete(&output) {
+                statuses.push(BatchTaskStatus {
+                    factor_id: column.clone(),
+                    universe: universe.to_string(),
+                    status: "skipped".to_string(),
+                    output: output.display().to_string(),
+                    elapsed_seconds: 0.0,
+                    error: None,
+                });
+                write_json_atomic(&batch_root.join("task_status.json"), &statuses)?;
+                continue;
+            }
+            let started = Instant::now();
+            let stage = stage_path(&batch_root, column, universe);
+            let result = wide_cohort_sql(&args.factor_dataset, column).and_then(|cohort_sql| {
+                evaluate_cached_factor(
+                    &conn,
+                    &cohort_sql,
+                    column,
+                    &args.factor_dataset,
+                    &args.catalog,
+                    universe,
+                    &config,
+                    &cache_manifest,
+                    &stage,
+                )
+            });
+            match result {
+                Ok(()) => {
+                    if output.exists() {
+                        fs::remove_dir_all(&output).with_context(|| {
+                            format!("replace incomplete or stale task output {}", output.display())
+                        })?;
+                    }
+                    fs::create_dir_all(output.parent().unwrap())?;
+                    fs::rename(&stage, &output)?;
+                    statuses.push(BatchTaskStatus {
+                        factor_id: column.clone(),
+                        universe: universe.to_string(),
+                        status: "ok".to_string(),
+                        output: output.display().to_string(),
+                        elapsed_seconds: started.elapsed().as_secs_f64(),
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    failed = true;
+                    statuses.push(BatchTaskStatus {
+                        factor_id: column.clone(),
+                        universe: universe.to_string(),
+                        status: "failed".to_string(),
+                        output: output.display().to_string(),
+                        elapsed_seconds: started.elapsed().as_secs_f64(),
+                        error: Some(format!("{error:#}")),
+                    });
+                }
+            }
+            write_json_atomic(&batch_root.join("task_status.json"), &statuses)?;
+        }
+    }
+    write_json_atomic(
+        &batch_root.join("batch_manifest.json"),
+        &serde_json::json!({
+            "batch_id": batch_id, "catalog": args.catalog, "factor_dataset": args.factor_dataset,
+            "factor_columns": columns, "tasks": task_count,
+            "execution": "batch-wide-factor-eval-v2: one market-label cache and one wide-dataset pass per universe; columns evaluated sequentially",
             "universes": args.universes, "cache_timings": cache_timings,
             "total_elapsed_seconds": batch_started.elapsed().as_secs_f64(), "has_failures": failed,
         }),
@@ -1868,6 +2170,7 @@ fn main() -> Result<()> {
     let output = match cli.command {
         Command::FactorEval(args) => run_factor_eval(args)?,
         Command::BatchFactorEval(args) => run_batch_factor_eval(args)?,
+        Command::BatchWideFactorEval(args) => run_batch_wide_factor_eval(args)?,
         Command::BatchEval(args) => run_batch_factor_eval(legacy_batch_args(args)?)?,
         Command::OptimizePortfolio(args) => run_optimizer(args)?,
     };
