@@ -155,19 +155,25 @@ def fit_predict_neural(
         batch_size=batch_size, shuffle=True, pin_memory=device.type == "cuda",
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=7e-4, weight_decay=2e-4)
-    loss_fn = nn.HuberLoss(delta=1.0)
+    loss_fn = nn.MSELoss()
     best_state: dict[str, Any] | None = None
     best_loss = float("inf")
     stale = 0
+    loss_history: list[dict[str, float | int]] = []
     model.train()
     for epoch in range(epochs):
+        train_loss_total = 0.0
+        train_observations = 0
         for xb, yb in loader:
             optimizer.zero_grad(set_to_none=True)
             loss = loss_fn(model(xb.to(device)), yb.to(device))
             loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
+            train_loss_total += float(loss.item()) * len(xb)
+            train_observations += len(xb)
         model.eval()
         with torch.no_grad():
             value = loss_fn(model(torch.from_numpy(x_val).to(device)), torch.from_numpy(y_val).to(device)).item()
+        loss_history.append({"epoch": epoch + 1, "train_mse": train_loss_total / train_observations, "validation_mse": float(value)})
         if value < best_loss - 1e-5:
             best_loss, stale = value, 0
             best_state = {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
@@ -183,5 +189,6 @@ def fit_predict_neural(
         prediction = model(torch.from_numpy(np.nan_to_num(test_x, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)).to(device)).cpu().numpy()
     return prediction * target_std + target_mean, {
         "backend": device.type, "fit_samples": int(len(x_fit)), "validation_samples": int(len(x_val)),
-        "best_validation_huber": float(best_loss), "epochs_completed": epoch + 1,
+        "loss": "mse", "best_validation_mse": float(best_loss), "epochs_completed": epoch + 1,
+        "loss_history": loss_history,
     }

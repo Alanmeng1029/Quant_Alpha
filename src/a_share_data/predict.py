@@ -64,6 +64,11 @@ def _fingerprint(paths: list[Path]) -> str:
     return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
 
 
+def _minute_year_glob(root: Path, year: str) -> Path:
+    """The minute-factor writer stores one wide Parquet file per trade date."""
+    return root / f"year={year}" / "*.parquet"
+
+
 def _dates(conn: duckdb.DuckDBPyConnection, start: str | None, end: str | None) -> list[str]:
     where = ["is_observed_market_day"]
     if start: where.append(f"trade_date >= DATE '{start}'")
@@ -93,14 +98,47 @@ def all_factor_ids(factor_root: Path) -> tuple[str, ...]:
     return found
 
 
-def build_features(catalog: Path, factor_root: Path, feature_root: Path, start: str | None = None, end: str | None = None, replace: bool = False, factor_ids: tuple[str, ...] = CORE40) -> dict:
-    """Pivot selected long factor parquet files once, retaining the dynamic universe."""
+def build_features(catalog: Path, factor_root: Path, feature_root: Path, start: str | None = None, end: str | None = None, replace: bool = False, factor_ids: tuple[str, ...] = CORE40, minute_factor_sources: tuple[tuple[Path, tuple[str, ...]], ...] = ()) -> dict:
+    """Build a daily feature cache from long daily and optional wide minute factors.
+
+    Minute candidates remain in their single daily-wide dataset.  Reading them
+    directly prevents multiplying the same data into one long Parquet file per
+    minute factor merely for model input.
+    """
+    minute_factor_ids = tuple(factor for _, factors in minute_factor_sources for factor in factors)
+    if len(set(factor_ids)) != len(factor_ids) or len(set(minute_factor_ids)) != len(minute_factor_ids):
+        raise ValueError("daily and minute factor ids must each be unique")
+    if set(factor_ids).intersection(minute_factor_ids):
+        raise ValueError("daily and minute factor ids must not overlap")
+    all_factor_ids = factor_ids + minute_factor_ids
     paths = [_factor_path(factor_root, f) for f in factor_ids]
     missing = [str(p) for p in paths if not p.exists()]
-    if missing: raise FileNotFoundError("Missing Core40 factor files: " + ", ".join(missing[:3]))
+    if missing: raise FileNotFoundError("Missing daily factor files: " + ", ".join(missing[:3]))
+    for minute_factor_dataset, source_ids in minute_factor_sources:
+        if not source_ids:
+            raise ValueError(f"No factor ids supplied for minute dataset {minute_factor_dataset}")
+        minute_files = sorted(minute_factor_dataset.glob("year=*/*.parquet"))
+        if not minute_files:
+            raise FileNotFoundError(f"No minute factor Parquet files under {minute_factor_dataset}")
+        paths.extend(minute_files)
+        manifest_file = minute_factor_dataset / "manifest.json"
+        if manifest_file.exists():
+            paths.append(manifest_file)
     feature_root.mkdir(parents=True, exist_ok=True)
     manifest_path = feature_root / "manifest.json"; digest = _fingerprint(paths)
-    manifest = {"version": 1, "factor_ids": factor_ids, "factor_hash": digest, "start": start, "end": end}
+    manifest = {
+        "version": 2,
+        "factor_ids": all_factor_ids,
+        "daily_factor_ids": factor_ids,
+        "minute_factor_ids": minute_factor_ids,
+        "minute_factor_sources": [
+            {"dataset": str(dataset.resolve()), "factor_ids": ids}
+            for dataset, ids in minute_factor_sources
+        ],
+        "factor_hash": digest,
+        "start": start,
+        "end": end,
+    }
     expected_years = {d[:4] for d in _dates(duckdb.connect(str(catalog), read_only=True), start, end)}
     if not replace and manifest_path.exists():
         old = json.loads(manifest_path.read_text())
@@ -111,14 +149,31 @@ def build_features(catalog: Path, factor_root: Path, feature_root: Path, start: 
     try:
         # Pivot one calendar year at a time.  This keeps the all-factor cache
         # bounded in memory and pushes the date predicate into every parquet scan.
-        columns = ", ".join(f"try_cast(max(factor_value) FILTER (WHERE factor_id='{fid}') AS FLOAT) AS {fid}" for fid in factor_ids)
+        daily_columns = [f"try_cast(max(f.factor_value) FILTER (WHERE f.factor_id='{fid}') AS FLOAT) AS \"{fid}\"" for fid in factor_ids]
+        minute_columns = [
+            f"try_cast(max(m{source_index}.\"{fid}\") AS FLOAT) AS \"{fid}\""
+            for source_index, (_, source_ids) in enumerate(minute_factor_sources)
+            for fid in source_ids
+        ]
+        columns = ", ".join(daily_columns + minute_columns)
         for year in sorted(expected_years):
             lower = max(start or f"{year}-01-01", f"{year}-01-01")
             upper = min(end or f"{year}-12-31", f"{year}-12-31")
-            unions = " UNION ALL ".join(f"SELECT trade_date, ts_code, factor_value, '{fid}' factor_id FROM read_parquet('{_sql(path)}') WHERE trade_date BETWEEN DATE '{lower}' AND DATE '{upper}'" for fid, path in zip(factor_ids, paths))
+            unions = " UNION ALL ".join(f"SELECT trade_date, ts_code, factor_value, '{fid}' factor_id FROM read_parquet('{_sql(path)}') WHERE trade_date BETWEEN DATE '{lower}' AND DATE '{upper}'" for fid, path in zip(factor_ids, paths[:len(factor_ids)]))
+            factors_cte = unions if unions else "SELECT CAST(NULL AS DATE) trade_date, CAST(NULL AS VARCHAR) ts_code, CAST(NULL AS DOUBLE) factor_value, CAST(NULL AS VARCHAR) factor_id WHERE FALSE"
+            minute_ctes = []
+            minute_joins = []
+            for source_index, (dataset, source_ids) in enumerate(minute_factor_sources):
+                minute_glob = _minute_year_glob(dataset, year)
+                selected = ", ".join(f'\"{factor}\"' for factor in source_ids)
+                minute_ctes.append(f"minute_{source_index} AS (SELECT trade_date, ts_code, {selected} FROM read_parquet('{_sql(minute_glob)}') WHERE trade_date BETWEEN DATE '{lower}' AND DATE '{upper}')")
+                minute_joins.append(f"LEFT JOIN minute_{source_index} m{source_index} USING(trade_date, ts_code)")
+            minute_sql = ", " + ", ".join(minute_ctes) if minute_ctes else ""
+            joins_sql = " ".join(minute_joins)
             query = f"""WITH universe AS (SELECT DISTINCT trade_date, ts_code FROM index_trading_universe
-                             WHERE index_code IN ('000300.SH','000905.SH') AND trade_date BETWEEN DATE '{lower}' AND DATE '{upper}'), factors AS ({unions})
+                             WHERE index_code IN ('000300.SH','000905.SH') AND trade_date BETWEEN DATE '{lower}' AND DATE '{upper}'), factors AS ({factors_cte}){minute_sql}
                          SELECT u.trade_date, u.ts_code, {columns} FROM universe u LEFT JOIN factors f USING(trade_date, ts_code)
+                         {joins_sql}
                          GROUP BY u.trade_date, u.ts_code ORDER BY u.trade_date, u.ts_code"""
             part = pl.from_arrow(conn.execute(query).arrow())
             rows += part.height
@@ -127,7 +182,7 @@ def build_features(catalog: Path, factor_root: Path, feature_root: Path, start: 
             part.write_parquet(tmp, compression="zstd"); os.replace(tmp, dest / "features.parquet")
     finally: conn.close()
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
-    return {"cache_hit": False, "rows": rows, "years": sorted(expected_years), "factor_hash": digest}
+    return {"cache_hit": False, "rows": rows, "years": sorted(expected_years), "factor_hash": digest, "factor_count": len(all_factor_ids)}
 
 
 def build_labels(catalog: Path, start: str | None = None, end: str | None = None) -> pl.DataFrame:
@@ -222,7 +277,7 @@ def run_oos(catalog: Path, feature_root: Path, output: Path, start: str | None =
     dates = sorted(str(x) for x in panel.select("trade_date").unique().to_series().to_list())
     invalid_models=set(ensemble.models)-{"lgbm","mlp","transformer"}
     if invalid_models or not ensemble.models: raise ValueError(f"unsupported models: {sorted(invalid_models)}")
-    windows = rolling_windows(dates); records=[]; timings=[]; importance=[]; selections=[]
+    windows = rolling_windows(dates); records=[]; timings=[]; importance=[]; selections=[]; neural_losses=[]
     for window_index, (signal, train_dates) in enumerate(windows):
         if window_index % ensemble.refit_months: continue
         if oos_start and signal < oos_start: continue
@@ -255,6 +310,7 @@ def run_oos(catalog: Path, feature_root: Path, output: Path, start: str | None =
             )
             out=out.with_columns(pl.Series(f"{model_name}_h1", prediction[:,0]), pl.Series(f"{model_name}_h5", prediction[:,1]))
             neural_metadata.append({"model":model_name, **metadata})
+            neural_losses.extend({"model_month":month, "model":model_name, **point} for point in metadata["loss_history"])
         out=out.with_columns(pl.lit(month).alias("model_month"))
         # execution date is market-calendar based, not per-stock; repair via date mapping.
         next_map={dates[i]:dates[i+1] for i in range(len(dates)-1)}; out=out.with_columns(pl.col("trade_date").cast(pl.String).replace_strict(next_map, default=None).str.to_date().alias("execution_date"))
@@ -276,6 +332,10 @@ def run_oos(catalog: Path, feature_root: Path, output: Path, start: str | None =
     pl.DataFrame(timings, schema={"model_month":pl.String,"seconds":pl.Float64,"training_start":pl.String,"training_end":pl.String,"training_days":pl.Int64,"selected_features":pl.Int64}).write_parquet(output / "model_timings.parquet")
     pl.DataFrame(importance, schema={"model_month":pl.String,"horizon":pl.String,"feature":pl.String,"importance":pl.Float64}).write_parquet(output / "feature_importance.parquet")
     pl.DataFrame(selections).write_parquet(output / "rolling_feature_selection.parquet")
+    if neural_losses:
+        loss_frame=pl.DataFrame(neural_losses).sort("model_month", "model", "epoch")
+        loss_frame.write_parquet(output / "neural_loss_history.parquet", compression="zstd")
+        loss_frame.write_csv(output / "neural_loss_history.csv")
     (output / "summary.json").write_text(json.dumps(summary,indent=2,default=str)); return summary
 
 
@@ -303,9 +363,13 @@ def project_capped_simplex(weights: np.ndarray, max_weight: float) -> np.ndarray
         remaining = 1.0 - result[~free].sum()
 
 
-def optimize_dual_alpha_targets(predictions: Path, output: Path, h1_weight: float = .5, turnover_cap: float = .30, temperature: float = 2.0, max_weight: float = .10, min_weight: float = 0.0) -> dict:
-    """Blend h1/h5 alpha, cap turnover, then enforce a hard minimum live weight."""
-    if not (0 <= h1_weight <= 1 and 0 < turnover_cap <= 1 and temperature > 0 and 0 <= min_weight <= max_weight <= 1):
+def optimize_dual_alpha_targets(predictions: Path, output: Path, h1_weight: float = .5, turnover_cap: float = .30, temperature: float = 2.0, max_weight: float = .10, min_weight: float = 0.0, top_fraction: float = 1.0, weighting: str = "softmax") -> dict:
+    """Blend h1/h5 alpha, select a score fraction, then turnover-project targets.
+
+    ``equal`` weighting is deliberately available as an optimizer diagnostic:
+    it measures the simple top-quantile signal without softmax concentration.
+    """
+    if not (0 <= h1_weight <= 1 and 0 < turnover_cap <= 1 and temperature > 0 and 0 <= min_weight <= max_weight <= 1 and 0 < top_fraction <= 1 and weighting in {"softmax", "equal"}):
         raise ValueError("invalid dual-alpha optimizer parameters")
     source=pl.read_parquet(predictions).with_columns(pl.col("trade_date").cast(pl.Date),pl.col("execution_date").cast(pl.Date)).filter(pl.col("execution_date").is_not_null() & pl.col("pred_h1").is_finite() & pl.col("pred_h5").is_finite() & ~pl.col("ts_code").is_in(INFEASIBLE_EXECUTION_CODES))
     previous: dict[str,float]={}; rows=[]
@@ -314,7 +378,15 @@ def optimize_dual_alpha_targets(predictions: Path, output: Path, h1_weight: floa
         frame=frame.sort("ts_code"); codes=frame["ts_code"].to_list(); a1=frame["pred_h1"].to_numpy(); a5=frame["pred_h5"].to_numpy()
         def z(value: np.ndarray) -> np.ndarray:
             std=value.std(); return (value-value.mean())/std if std > 1e-12 else np.zeros_like(value)
-        score=h1_weight*z(a1)+(1-h1_weight)*z(a5); exp=np.exp(np.clip(score/temperature,-30,30)); desired=project_capped_simplex(exp,max_weight)
+        score=h1_weight*z(a1)+(1-h1_weight)*z(a5)
+        selected_count = max(1, int(np.ceil(len(codes) * top_fraction)))
+        selected_index = np.argsort(score)[-selected_count:]
+        desired = np.zeros_like(score)
+        if weighting == "equal":
+            desired[selected_index] = project_capped_simplex(np.ones(selected_count), max_weight)
+        else:
+            exp = np.exp(np.clip(score[selected_index] / temperature, -30, 30))
+            desired[selected_index] = project_capped_simplex(exp, max_weight)
         old=np.array([previous.get(code,0.0) for code in codes]); l1=float(np.abs(desired-old).sum()); scale=1.0 if not previous else min(1.0,2*turnover_cap/l1)
         weights=old+scale*(desired-old); previous=dict(zip(codes,weights))
         # The minimum is applied to the executed target, not merely the
@@ -331,7 +403,111 @@ def optimize_dual_alpha_targets(predictions: Path, output: Path, h1_weight: floa
             if w > 0:
                 rows.append({"trade_date":signal_date,"execution_date":execution_date,"ts_code":code,"target_weight":float(w),"pred_h1":float(s1),"pred_h5":float(s5),"alpha_daily":float(h1_weight*s1+(1-h1_weight)*s5),"optimizer":"dual_alpha_turnover_projection"})
     result=pl.DataFrame(rows); output.parent.mkdir(parents=True,exist_ok=True); result.write_parquet(output,compression="zstd")
-    return {"output":str(output),"days":result.select("trade_date").n_unique(),"rows":result.height,"h1_weight":h1_weight,"h5_weight":1-h1_weight,"turnover_cap_one_way":turnover_cap,"temperature":temperature,"max_weight":max_weight,"min_weight":min_weight}
+    return {"output":str(output),"days":result.select("trade_date").n_unique(),"rows":result.height,"h1_weight":h1_weight,"h5_weight":1-h1_weight,"turnover_cap_one_way":turnover_cap,"temperature":temperature,"max_weight":max_weight,"min_weight":min_weight,"top_fraction":top_fraction,"weighting":weighting}
+
+
+def staggered_top_quantile_targets(predictions: Path, output: Path, top_fraction: float = .10, holding_days: int = 5) -> dict:
+    """Build equal-weight, H5-ranked sleeves that rebalance one vintage a day.
+
+    Each vintage receives ``1 / holding_days`` of NAV.  On signal date *T*,
+    only the corresponding sleeve is refreshed and executes at *T+1* open.
+    The aggregate target is therefore directly consumable by the normal
+    portfolio backtester while keeping each sleeve for five market sessions.
+    """
+    if not (0 < top_fraction <= 1 and holding_days >= 1):
+        raise ValueError("top_fraction must be in (0, 1] and holding_days must be positive")
+    source = pl.read_parquet(predictions).with_columns(
+        pl.col("trade_date").cast(pl.Date), pl.col("execution_date").cast(pl.Date)
+    ).filter(
+        pl.col("execution_date").is_not_null() & pl.col("pred_h5").is_finite() & ~pl.col("ts_code").is_in(INFEASIBLE_EXECUTION_CODES)
+    )
+    by_date = {
+        (key[0] if isinstance(key, tuple) else key): frame
+        for key, frame in source.partition_by("trade_date", as_dict=True).items()
+    }
+    sleeves: list[dict[str, float]] = [dict() for _ in range(holding_days)]
+    rows: list[dict[str, object]] = []
+    selected_counts: list[int] = []
+    for index, signal_date in enumerate(sorted(by_date)):
+        frame = by_date[signal_date].sort("pred_h5", descending=True)
+        count = max(1, int(np.ceil(frame.height * top_fraction)))
+        chosen = frame.head(count)
+        sleeve = index % holding_days
+        sleeve_weight = 1.0 / holding_days / count
+        sleeves[sleeve] = {code: sleeve_weight for code in chosen.get_column("ts_code").to_list()}
+        aggregate: dict[str, float] = {}
+        for vintage in sleeves:
+            for code, weight in vintage.items():
+                aggregate[code] = aggregate.get(code, 0.0) + weight
+        execution_date = frame.get_column("execution_date")[0]
+        for code, weight in sorted(aggregate.items()):
+            rows.append({"trade_date": signal_date, "execution_date": execution_date, "ts_code": code, "target_weight": weight, "optimizer": "staggered_h5_top_quantile_equal_weight"})
+        selected_counts.append(count)
+    result = pl.DataFrame(rows)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    result.write_parquet(output, compression="zstd")
+    return {"output": str(output), "days": len(by_date), "rows": result.height, "top_fraction": top_fraction, "holding_days": holding_days, "mean_names_per_sleeve": float(np.mean(selected_counts))}
+
+
+def staggered_dual_hysteresis_targets(predictions: Path, output: Path, h1_allocation: float = .20, entry_fraction: float = .08, exit_fraction: float = .12, holding_days: int = 5) -> dict:
+    """Combine a daily H1 sleeve with staggered H5 sleeves using rank buffers.
+
+    A name enters when it reaches the top ``entry_fraction`` and remains until
+    it falls below ``exit_fraction``.  The H1 sleeve receives ``h1_allocation``
+    and the remaining capital is split evenly across H5 vintages.
+    """
+    if not (0 < h1_allocation < 1 and 0 < entry_fraction <= exit_fraction <= 1 and holding_days >= 1):
+        raise ValueError("invalid sleeve allocation or rank-buffer parameters")
+    source = pl.read_parquet(predictions).with_columns(
+        pl.col("trade_date").cast(pl.Date), pl.col("execution_date").cast(pl.Date)
+    ).filter(
+        pl.col("execution_date").is_not_null() & pl.col("pred_h1").is_finite() & pl.col("pred_h5").is_finite() & ~pl.col("ts_code").is_in(INFEASIBLE_EXECUTION_CODES)
+    )
+    by_date = {
+        (key[0] if isinstance(key, tuple) else key): frame
+        for key, frame in source.partition_by("trade_date", as_dict=True).items()
+    }
+
+    def buffered_members(frame: pl.DataFrame, score: str, old: set[str]) -> set[str]:
+        ordered = frame.sort(score, descending=True)
+        enter_count = max(1, int(np.ceil(ordered.height * entry_fraction)))
+        exit_count = max(enter_count, int(np.ceil(ordered.height * exit_fraction)))
+        entrants = set(ordered.head(enter_count).get_column("ts_code").to_list())
+        eligible = set(ordered.head(exit_count).get_column("ts_code").to_list())
+        return entrants | (old & eligible)
+
+    h1_members: set[str] = set()
+    h5_members: list[set[str]] = [set() for _ in range(holding_days)]
+    h5_allocation = 1.0 - h1_allocation
+    rows: list[dict[str, object]] = []
+    h1_counts: list[int] = []
+    h5_counts: list[int] = []
+    for index, signal_date in enumerate(sorted(by_date)):
+        frame = by_date[signal_date]
+        available = set(frame.get_column("ts_code").to_list())
+        h5_members = [vintage & available for vintage in h5_members]
+        h1_members = buffered_members(frame, "pred_h1", h1_members)
+        sleeve = index % holding_days
+        h5_members[sleeve] = buffered_members(frame, "pred_h5", h5_members[sleeve])
+        aggregate: dict[str, float] = {}
+        if h1_members:
+            h1_weight = h1_allocation / len(h1_members)
+            for code in h1_members:
+                aggregate[code] = aggregate.get(code, 0.0) + h1_weight
+        for vintage in h5_members:
+            if vintage:
+                h5_weight = h5_allocation / holding_days / len(vintage)
+                for code in vintage:
+                    aggregate[code] = aggregate.get(code, 0.0) + h5_weight
+        execution_date = frame.get_column("execution_date")[0]
+        for code, weight in sorted(aggregate.items()):
+            rows.append({"trade_date": signal_date, "execution_date": execution_date, "ts_code": code, "target_weight": weight, "optimizer": "staggered_h1_h5_rank_buffer"})
+        h1_counts.append(len(h1_members))
+        h5_counts.append(sum(len(vintage) for vintage in h5_members))
+    result = pl.DataFrame(rows)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    result.write_parquet(output, compression="zstd")
+    return {"output": str(output), "days": len(by_date), "rows": result.height, "h1_allocation": h1_allocation, "h5_allocation": h5_allocation, "entry_fraction": entry_fraction, "exit_fraction": exit_fraction, "holding_days": holding_days, "mean_h1_names": float(np.mean(h1_counts)), "mean_h5_names_across_sleeves": float(np.mean(h5_counts))}
 
 
 def backtest_targets(catalog: Path, target_weights: Path, output: Path, buy_bps: float = 2.1, sell_bps: float = 7.1, initial_capital: float = 10_000_000.0, lot_size: int = 100, return_basis: str = "qfq") -> dict:
@@ -502,18 +678,39 @@ def render_backtest_report(portfolio_daily: Path, output: Path, title: str = "Po
 def main(argv: list[str] | None = None) -> None:
     p=argparse.ArgumentParser(prog="quant-predict"); sub=p.add_subparsers(dest="command",required=True)
     def common(x): x.add_argument("--catalog",type=Path,required=True); x.add_argument("--start"); x.add_argument("--end")
-    b=sub.add_parser("build-features"); common(b); b.add_argument("--factor-root",type=Path,required=True); b.add_argument("--feature-root",type=Path,required=True); b.add_argument("--factor-ids-file",type=Path); b.add_argument("--all-factor-artifacts",action="store_true"); b.add_argument("--replace",action="store_true")
+    b=sub.add_parser("build-features"); common(b); b.add_argument("--factor-root",type=Path,required=True); b.add_argument("--feature-root",type=Path,required=True); b.add_argument("--factor-ids-file",type=Path); b.add_argument("--all-factor-artifacts",action="store_true"); b.add_argument("--no-daily-factors",action="store_true"); b.add_argument("--minute-factor-dataset",type=Path,action="append"); b.add_argument("--minute-factor-ids-file",type=Path,action="append"); b.add_argument("--replace",action="store_true")
     r=sub.add_parser("run-oos"); common(r); r.add_argument("--oos-start"); r.add_argument("--feature-root",type=Path,required=True); r.add_argument("--output",type=Path,required=True); r.add_argument("--models",nargs="+",choices=["lgbm","mlp","transformer"],default=["lgbm"]); r.add_argument("--refit-months",type=int,default=3); r.add_argument("--neural-epochs",type=int,default=20); r.add_argument("--neural-max-samples",type=int,default=60_000); r.add_argument("--max-features",type=int,default=40); r.add_argument("--min-coverage",type=float,default=.85); r.add_argument("--min-abs-icir",type=float,default=.5); r.add_argument("--max-abs-correlation",type=float,default=.90)
-    d=sub.add_parser("optimize-dual-alpha"); d.add_argument("--predictions",type=Path,required=True); d.add_argument("--output",type=Path,required=True); d.add_argument("--h1-weight",type=float,default=.5); d.add_argument("--turnover-cap",type=float,default=.30); d.add_argument("--temperature",type=float,default=2.0); d.add_argument("--max-weight",type=float,default=.10); d.add_argument("--min-weight",type=float,default=0.0)
+    d=sub.add_parser("optimize-dual-alpha"); d.add_argument("--predictions",type=Path,required=True); d.add_argument("--output",type=Path,required=True); d.add_argument("--h1-weight",type=float,default=.5); d.add_argument("--turnover-cap",type=float,default=.30); d.add_argument("--temperature",type=float,default=2.0); d.add_argument("--max-weight",type=float,default=.10); d.add_argument("--min-weight",type=float,default=0.0); d.add_argument("--top-fraction",type=float,default=1.0); d.add_argument("--weighting",choices=["softmax","equal"],default="softmax")
+    s=sub.add_parser("staggered-top-quantile"); s.add_argument("--predictions",type=Path,required=True); s.add_argument("--output",type=Path,required=True); s.add_argument("--top-fraction",type=float,default=.10); s.add_argument("--holding-days",type=int,default=5)
+    q=sub.add_parser("staggered-dual-hysteresis"); q.add_argument("--predictions",type=Path,required=True); q.add_argument("--output",type=Path,required=True); q.add_argument("--h1-allocation",type=float,default=.20); q.add_argument("--entry-fraction",type=float,default=.08); q.add_argument("--exit-fraction",type=float,default=.12); q.add_argument("--holding-days",type=int,default=5)
     bt=sub.add_parser("backtest-portfolio"); bt.add_argument("--catalog",type=Path,required=True); bt.add_argument("--target-weights",type=Path,required=True); bt.add_argument("--output",type=Path,required=True); bt.add_argument("--buy-bps",type=float,default=2.1); bt.add_argument("--sell-bps",type=float,default=7.1); bt.add_argument("--initial-capital",type=float,default=10_000_000); bt.add_argument("--lot-size",type=int,default=100); bt.add_argument("--return-basis",choices=["qfq","raw"],default="qfq")
+    bp=sub.add_parser("backtest-policy", help="real-holdings limited-replacement daily policy")
+    bp.add_argument("--catalog",type=Path,required=True); bp.add_argument("--predictions",type=Path,required=True); bp.add_argument("--output",type=Path,required=True)
+    bp.add_argument("--target-holdings",type=int,default=80); bp.add_argument("--entry-rank",type=int,default=80); bp.add_argument("--exit-rank",type=int,default=96); bp.add_argument("--max-daily-replacements",type=int,default=5)
+    bp.add_argument("--max-weight",type=float,default=.03); bp.add_argument("--rebalance-to-weight",type=float,default=.028); bp.add_argument("--min-new-weight",type=float,default=.005); bp.add_argument("--cash-reserve",type=float,default=.02)
+    bp.add_argument("--daily-buy-budget",type=float,default=.10); bp.add_argument("--daily-sell-budget",type=float,default=.10); bp.add_argument("--h1-weight",type=float,default=.5); bp.add_argument("--initial-capital",type=float,default=10_000_000); bp.add_argument("--lot-size",type=int,default=100); bp.add_argument("--buy-bps",type=float,default=2.1); bp.add_argument("--sell-bps",type=float,default=7.1); bp.add_argument("--no-report",action="store_true")
     rp=sub.add_parser("render-backtest-report"); rp.add_argument("--portfolio-daily",type=Path,required=True); rp.add_argument("--output",type=Path,required=True); rp.add_argument("--title",default="Portfolio backtest"); rp.add_argument("--target-weights",type=Path)
     args=p.parse_args(argv)
     if args.command=="build-features":
-        if args.factor_ids_file and args.all_factor_artifacts: raise ValueError("choose factor ids file or all-factor-artifacts, not both")
-        result=build_features(args.catalog,args.factor_root,args.feature_root,args.start,args.end,args.replace,all_factor_ids(args.factor_root) if args.all_factor_artifacts else read_factor_ids(args.factor_ids_file))
+        if sum(bool(value) for value in (args.factor_ids_file, args.all_factor_artifacts, args.no_daily_factors)) > 1: raise ValueError("choose one daily-factor source: factor ids file, all artifacts, or no daily factors")
+        daily_ids = () if args.no_daily_factors else (all_factor_ids(args.factor_root) if args.all_factor_artifacts else read_factor_ids(args.factor_ids_file))
+        minute_datasets = args.minute_factor_dataset or []
+        minute_id_files = args.minute_factor_ids_file or []
+        if len(minute_datasets) != len(minute_id_files): raise ValueError("provide one --minute-factor-ids-file for each --minute-factor-dataset")
+        minute_sources = tuple((dataset, read_factor_ids(ids_file)) for dataset, ids_file in zip(minute_datasets, minute_id_files))
+        result=build_features(args.catalog,args.factor_root,args.feature_root,args.start,args.end,args.replace,daily_ids,minute_sources)
     elif args.command=="run-oos": result=run_oos(args.catalog,args.feature_root,args.output,args.start,args.end,ensemble=EnsembleSettings(tuple(args.models),args.refit_months,args.neural_epochs,args.neural_max_samples),selection=SelectionSettings(args.min_coverage,args.min_abs_icir,args.max_features,args.max_abs_correlation),oos_start=args.oos_start)
-    elif args.command=="optimize-dual-alpha": result=optimize_dual_alpha_targets(args.predictions,args.output,args.h1_weight,args.turnover_cap,args.temperature,args.max_weight,args.min_weight)
+    elif args.command=="optimize-dual-alpha": result=optimize_dual_alpha_targets(args.predictions,args.output,args.h1_weight,args.turnover_cap,args.temperature,args.max_weight,args.min_weight,args.top_fraction,args.weighting)
+    elif args.command=="staggered-top-quantile": result=staggered_top_quantile_targets(args.predictions,args.output,args.top_fraction,args.holding_days)
+    elif args.command=="staggered-dual-hysteresis": result=staggered_dual_hysteresis_targets(args.predictions,args.output,args.h1_allocation,args.entry_fraction,args.exit_fraction,args.holding_days)
     elif args.command=="backtest-portfolio": result=backtest_targets(args.catalog,args.target_weights,args.output,args.buy_bps,args.sell_bps,args.initial_capital,args.lot_size,args.return_basis)
+    elif args.command=="backtest-policy":
+        from a_share_data.policy import LimitedReplacementConfig, run_limited_replacement_policy
+        config=LimitedReplacementConfig(target_holdings=args.target_holdings,entry_rank=args.entry_rank,exit_rank=args.exit_rank,max_daily_replacements=args.max_daily_replacements,max_weight=args.max_weight,rebalance_to_weight=args.rebalance_to_weight,min_new_weight=args.min_new_weight,cash_reserve=args.cash_reserve,daily_buy_budget=args.daily_buy_budget,daily_sell_budget=args.daily_sell_budget,h1_weight=args.h1_weight,initial_capital=args.initial_capital,lot_size=args.lot_size,buy_bps=args.buy_bps,sell_bps=args.sell_bps)
+        result=run_limited_replacement_policy(args.catalog,args.predictions,args.output,config)
+        if not args.no_report:
+            result["charged_report"]=render_backtest_report(args.output/"portfolio_daily.parquet",args.output/"report","Limited-replacement v2 — charged account")
+            result["zero_cost_report"]=render_backtest_report(args.output/"zero_cost"/"portfolio_daily.parquet",args.output/"zero_cost"/"report","Limited-replacement v2 — independent zero-cost account")
     else: result=render_backtest_report(args.portfolio_daily,args.output,args.title,args.target_weights)
     print(json.dumps(result,ensure_ascii=False,default=str))
 
