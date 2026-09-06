@@ -1,0 +1,6 @@
+# Final Open-to-open candidate factors selected from the existing 272 factor
+# artifacts.  Selection criterion: finite |Open-to-open, h=1 Rank ICIR| > 3
+# on CSI300 union CSI500, evaluated 2018-01-02 through 2026-08-28.
+# Factor artifacts themselves are not rebuilt by this configuration.
+gtja_alpha140_qfq_v1
+wq_alpha088_qfq_v1

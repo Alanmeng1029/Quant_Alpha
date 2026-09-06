@@ -1,0 +1,27 @@
+# Minute core24 first-screen candidates, open-to-open primary label.
+# Criteria: full-sample |open_to_open h=1 excess-CSI500 Rank ICIR| >= 1.0 and
+# same-sign annual ICIR > 1 in at least 5 of 9 calendar years, on CSI300 union
+# CSI500, 2018-01-31 through 2026-08-28
+# (results/factor_batches/minute-core24-csi800-v1/screening_open_h1.parquet).
+#
+# Full-sample ICIR / same-sign years:
+#   tail30_return                -5.13 (9/9)  strongest; intraday reversal at open-to-open
+#   close_to_vwap                -3.10 (8/9)  replaces tail30_vwap_to_day_vwap (rho +0.94)
+#   realized_kurtosis            -2.93 (9/9)
+#   downside_semivariance_ratio  +2.89 (8/9)  vs realized_skewness -2.66 (9/9), rho -0.88: keep both, stage-2 dedup
+#   realized_skewness            -2.66 (9/9)
+#   realized_volatility          -2.52 (8/9)
+#   tail30_amount_z20            -2.19 (6/9)  replaces tail30_amount_share (rho +0.88)
+#   return_amount_corr           -2.09 (6/9)
+#   smart_q_b050_w10_p20         +1.73 (6/9)  representative of the smart_q family
+#   five_minute_amount_excess_w20 -1.33 (5/9) borderline; concentration-family representative
+mf_tail30_return
+mf_close_to_vwap
+mf_realized_kurtosis
+mf_downside_semivariance_ratio
+mf_realized_skewness
+mf_realized_volatility
+mf_tail30_amount_z20
+mf_return_amount_corr
+mf_smart_q_b050_w10_p20
+mf_five_minute_amount_excess_w20

@@ -1,0 +1,30 @@
+# Candidate set from ohlcv_candidates_v1, CSI300 union CSI500.
+# Keep when either Open-to-open h=1 or h=5 has absolute full-sample Rank ICIR > 2.
+mf_smart_q_pooled_b025_w10_p20
+mf_cpv_dvolume_lead_dprice_mp_w20
+mf_cpv_dprice_dvolume_pp_w20
+mf_cpv_dvolume_lead_dprice_pp_w20
+mf_volume_up_return_std
+mf_volume_up_positive_return_std
+mf_cpv_dvolume_lead_dprice_pm_w20
+mf_cpv_dvolume_lead_dprice_mm_w20
+mf_segment_return_dispersion
+mf_cpv_dprice_dvolume_mm_w20
+mf_cpv_dprice_dvolume_mp_w20
+mf_cpv_dprice_dvolume_pm_w20
+mf_chip_top3_return_bin_share
+mf_chip_return_bin_std
+mf_tail30_amount_to_segment_median
+mf_chip_return_bin_skewness
+mf_chip_return_bin_kurtosis
+mf_high_price_vol_ratio_w20
+mf_tail30_open30_amihud_ratio
+mf_cpv_price_volume_level_w20
+mf_tail30_open30_rv_ratio
+mf_tail30_day_amihud_ratio
+mf_amihud_intraday_w20
+mf_open30_amount_share
+mf_pm_am_rv_ratio
+mf_return_damount_corr_w20
+mf_minute_amount_seasonality_return_corr_w20
+mf_chip_return_q80
