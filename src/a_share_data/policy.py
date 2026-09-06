@@ -35,6 +35,8 @@ class LimitedReplacementConfig:
     daily_buy_budget: float = 0.10
     daily_sell_budget: float = 0.10
     h1_weight: float = 0.50
+    entry_sizing: str = "equal"
+    rank_tilt: float = 0.15
     lot_size: int = 100
     initial_capital: float = 10_000_000.0
     buy_bps: float = 2.1
@@ -51,7 +53,7 @@ class LimitedReplacementConfig:
             raise ValueError("min_new_weight must not exceed rebalance_to_weight")
         if not (0 <= self.cash_reserve < 1 and 0 < self.daily_buy_budget <= 1 and 0 < self.daily_sell_budget <= 1):
             raise ValueError("invalid cash reserve or daily budgets")
-        if not (0 <= self.h1_weight <= 1 and self.lot_size > 0 and self.initial_capital > 0 and self.buy_bps >= 0 and self.sell_bps >= 0):
+        if not (0 <= self.h1_weight <= 1 and self.entry_sizing in {"equal", "rank_tilt"} and 0 <= self.rank_tilt < 1 and self.lot_size > 0 and self.initial_capital > 0 and self.buy_bps >= 0 and self.sell_bps >= 0):
             raise ValueError("invalid execution parameters")
 
 
@@ -212,11 +214,32 @@ def _run_account(predictions: pl.DataFrame, quotes: dict[tuple[date, str], tuple
                 return False
             price = quote[0]
             reference = equity * (1.0 - config.cash_reserve) / config.target_holdings
-            affordable = cash / (1.0 + buy_bps / 10_000)
-            notional = min(reference, affordable, buy_budget)
+            if config.entry_sizing == "rank_tilt":
+                # A bounded, mean-one tilt: rank 1 receives 1 + tilt times
+                # the equal entry amount, rank 80 receives 1 - tilt.  It
+                # uses score strength only when opening a position, so it
+                # does not reintroduce daily score-chasing rebalances.
+                denominator = max(config.entry_rank - 1, 1)
+                rank_fraction = (ranks.get(code, config.entry_rank) - 1) / denominator
+                reference *= 1.0 + config.rank_tilt * (1.0 - 2.0 * rank_fraction)
+            # The reserve is a hard account constraint, rather than merely a
+            # reference sizing convention.  In particular, lot rounding and
+            # rank tilts must not quietly consume it during the initial build.
+            affordable = max(0.0, cash - equity * config.cash_reserve) / (1.0 + buy_bps / 10_000)
+            minimum = equity * config.min_new_weight
+            notional = min(max(reference, minimum), affordable, buy_budget)
             quantity = _round_lot(notional, price, config.lot_size)
             notional = quantity * price
-            if notional < equity * config.min_new_weight - 1e-8:
+            if notional < minimum - 1e-8:
+                # A downward lot round must not turn an otherwise viable entry
+                # into a sub-minimum position.  Take the smallest whole lot
+                # that satisfies the declared admission rule when the cash and
+                # daily budget genuinely support it.
+                required_quantity = float(np.ceil(minimum / price / config.lot_size) * config.lot_size)
+                required_notional = required_quantity * price
+                if required_notional <= affordable + 1e-8 and required_notional <= buy_budget + 1e-8:
+                    quantity, notional = required_quantity, required_notional
+            if notional < minimum - 1e-8:
                 order_rows.append({"signal_date": signal_date, "execution_date": execution_day, "ts_code": code, "side": "buy", "reason": reason, "status": "skipped_min_new_weight", "shares": quantity, "notional": notional, "budget_exception": False})
                 return False
             fee = notional * buy_bps / 10_000

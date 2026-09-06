@@ -1,0 +1,12 @@
+# Official Core24 component of o2o_daily60_minute38_v1.
+# Selected with the second-round OOS feature protocol; order is immutable.
+mf_tail30_return
+mf_close_to_vwap
+mf_realized_kurtosis
+mf_downside_semivariance_ratio
+mf_realized_skewness
+mf_realized_volatility
+mf_tail30_amount_z20
+mf_return_amount_corr
+mf_smart_q_b050_w10_p20
+mf_five_minute_amount_excess_w20

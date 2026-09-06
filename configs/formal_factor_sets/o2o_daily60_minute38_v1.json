@@ -1,0 +1,30 @@
+{
+  "factor_set_id": "o2o_daily60_minute38_v1",
+  "status": "active",
+  "output_frequency": "daily",
+  "factor_count": 98,
+  "approval": {
+    "approved_by": "Alanmxy",
+    "approval_note": "Daily60 plus both screened minute-factor rounds; active OOS input for the limited-replacement strategy."
+  },
+  "daily_component": {
+    "count": 60,
+    "factor_ids_file": "configs/candidate_factors_daily_o2o_candidate60.txt",
+    "artifact_root": "A_stock_database/lake/derived/factors"
+  },
+  "minute_components": [
+    {
+      "count": 28,
+      "factor_ids_file": "configs/candidate_factors_minute_ohlcv_open_to_open_abs_icir_gt2_h1_or_h5.txt",
+      "dataset": "A_stock_database/lake/derived/minute_factors/ohlcv_candidates_v1"
+    },
+    {
+      "count": 10,
+      "factor_ids_file": "configs/candidate_factors_minute_core24_o2o_selected10.txt",
+      "dataset": "A_stock_database/lake/derived/minute_factors/core24/v1"
+    }
+  ],
+  "active_feature_cache": "A_stock_database/lake/derived/predict_features_o2o_daily60_minute38_v1",
+  "active_prediction": "results/predict/open-open-daily60-minute38-lgbm-v1/predictions.parquet",
+  "strategy": "limited_replacement_v2"
+}
