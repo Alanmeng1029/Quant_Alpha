@@ -14,3 +14,12 @@ results/
 # kept outside the project history; record their source and revision separately
 # if a study needs to cite one.
 external/
+
+# Locally downloaded, potentially licensed research source material and editor
+# state are documented in SOURCES.md but are not repository artifacts.
+.video_agent/
+.vscode/
+research/minute_factor_sources/papers/
+research/minute_factor_sources/reports/hf_stock_factors/
+research/minute_factor_sources/reports/fangzheng_intraday_momentum_overnight_reversal_industry.pdf
+research/minute_factor_sources/metadata/cicc_high_freq_factor_handbook_wechat.html
