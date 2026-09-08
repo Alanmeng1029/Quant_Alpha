@@ -20,6 +20,7 @@ dependencies = [
   "PyYAML>=6.0",
   "reportlab>=5.0",
   "scipy>=1.11",
+  "xgboost==3.2.0",
 ]
 
 [project.optional-dependencies]

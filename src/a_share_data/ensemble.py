@@ -15,6 +15,7 @@ class SelectionSettings:
     max_features: int = 40
     max_abs_correlation: float = 0.90
     correlation_lookback_days: int = 60
+    use_all_features: bool = False
 
 
 def select_features(train: pl.DataFrame, features: tuple[str, ...], target: str, settings: SelectionSettings = SelectionSettings()) -> tuple[tuple[str, ...], list[dict[str, float | str]]]:
@@ -26,15 +27,20 @@ def select_features(train: pl.DataFrame, features: tuple[str, ...], target: str,
     viable = [name for name in features if float(coverage[name]) >= settings.min_coverage and data.get_column(name).drop_nulls().std() > 1e-12]
     if not viable:
         raise ValueError("no features meet coverage and variance requirements")
-    # Features are already cross-sectionally standardized.  The daily Pearson IC
-    # is a fast monotone-quality proxy used only on the current training window.
-    daily = data.group_by("trade_date").agg([pl.corr(name, target).alias(name) for name in viable])
+    # Candidate factor evaluation and downstream diagnostics use Rank IC.  Use
+    # the same monotone statistic for every rolling training-window decision.
+    daily = data.group_by("trade_date").agg([
+        pl.corr(pl.col(name).rank(), pl.col(target).rank()).alias(name)
+        for name in viable
+    ])
     stats: list[dict[str, float | str]] = []
     for name in viable:
         values = daily.get_column(name).drop_nulls()
         mean, std = float(values.mean()), float(values.std())
         icir = mean / std * np.sqrt(252) if std > 1e-12 else 0.0
         stats.append({"feature": name, "coverage": float(coverage[name]), "mean_ic": mean, "icir": icir, "abs_icir": abs(icir)})
+    if settings.use_all_features:
+        return tuple(viable), stats
     ranked = sorted((row for row in stats if row["abs_icir"] >= settings.min_abs_icir), key=lambda row: float(row["abs_icir"]), reverse=True)
     if not ranked:
         ranked = sorted(stats, key=lambda row: float(row["abs_icir"]), reverse=True)
