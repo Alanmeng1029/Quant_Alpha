@@ -1,11 +1,11 @@
 {
-  "factor_set_id": "o2o_daily60_minute38_v1",
-  "status": "superseded",
+  "factor_set_id": "o2o_daily60_minute45_v2",
+  "status": "active",
   "output_frequency": "daily",
-  "factor_count": 98,
+  "factor_count": 105,
   "approval": {
     "approved_by": "Alanmxy",
-    "approval_note": "Daily60 plus both screened minute-factor rounds; active OOS input for the limited-replacement strategy."
+    "approval_note": "Adds seven ohlcv_candidates_v3 factors selected under abs(annualized H1 or H5 Rank ICIR) > 2; active versioned LGBM input after its rolling OOS evaluation."
   },
   "daily_component": {
     "count": 60,
@@ -22,9 +22,14 @@
       "count": 10,
       "factor_ids_file": "configs/candidate_factors_minute_core24_o2o_selected10.txt",
       "dataset": "A_stock_database/lake/derived/minute_factors/core24/v1"
+    },
+    {
+      "count": 7,
+      "factor_ids_file": "configs/candidate_factors_minute_ohlcv_v3_o2o_abs_annual_icir_gt2_h1_or_h5.txt",
+      "dataset": "A_stock_database/lake/derived/minute_factors/ohlcv_candidates_v3"
     }
   ],
-  "active_feature_cache": "A_stock_database/lake/derived/predict_features_o2o_daily60_minute38_v1",
-  "active_prediction": "results/predict/open-open-daily60-minute38-lgbm-v1/predictions.parquet",
+  "active_feature_cache": "A_stock_database/lake/derived/predict_features_o2o_daily60_minute45_v2",
+  "active_prediction": "results/predict/research-oos-daily60-minute45-v2/predictions/lgbm_default105.parquet",
   "strategy": "limited_replacement_v2"
 }

@@ -1,0 +1,35 @@
+# Strict OOS candidate screen: CSI300 union CSI500 Open-to-open Rank ICIR.
+# Screen period ends 2021-03-31, before the OOS prediction period starts.
+# Keep when absolute h=1 or h=5 ICIR is greater than 2.
+# Existing baseline duplicates are omitted.
+mf_tail30_sharpe_ratio
+mf_tail_volume_weighted_return
+mf_ideal_turnover_d20
+mf_last3bar_auction_share
+mf_climb_cov_w20
+mf_ambiguity_price_gap_w20
+mf_jump_taylor_residual_w20
+mf_logsig_v_l2_21
+mf_dazzling_ret_w20
+mf_volume_game_position_w20
+mf_realized_skew_5m_w20
+mf_realized_hyperskew_w20
+mf_vol_diff_ols_tstd_w20
+mf_pm_open30_to_am_open30_vol_ratio
+mf_volume_game_return_w20
+mf_dazzling_vol_w20
+mf_vol_diff_ols_intercept_w20
+mf_ambiguity_amount_corr_w20
+mf_logsig_v_l2_1
+mf_ambiguity_amount_ratio_w20
+mf_bottomvol_ret_w20
+mf_direction_changes_w20
+mf_firstbar_auction_share
+mf_amplitude_game_w20
+mf_logvol_intraday_std_w20
+mf_left_tail_cvar_ratio_w20
+mf_ideal_amplitude_d20
+mf_reversal_hour_weighted_d20
+mf_realized_hyperkurt_w20
+mf_realized_skew_neg_w20
+mf_realized_skew_pos_w20

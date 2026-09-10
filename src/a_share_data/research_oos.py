@@ -1,4 +1,4 @@
-"""Leakage-safe rolling OOS model comparison for the formal 98-factor set.
+"""Leakage-safe rolling OOS model comparison for a registered formal factor set.
 
 This module intentionally sits beside the legacy ``run-oos`` command.  It does
 not change the production prediction or the V2 policy: it produces a fully
@@ -27,7 +27,7 @@ import polars as pl
 
 from a_share_data.policy import LimitedReplacementConfig, run_limited_replacement_policy
 from a_share_data.predict import (INFEASIBLE_EXECUTION_CODES, LABEL_LAG, TRAIN_DAYS,
-                                  build_labels, render_backtest_report, standardize_features)
+                                  build_labels, read_factor_ids, render_backtest_report, standardize_features)
 
 
 SEED = 20260908
@@ -341,15 +341,15 @@ def _tune(panel: pl.DataFrame, train_dates: list[str], features: list[str], fami
     return best
 
 
-def _predict_final(panel: pl.DataFrame, train_dates: list[str], test_dates: list[str], features: list[str], tuned: dict[str, Any], families: tuple[str, ...]) -> tuple[dict[str, pl.DataFrame], dict[str, Any], dict[str, Any]]:
+def _predict_final(panel: pl.DataFrame, train_dates: list[str], test_dates: list[str], features: list[str], tuned: dict[str, Any], families: tuple[str, ...], model_tag: str, include_tuned_lgbm: bool) -> tuple[dict[str, pl.DataFrame], dict[str, Any], dict[str, Any]]:
     train = panel.filter(pl.col("trade_date").is_in(_date_values(train_dates))); test = panel.filter(pl.col("trade_date").is_in(_date_values(test_dates)))
     final_fit_dates, final_valid_dates = validation_folds(train_dates)[-1]
     early_train = panel.filter(pl.col("trade_date").is_in(_date_values(final_fit_dates))); early_valid = panel.filter(pl.col("trade_date").is_in(_date_values(final_valid_dates)))
     bases = test.select("trade_date", "ts_code").with_columns(pl.col("trade_date").cast(pl.Date))
     raw: dict[str, pl.DataFrame] = {}; metadata: dict[str, Any] = {}; saved: dict[str, Any] = {}
-    tree_outputs = (("lgbm", "lgbm_tuned98"), ("xgb", "xgboost_tuned98"))
+    tree_outputs = (("lgbm", f"lgbm_tuned{model_tag}"), ("xgb", f"xgboost_tuned{model_tag}"))
     for family, output_name in tree_outputs:
-        if family not in families:
+        if family not in families or (family == "lgbm" and not include_tuned_lgbm):
             continue
         cols: list[pl.Series] = []; rounds_record: dict[str, int] = {}; saved[output_name] = {}
         for horizon in HORIZONS:
@@ -359,19 +359,21 @@ def _predict_final(panel: pl.DataFrame, train_dates: list[str], test_dates: list
             prediction, _, model = fitter(train, early_valid, test, features, TARGETS[horizon], choice, rounds)
             cols.append(pl.Series(f"raw_{horizon}", prediction)); rounds_record[horizon] = rounds; saved[output_name][horizon] = model
         raw[output_name] = bases.with_columns(cols); metadata[output_name] = {"params": tuned[family], "rounds": rounds_record}
-    # Default LGBM is a true all-98 reference, with no search and the same final validation protocol.
+    # Default LGBM is a true all-feature reference, with no search and the same final validation protocol.
     default_choice = {"num_leaves": 31, "min_data_in_leaf": 20, "feature_fraction": 1.0, "lambda_l2": 0.0}
-    cols = []; rounds_record = {}; saved["lgbm_default98"] = {}
+    default_name = f"lgbm_default{model_tag}"
+    cols = []; rounds_record = {}; saved[default_name] = {}
     for horizon in HORIZONS:
         _, rounds, _ = _fit_lgbm(early_train, early_valid, early_valid, features, TARGETS[horizon], default_choice)
         prediction, _, model = _fit_lgbm(train, early_valid, test, features, TARGETS[horizon], default_choice, rounds)
-        cols.append(pl.Series(f"raw_{horizon}", prediction)); rounds_record[horizon] = rounds; saved["lgbm_default98"][horizon] = model
-    raw["lgbm_default98"] = bases.with_columns(cols); metadata["lgbm_default98"] = {"params": default_choice, "rounds": rounds_record}
+        cols.append(pl.Series(f"raw_{horizon}", prediction)); rounds_record[horizon] = rounds; saved[default_name][horizon] = model
+    raw[default_name] = bases.with_columns(cols); metadata[default_name] = {"params": default_choice, "rounds": rounds_record}
     if "mlp" in families:
         _, epochs, _ = _fit_mlp(early_train, early_valid, early_valid, features, tuned["mlp"]["params"])
         prediction, _, state = _fit_mlp(train, early_valid, test, features, tuned["mlp"]["params"], final_epochs=epochs)
-        raw["mlp_tuned98"] = bases.with_columns(pl.Series("raw_h1", prediction[:, 0]), pl.Series("raw_h5", prediction[:, 1]))
-        metadata["mlp_tuned98"] = {"params": tuned["mlp"]["params"], "epochs": epochs}; saved["mlp_tuned98"] = state
+        mlp_name = f"mlp_tuned{model_tag}"
+        raw[mlp_name] = bases.with_columns(pl.Series("raw_h1", prediction[:, 0]), pl.Series("raw_h5", prediction[:, 1]))
+        metadata[mlp_name] = {"params": tuned["mlp"]["params"], "epochs": epochs}; saved[mlp_name] = state
     return raw, metadata, saved
 
 
@@ -462,20 +464,48 @@ def _run_backtests(catalog: Path, predictions: dict[str, Path], output: Path, po
     return results
 
 
+def _registered_factor_ids(formal_path: Path, formal: dict[str, Any]) -> tuple[str, ...]:
+    """Expand a factor registry and make its cache contract explicit."""
+    repository = formal_path.resolve().parents[2]
+    daily = formal.get("daily_component", {})
+    components = [daily, *formal.get("minute_components", [])]
+    factor_ids: list[str] = []
+    for component in components:
+        path = repository / component["factor_ids_file"]
+        ids = read_factor_ids(path)
+        if len(ids) != component["count"]:
+            raise ValueError(f"registry count disagrees with {path}")
+        factor_ids.extend(ids)
+    if len(factor_ids) != len(set(factor_ids)):
+        raise ValueError("formal factor registry contains duplicate factor ids")
+    if formal.get("factor_count") != len(factor_ids):
+        raise ValueError("formal factor registry factor_count disagrees with its components")
+    return tuple(factor_ids)
+
+
 def run_research_oos(config_path: Path, start_override: str | None = None, end_override: str | None = None, skip_backtests: bool = False) -> dict[str, Any]:
     config = json.loads(config_path.read_text(encoding="utf-8")); root = Path(config["output"]).expanduser(); root.mkdir(parents=True, exist_ok=True)
     feature_root = Path(config["feature_root"]).expanduser(); catalog = Path(config["catalog"]).expanduser(); feature_manifest = json.loads((feature_root / "manifest.json").read_text(encoding="utf-8"))
     factor_ids = tuple(feature_manifest["factor_ids"])
-    if len(factor_ids) != 98 or feature_manifest.get("factor_count", len(factor_ids)) != 98:
-        raise ValueError("research-oos requires the fixed 98-factor cache")
-    if any("ohlcv_candidates_v2" in value for value in factor_ids): raise ValueError("minute v2 factors are explicitly excluded")
-    formal = json.loads(Path(config["formal_factor_set"]).read_text(encoding="utf-8"))
-    if formal.get("factor_count") != 98: raise ValueError("formal factor registry is not the 98-factor v1 set")
+    formal_path = Path(config["formal_factor_set"]).expanduser()
+    formal = json.loads(formal_path.read_text(encoding="utf-8"))
+    registered_ids = _registered_factor_ids(formal_path, formal)
+    if factor_ids != registered_ids or feature_manifest.get("factor_count", len(factor_ids)) != len(registered_ids):
+        raise ValueError("feature cache does not exactly match the formal factor registry")
+    model_tag = str(config.get("model_tag", len(factor_ids)))
     start = start_override or config["oos_start"]; end = end_override or config["oos_end"]
     families = tuple(config.get("model_families", ("lgbm", "xgb", "mlp")))
     if "lgbm" not in families or set(families) - {"lgbm", "xgb", "mlp"}:
         raise ValueError("model_families must include lgbm and may additionally include xgb and/or mlp")
-    base_models: tuple[str, ...] = (("lgbm_default98", "lgbm_tuned98") if "lgbm" in families else ()) + (("xgboost_tuned98",) if "xgb" in families else ()) + (("mlp_tuned98",) if "mlp" in families else ())
+    lgbm_mode = config.get("lgbm_mode", "default_and_tuned")
+    if lgbm_mode not in {"default_only", "default_and_tuned"}:
+        raise ValueError("lgbm_mode must be default_only or default_and_tuned")
+    include_tuned_lgbm = "lgbm" in families and lgbm_mode == "default_and_tuned"
+    tuning_families = tuple(family for family in families if family != "lgbm" or include_tuned_lgbm)
+    default_name = f"lgbm_default{model_tag}"
+    tuned_lgbm_name = f"lgbm_tuned{model_tag}"
+    tuned_xgb_name = f"xgboost_tuned{model_tag}"
+    base_models: tuple[str, ...] = ((default_name,) + ((tuned_lgbm_name,) if include_tuned_lgbm else ()) if "lgbm" in families else ()) + ((tuned_xgb_name,) if "xgb" in families else ()) + ((f"mlp_tuned{model_tag}",) if "mlp" in families else ())
     source_fingerprints = _source_fingerprints()
     fingerprint = _json_hash({"config": config, "features": feature_manifest, "source": source_fingerprints, "python": sys.version, "platform": platform.platform(), "lightgbm": lgb.__version__})
     manifest_path = root / "manifest.json"
@@ -496,21 +526,21 @@ def run_research_oos(config_path: Path, start_override: str | None = None, end_o
         if year not in tuned_by_year:
             if tuning_file.exists(): tuned_by_year[year] = json.loads(tuning_file.read_text())
             else:
-                tuned_by_year[year] = {family: _tune(panel, train_dates, selected, family, root / "tuning" / f"year={year}-{family}.partial.json") for family in families}
+                tuned_by_year[year] = {family: _tune(panel, train_dates, selected, family, root / "tuning" / f"year={year}-{family}.partial.json") for family in tuning_families}
                 _write_json(tuning_file, tuned_by_year[year])
         quarter_dir = root / "quarters" / f"month={signal[:7]}"; quarter_dir.mkdir(parents=True, exist_ok=True)
         existing = {name: quarter_dir / f"{name}.parquet" for name in base_models}
         if all(path.exists() for path in existing.values()):
             generated = {name: pl.read_parquet(path) for name, path in existing.items()}; metadata = {"resumed": True}; saved = {}
         else:
-            generated, metadata, saved = _predict_final(panel, train_dates, test_dates, selected, tuned_by_year[year], families); _save_models(saved, quarter_dir / "models")
+            generated, metadata, saved = _predict_final(panel, train_dates, test_dates, selected, tuned_by_year[year], families, model_tag, include_tuned_lgbm); _save_models(saved, quarter_dir / "models")
             for name, frame in generated.items(): frame.write_parquet(quarter_dir / f"{name}.parquet", compression="zstd")
         for name, frame in generated.items(): all_predictions[name].append(frame)
         training_log.append({"signal": signal, "test_start": test_dates[0], "test_end": test_dates[-1], "year": year, "feature_count": len(selected), "excluded_features": excluded, "metadata": metadata, "seconds": time.time() - started})
         _write_json(root / "training_log.json", training_log)
     outputs: dict[str, pl.DataFrame] = {name: pl.concat(parts).unique(["trade_date", "ts_code"], keep="first").sort(["trade_date", "ts_code"]) for name, parts in all_predictions.items()}
-    if {"lgbm", "xgb"}.issubset(families):
-        outputs["lgbm_xgb_equal"] = _fuse(outputs["lgbm_tuned98"], outputs["xgboost_tuned98"])
+    if include_tuned_lgbm and {"lgbm", "xgb"}.issubset(families):
+        outputs["lgbm_xgb_equal"] = _fuse(outputs[tuned_lgbm_name], outputs[tuned_xgb_name])
     if {"lgbm", "xgb", "mlp"}.issubset(families):
         # Combine the two-tree daily blend (weight 2/3) with MLP's daily z-score.
         tree = outputs["lgbm_xgb_equal"].join(daily_normalize(outputs["mlp_tuned98"], "raw_h1", "raw_h5").select("trade_date", "ts_code", "raw_h1", "raw_h5", "pred_h1", "pred_h5").rename({"raw_h1": "m_h1", "raw_h5": "m_h5", "pred_h1": "m_z1", "pred_h5": "m_z5"}), on=["trade_date", "ts_code"])
@@ -522,13 +552,24 @@ def run_research_oos(config_path: Path, start_override: str | None = None, end_o
         ).select("trade_date", "ts_code", "raw_h1", "raw_h5", "blend_h1", "blend_h5")
     prediction_paths: dict[str, Path] = {}; report: dict[str, Any] = {"fingerprint": fingerprint, "oos_start": start, "oos_end": end, "models": {}, "paired_ic_difference_vs_default": {}}
     label_oos = panel.select("trade_date", "ts_code", "excess_h1", "excess_h5").filter((pl.col("trade_date") >= date.fromisoformat(start)) & (pl.col("trade_date") <= date.fromisoformat(end)))
+    calendar_conn = duckdb.connect(str(catalog), read_only=True)
+    try:
+        final_observed_date = calendar_conn.execute("SELECT max(trade_date) FROM observed_calendar WHERE is_observed_market_day").fetchone()[0]
+    finally:
+        calendar_conn.close()
+    # A signal needs the following observed session for its T+1 execution.
+    # Keep this explicit rather than silently fabricating an execution date.
+    unexecutable_dates = label_oos.filter(pl.col("trade_date") >= final_observed_date).select("trade_date").unique().sort("trade_date").get_column("trade_date").to_list()
+    label_oos = label_oos.filter(pl.col("trade_date") < final_observed_date)
+    report["excluded_unexecutable_signal_dates"] = [str(value) for value in unexecutable_dates]
     execution_dates = _execution_calendar(catalog, [date.fromisoformat(value) for value in _date_strings(label_oos)])
     for name, raw in outputs.items():
         normalized = (raw.rename({"blend_h1": "pred_h1", "blend_h5": "pred_h5"}) if "blend_h1" in raw.columns else daily_normalize(raw, "raw_h1", "raw_h5")).join(execution_dates, on="trade_date", how="left")
+        normalized = normalized.filter(pl.col("execution_date").is_not_null())
         path = root / "predictions" / f"{name}.parquet"; path.parent.mkdir(parents=True, exist_ok=True); normalized.write_parquet(path, compression="zstd"); prediction_paths[name] = path
         measured = normalized.join(label_oos, on=["trade_date", "ts_code"], how="left")
         report["models"][name] = {"h1": _metrics(measured, "raw_h1", "excess_h1"), "h5": _metrics(measured, "raw_h5", "excess_h5"), "period_metrics": _period_metrics(measured, "raw_h1", "raw_h5"), "diagnostics": _diagnostics(measured, "raw_h1", "raw_h5")}
-        if name != "lgbm_default98": report["paired_ic_difference_vs_default"][name] = {h: block_bootstrap_difference(outputs["lgbm_default98"].join(label_oos, on=["trade_date", "ts_code"], how="left"), raw.join(label_oos, on=["trade_date", "ts_code"], how="left"), h) for h in HORIZONS}
+        if name != default_name: report["paired_ic_difference_vs_default"][name] = {h: block_bootstrap_difference(outputs[default_name].join(label_oos, on=["trade_date", "ts_code"], how="left"), raw.join(label_oos, on=["trade_date", "ts_code"], how="left"), h) for h in HORIZONS}
     correlations = {}
     for left, right in product(tuple(outputs), repeat=2):
         if left < right:
@@ -538,5 +579,5 @@ def run_research_oos(config_path: Path, start_override: str | None = None, end_o
     if not skip_backtests and config.get("run_backtests", True): report["backtests"] = _run_backtests(catalog, prediction_paths, root / "backtests", config["optimizer_v2"])
     _write_json(root / "report.json", report)
     rows = "".join(f"<tr><td>{html.escape(name)}</td><td>{item['h1'].get('mean_rank_ic')}</td><td>{item['h5'].get('mean_rank_ic')}</td><td>{item['h1'].get('rank_icir_annualized')}</td><td>{item['h5'].get('rank_icir_annualized')}</td></tr>" for name, item in report["models"].items())
-    (root / "report.html").write_text(f"<html><body><h1>98-factor rolling OOS research</h1><p>{start} to {end}; fixed Optimizer V2.</p><table border='1'><tr><th>model</th><th>H1 Rank IC</th><th>H5 Rank IC</th><th>H1 annual ICIR</th><th>H5 annual ICIR</th></tr>{rows}</table><p>Full machine-readable report: report.json</p></body></html>", encoding="utf-8")
+    (root / "report.html").write_text(f"<html><body><h1>{len(factor_ids)}-factor rolling OOS research</h1><p>{start} to {end}; fixed Optimizer V2.</p><table border='1'><tr><th>model</th><th>H1 Rank IC</th><th>H5 Rank IC</th><th>H1 annual ICIR</th><th>H5 annual ICIR</th></tr>{rows}</table><p>Full machine-readable report: report.json</p></body></html>", encoding="utf-8")
     return {"output": str(root), "windows": len(windows), "models": list(outputs), "report": str(root / "report.json")}

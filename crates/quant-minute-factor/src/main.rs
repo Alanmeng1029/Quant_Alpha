@@ -7,6 +7,7 @@
 //! owns an independent rolling state, so block layout and thread count cannot
 //! change any output value.
 mod candidates;
+mod candidates_v3;
 mod daily;
 mod loader;
 mod manifest;
@@ -108,9 +109,12 @@ fn run_build(args: BuildArgs) -> Result<PathBuf> {
     if args.factor_set == "ohlcv_candidates_v1" {
         return candidates::run(args);
     }
+    if args.factor_set == "ohlcv_candidates_v3" {
+        return candidates_v3::run(args);
+    }
     if args.factor_set != "core24" {
         bail!(
-            "unknown --factor-set {}; expected core24 or ohlcv_candidates_v1",
+            "unknown --factor-set {}; expected core24, ohlcv_candidates_v1, or ohlcv_candidates_v3",
             args.factor_set
         );
     }

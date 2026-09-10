@@ -1,0 +1,10 @@
+# ohlcv_candidates_v3, CSI300 union CSI500.
+# Selected when either H1 or H5 full-period annualized Rank ICIR has absolute value > 2.
+# Evaluation period: 2021-04-01 through 2026-08-28; direction is retained for LGBM.
+mf_abnormal_signed_amount_imbalance
+mf_cs_rank_top30_persistence
+mf_market_residual_rv
+mf_signed_amount_imbalance
+mf_signed_amount_positive_segment_share
+mf_tail30_market_residual_return
+mf_traded_cost_dispersion

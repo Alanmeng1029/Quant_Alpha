@@ -1,0 +1,36 @@
+# V2 minute candidates from CSI300 union CSI500 batch evaluation.
+# Keep when either Open-to-open h=1 or h=5 has absolute full-sample Rank ICIR > 2.
+# Rolling prediction feature selection remains strictly train-window-only.
+mf_vol_diff_ols_tstd_w20
+mf_tail30_sharpe_ratio
+mf_ideal_turnover_d20
+mf_tail_volume_weighted_return
+mf_jump_taylor_residual_w20
+mf_logsig_v_l2_21
+mf_ambiguity_price_gap_w20
+mf_ambiguity_amount_ratio_w20
+mf_vol_diff_ols_intercept_w20
+mf_pm_open30_to_am_open30_vol_ratio
+mf_ambiguity_amount_corr_w20
+mf_dazzling_ret_w20
+mf_dazzling_vol_w20
+mf_ideal_amplitude_d20
+mf_logsig_v_l2_1
+mf_tide_strong_rate_w20
+mf_last3bar_auction_share
+mf_amplitude_game_w20
+mf_realized_hyperkurt_w20
+mf_realized_hyperskew_w20
+mf_minute_ols_qrs_w20
+mf_climb_cov_w20
+mf_realized_skew_5m_w20
+mf_left_tail_mean_w20
+mf_logvol_intraday_std_w20
+mf_tide_weak_std_w20
+mf_volume_game_position_w20
+mf_volume_game_return_w20
+mf_bottomvol_ret_w20
+mf_between_momentum_w20
+mf_rv_jump_share_w20
+mf_reversal_hour_weighted_d20
+mf_path_tortuosity_w20

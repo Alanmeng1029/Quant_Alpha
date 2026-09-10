@@ -54,3 +54,30 @@ def test_unchanged_members_are_not_rebalanced_daily() -> None:
     first_weights = holdings.filter(pl.col("execution_date") == execution_days[0]).sort("ts_code").get_column("weight").to_list()
     second_weights = holdings.filter(pl.col("execution_date") == execution_days[1]).sort("ts_code").get_column("weight").to_list()
     assert first_weights != second_weights
+
+
+def test_policy_rejects_calendar_day_execution(tmp_path):
+    import duckdb
+    import pytest
+    from a_share_data.policy import run_limited_replacement_policy
+    catalog = tmp_path / 'calendar.duckdb'
+    conn = duckdb.connect(str(catalog))
+    conn.execute('CREATE TABLE observed_calendar(trade_date DATE, is_observed_market_day BOOLEAN)')
+    conn.execute("INSERT INTO observed_calendar VALUES ('2021-04-02',true),('2021-04-06',true)")
+    conn.close()
+    path = tmp_path / 'predictions.parquet'
+    pl.DataFrame({'trade_date':[date(2021,4,2)], 'execution_date':[date(2021,4,3)]}).write_parquet(path)
+    with pytest.raises(ValueError, match='next trading day'):
+        run_limited_replacement_policy(catalog, path, tmp_path/'output')
+    assert not (tmp_path/'output').exists()
+
+
+def test_dynamic_top10_initial_holdings():
+    codes = [f'S{i:03}' for i in range(30)]
+    days = [date(2024,1,3), date(2024,1,4)]
+    predictions = pl.DataFrame([{'trade_date':date(2024,1,2+i), 'execution_date':d, 'ts_code':c, 'pred_h1':float(j), 'pred_h5':float(j)} for i,d in enumerate(days) for j,c in enumerate(codes)])
+    config = LimitedReplacementConfig(target_fraction=.1, max_weight=.5, rebalance_to_weight=.45)
+    quotes = {(d,c):(10.,1.,True) for d in days for c in codes}
+    daily, _, _, holdings, _ = _run_account(predictions,quotes,{d:100. for d in days},config,2.1,7.1)
+    assert daily['holding_count'][0] == 3
+    assert set(holdings['ts_code']) == {'S027','S028','S029'}

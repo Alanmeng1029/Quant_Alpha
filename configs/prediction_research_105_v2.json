@@ -1,0 +1,31 @@
+{
+  "catalog": "/Users/alanmxy/Documents/Quant_Alpha/A_stock_database/lake/catalog/a_share.duckdb",
+  "feature_root": "/Users/alanmxy/Documents/Quant_Alpha/A_stock_database/lake/derived/predict_features_o2o_daily60_minute45_v2",
+  "formal_factor_set": "/Users/alanmxy/Documents/Quant_Alpha/configs/formal_factor_sets/o2o_daily60_minute45_v2.json",
+  "output": "/Users/alanmxy/Documents/Quant_Alpha/results/predict/research-oos-daily60-minute45-v2",
+  "model_tag": "105",
+  "lgbm_mode": "default_only",
+  "oos_start": "2021-04-01",
+  "oos_end": "2026-08-28",
+  "model_families": ["lgbm"],
+  "run_backtests": true,
+  "optimizer_v2": {
+    "target_holdings": 80,
+    "entry_rank": 80,
+    "exit_rank": 96,
+    "max_daily_replacements": 5,
+    "max_weight": 0.03,
+    "rebalance_to_weight": 0.028,
+    "min_new_weight": 0.005,
+    "cash_reserve": 0.02,
+    "daily_buy_budget": 0.1,
+    "daily_sell_budget": 0.1,
+    "h1_weight": 0.5,
+    "entry_sizing": "equal",
+    "rank_tilt": 0.15,
+    "lot_size": 100,
+    "initial_capital": 10000000.0,
+    "buy_bps": 2.1,
+    "sell_bps": 7.1
+  }
+}

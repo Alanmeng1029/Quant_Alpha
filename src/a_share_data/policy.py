@@ -7,7 +7,7 @@ produced by lot rounding and transaction costs.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date
 import hashlib
 import json
@@ -41,8 +41,11 @@ class LimitedReplacementConfig:
     initial_capital: float = 10_000_000.0
     buy_bps: float = 2.1
     sell_bps: float = 7.1
+    target_fraction: float | None = None
 
     def validate(self) -> None:
+        if self.target_fraction is not None and not 0 < self.target_fraction <= 1:
+            raise ValueError("target_fraction must be in (0, 1]")
         if not (self.target_holdings > 0 and self.entry_rank >= self.target_holdings and self.exit_rank >= self.entry_rank):
             raise ValueError("ranking limits must satisfy target_holdings <= entry_rank <= exit_rank")
         if not (0 < self.max_daily_replacements <= self.target_holdings):
@@ -162,7 +165,13 @@ def _run_account(predictions: pl.DataFrame, quotes: dict[tuple[date, str], tuple
 
     # The final signal has no next opening price to mark the account.  It is
     # therefore intentionally not traded in this open-to-open simulation.
+    base_config = config
     for day_index, (signal_date, execution_day, raw_frame) in enumerate(valid_days[:-1]):
+        if base_config.target_fraction is not None:
+            count = max(1, int(np.ceil(raw_frame.height * base_config.target_fraction)))
+            config = replace(base_config, target_holdings=count, entry_rank=count,
+                             exit_rank=max(count, int(np.ceil(count * base_config.exit_rank / base_config.entry_rank))),
+                             max_daily_replacements=min(count, base_config.max_daily_replacements))
         frame = _score_frame(raw_frame, config.h1_weight)
         ranks = dict(frame.select("ts_code", "rank").iter_rows())
         signal_codes = set(frame.get_column("ts_code").to_list())
@@ -324,10 +333,24 @@ def run_limited_replacement_policy(catalog: Path, predictions_path: Path, output
     predictions = pl.read_parquet(predictions_path).with_columns(pl.col("trade_date").cast(pl.Date), pl.col("execution_date").cast(pl.Date)).filter(pl.col("execution_date").is_not_null())
     if predictions.is_empty():
         raise ValueError("predictions are empty")
+    conn = duckdb.connect(str(catalog), read_only=True)
+    try:
+        calendar = [row[0] for row in conn.execute("SELECT trade_date FROM observed_calendar WHERE is_observed_market_day ORDER BY trade_date").fetchall()]
+    finally:
+        conn.close()
+    next_days = dict(zip(calendar, calendar[1:]))
+    invalid = [(str(signal), str(execution)) for signal, execution in predictions.select("trade_date", "execution_date").unique().iter_rows()
+               if next_days.get(signal) != execution]
+    if invalid:
+        raise ValueError(f"execution_date must be the next trading day: {invalid[:3]}")
     first_day = predictions.get_column("execution_date").min()
     last_day = predictions.get_column("execution_date").max()
     quotes = _load_quotes(catalog, first_day, last_day)
     csi500_opens = _load_csi500_opens(catalog, first_day, last_day)
+    missing_benchmark = [str(day) for day in predictions["execution_date"].unique().to_list()
+                         if not np.isfinite(csi500_opens.get(day, np.nan)) or csi500_opens.get(day, 0) <= 0]
+    if missing_benchmark:
+        raise ValueError(f"missing CSI500 execution open: {missing_benchmark[:3]}")
     output.mkdir(parents=True, exist_ok=True)
     manifest = {"strategy": "limited_replacement_v2", "config": asdict(config), "predictions": str(predictions_path.resolve()), "prediction_fingerprint": _fingerprint(predictions_path), "catalog": str(catalog.resolve()), "execution": "signal at T close; decisions and lot-rounded trades at T+1 open; actual shares and cash feed the next decision", "costs": {"buy_bps": config.buy_bps, "sell_bps": config.sell_bps}}
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False))

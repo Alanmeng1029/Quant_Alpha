@@ -510,9 +510,9 @@ def staggered_dual_hysteresis_targets(predictions: Path, output: Path, h1_alloca
     return {"output": str(output), "days": len(by_date), "rows": result.height, "h1_allocation": h1_allocation, "h5_allocation": h5_allocation, "entry_fraction": entry_fraction, "exit_fraction": exit_fraction, "holding_days": holding_days, "mean_h1_names": float(np.mean(h1_counts)), "mean_h5_names_across_sleeves": float(np.mean(h5_counts))}
 
 
-def backtest_targets(catalog: Path, target_weights: Path, output: Path, buy_bps: float = 2.1, sell_bps: float = 7.1, initial_capital: float = 10_000_000.0, lot_size: int = 100, return_basis: str = "qfq") -> dict:
+def backtest_targets(catalog: Path, target_weights: Path, output: Path, buy_bps: float = 2.1, sell_bps: float = 7.1, initial_capital: float = 10_000_000.0, lot_size: int = 100, return_basis: str = "qfq", rebalance_band: float = 0.0) -> dict:
     """Open-to-open backtest using real-price lots and qfq or raw-price marking."""
-    if initial_capital <= 0 or lot_size <= 0 or return_basis not in {"qfq", "raw"}:
+    if initial_capital <= 0 or lot_size <= 0 or return_basis not in {"qfq", "raw"} or not 0 <= rebalance_band < 1:
         raise ValueError("initial_capital and lot_size must be positive; return_basis must be qfq or raw")
     output.mkdir(parents=True, exist_ok=True)
     targets = pl.read_parquet(target_weights).with_columns(pl.col("execution_date").cast(pl.Date)).filter(~pl.col("ts_code").is_in(INFEASIBLE_EXECUTION_CODES))
@@ -538,6 +538,10 @@ def backtest_targets(catalog: Path, target_weights: Path, output: Path, buy_bps:
         if equity <= 0: raise RuntimeError(f"non-positive equity on {day}")
         targets = {code: float(weight) for code, weight in frame.select("ts_code", "target_weight").iter_rows() if weight > 0 and code in quote}
         desired = {code: float(np.floor(equity * weight / quote[code][0] / lot_size) * lot_size) for code, weight in targets.items()}
+        # The band applies only to continuing positions, never entries/exits.
+        for code in desired.keys() & shares.keys():
+            if abs(shares[code] * quote[code][0] / equity - targets[code]) <= rebalance_band:
+                desired[code] = shares[code]
         # Sells are financed first.  Quantities produced by a corporate action
         # may be fractional; they remain sellable even though new buys are lots.
         sold = 0.0
