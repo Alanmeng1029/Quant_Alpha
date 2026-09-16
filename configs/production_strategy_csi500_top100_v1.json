@@ -1,0 +1,39 @@
+{
+  "strategy_id": "csi500_top100_swap3_v1",
+  "status": "active",
+  "model_factor_set": "o2o_daily60_minute45_v2",
+  "prediction_config": "configs/prediction_research_105_v2.json",
+  "prediction_artifact": "results/predict/research-oos-daily60-minute45-v2/predictions/lgbm_default105.parquet",
+  "universe": {
+    "index_code": "000905.SH",
+    "name": "CSI500",
+    "membership_timing": "signal_date",
+    "membership_source": "index_trading_universe"
+  },
+  "portfolio": {
+    "strategy": "limited_replacement_v2",
+    "target_holdings": 100,
+    "entry_rank": 100,
+    "exit_rank": 120,
+    "max_daily_replacements": 3,
+    "max_weight": 0.03,
+    "rebalance_to_weight": 0.028,
+    "min_new_weight": 0.005,
+    "cash_reserve": 0.02,
+    "daily_buy_budget": 0.1,
+    "daily_sell_budget": 0.1,
+    "h1_weight": 0.5,
+    "entry_sizing": "equal",
+    "lot_size": 100,
+    "initial_capital": 10000000.0
+  },
+  "costs": {
+    "buy_bps": 2.1,
+    "sell_bps": 7.1
+  },
+  "approval": {
+    "approved_by": "Alanmxy",
+    "approved_on": "2026-09-16",
+    "approval_note": "Formal portfolio is selected only from point-in-time CSI500 constituents; Top100 with at most three daily replacements."
+  }
+}

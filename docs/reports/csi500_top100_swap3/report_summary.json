@@ -1,0 +1,23 @@
+{
+  "days": 1311,
+  "start": "2021-04-02",
+  "end": "2026-08-27",
+  "gross_total_return": 1.1355900026896788,
+  "net_total_return": 1.0613705722444386,
+  "csi500_total_return": 0.25692677691883214,
+  "net_excess_wealth_vs_csi500": 0.6400084794896168,
+  "gross_annualized_return": 0.15701721604035734,
+  "net_annualized_return": 0.14917714338626453,
+  "csi500_annualized_return": 0.044935135080729216,
+  "net_annualized_excess_vs_csi500": 0.09975931022501405,
+  "average_daily_active_return_bps": 3.527035235029042,
+  "annualized_tracking_error": 0.09125111103497856,
+  "net_sharpe": 0.728300065103047,
+  "information_ratio": 0.9740296519640371,
+  "max_drawdown": -0.23361437188977618,
+  "average_buy_turnover": 0.02982805142606649,
+  "average_sell_turnover": 0.029197914046040354,
+  "average_fee_bps": 0.26994810307892125,
+  "cumulative_fee_paid_on_initial_nav": 0.050495693459763395,
+  "average_holding_count": 99.85278413424867
+}

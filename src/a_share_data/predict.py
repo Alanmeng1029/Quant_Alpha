@@ -631,6 +631,20 @@ def summarize_holdings(target_weights: Path) -> dict:
     }
 
 
+def _format_backtest_report_value(key: str, value: object) -> object:
+    if not isinstance(value, float):
+        return value
+    if key.endswith("_bps"):
+        return f"{value:.4f}"
+    percentage_keys = (
+        "return", "drawdown", "turnover", "weight", "excess_wealth",
+        "tracking_error", "cumulative_fee_paid_on_initial_nav",
+    )
+    if any(marker in key for marker in percentage_keys):
+        return f"{value:.4%}"
+    return f"{value:.4f}"
+
+
 def render_backtest_report(portfolio_daily: Path, output: Path, title: str = "Portfolio backtest", target_weights: Path | None = None) -> dict:
     """Render a self-contained HTML tear sheet from portfolio_daily.parquet."""
     import matplotlib
@@ -663,11 +677,7 @@ def render_backtest_report(portfolio_daily: Path, output: Path, title: str = "Po
     fig,axes=plt.subplots(2,1,figsize=(12,7),sharex=True,gridspec_kw={"height_ratios":[2,1]}); axes[0].plot(dates,excess_nav,color="#2a9d8f",lw=1.8,label="Net NAV − CSI500 NAV"); axes[0].fill_between(dates,excess_nav,0,color="#2a9d8f",alpha=.18); axes[0].axhline(0,color="#6b7280",lw=.8); axes[0].set_ylabel("Excess NAV (initial NAV)"); axes[0].set_title(title+" — CSI500 excess return / NAV"); axes[0].legend(fontsize=9); axes[1].plot(dates,cumulative_active,color="#457b9d",lw=1.3,label="Cumulative daily active return"); axes[1].axhline(0,color="#6b7280",lw=.8); axes[1].set_ylabel("Sum of active returns"); axes[1].legend(fontsize=9); fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(output/"excess_performance.png",dpi=160); plt.close(fig)
     fig,axes=plt.subplots(2,1,figsize=(12,7),sharex=True); axes[0].plot(dates,drawdown,color="#c44e52",lw=1.2); axes[0].fill_between(dates,drawdown,0,color="#c44e52",alpha=.2); axes[0].set_ylabel("Net drawdown"); axes[0].set_title(title+" — drawdown and turnover"); axes[1].plot(dates,frame["buy_turnover"].to_numpy(),label="Buy turnover",lw=1); axes[1].plot(dates,frame["sell_turnover"].to_numpy(),label="Sell turnover",lw=1); axes[1].bar(dates,cost,label="Fee",alpha=.35,width=1); axes[1].set_ylabel("Fraction of NAV"); axes[1].legend(ncol=3,fontsize=9); fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(output/"drawdown_turnover_fee.png",dpi=160); plt.close(fig)
     def row(key: str, value: object) -> str:
-        if isinstance(value, float):
-            if any(marker in key for marker in ("return", "drawdown", "turnover", "weight", "excess_wealth")):
-                value = f"{value:.4%}"
-            else:
-                value = f"{value:.4f}"
+        value = _format_backtest_report_value(key, value)
         return f"<tr><th>{html.escape(key)}</th><td>{html.escape(str(value))}</td></tr>"
     table="".join(row(key,value) for key,value in metrics.items())
     holdings_table=""

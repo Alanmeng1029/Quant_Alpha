@@ -6,12 +6,17 @@ from datetime import date, timedelta
 import numpy as np
 import polars as pl
 
-from a_share_data.predict import CORE40, LABEL_LAG, TRAIN_DAYS, project_capped_simplex, read_factor_ids, rolling_windows, winsorize_labels
+from a_share_data.predict import CORE40, LABEL_LAG, TRAIN_DAYS, _format_backtest_report_value, project_capped_simplex, read_factor_ids, rolling_windows, winsorize_labels
 from a_share_data.ensemble import SelectionSettings, select_features
 from a_share_data.factors import _restrict_storage_universe
 
 
 class PredictionProtocolTests(unittest.TestCase):
+    def test_backtest_report_formats_rates_and_basis_points(self) -> None:
+        self.assertEqual(_format_backtest_report_value("net_total_return", 1.0613705), "106.1371%")
+        self.assertEqual(_format_backtest_report_value("annualized_tracking_error", .091251), "9.1251%")
+        self.assertEqual(_format_backtest_report_value("average_daily_active_return_bps", 3.527035), "3.5270")
+
     def test_core40_is_fixed_and_complete(self) -> None:
         self.assertEqual(len(CORE40), 40)
         self.assertEqual(CORE40[0], "gtja_alpha001_qfq_v1")

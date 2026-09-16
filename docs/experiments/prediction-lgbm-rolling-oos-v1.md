@@ -1,5 +1,7 @@
 # Fixed-98 LGBM rolling OOS, 2026-09-08
 
+> 历史基线：本实验用于确定 98 因子阶段采用默认 LightGBM，而不是年度 Rank-IC 调参版本。98 因子集现已由 105 因子 `o2o_daily60_minute45_v2` 替代；当前正式结果见 [`../PRODUCTION_BACKTEST.md`](../PRODUCTION_BACKTEST.md)。
+
 ## Scope
 
 - Input: formal `o2o_daily60_minute38_v1` cache: 60 daily factors plus 38 minute-v1 factors; minute-v2 is excluded.
@@ -30,6 +32,6 @@ The tuned-minus-default 20-trading-day block bootstrap intervals include zero: H
 
 ## Decision
 
-Keep `lgbm_default98` as the current formal prediction candidate. Do not promote the Rank-IC-tuned variant.
+在 98 因子版本内部保留 `lgbm_default98`，不晋级 Rank-IC 调参版本。该结论随后成为 105 因子版本继续采用默认 LightGBM 的历史依据，但本页不再代表当前正式因子集。
 
 MLP was paused because this environment reports `torch.backends.mps.is_available() == False`, so it would train on CPU. A follow-up LGBM experiment selecting annual parameters by validation Top80 future return was started but intentionally stopped before results and its partial outputs were deleted. It must be restarted as a fresh exploratory experiment if needed.
