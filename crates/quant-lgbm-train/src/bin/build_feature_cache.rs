@@ -20,6 +20,8 @@ struct Args {
     output: PathBuf,
     #[arg(long, default_value = "000905.SH")]
     index_code: String,
+    #[arg(long, default_value = "qfq")]
+    price_basis: String,
     #[arg(long, default_value = "2018-01-01")]
     start: String,
     #[arg(long, default_value = "2026-08-28")]
@@ -62,6 +64,26 @@ fn ident(value: &str) -> Result<String> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if !matches!(args.price_basis.as_str(), "qfq" | "raw") {
+        bail!("--price-basis must be qfq or raw");
+    }
+    let index_codes = args
+        .index_code
+        .split(',')
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    if index_codes.is_empty()
+        || index_codes.iter().any(|code| {
+            code.is_empty() || !code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
+        })
+    {
+        bail!("invalid --index-code list: {}", args.index_code);
+    }
+    let index_values = index_codes
+        .iter()
+        .map(|code| format!("'{code}'"))
+        .collect::<Vec<_>>()
+        .join(",");
     let daily_ids = ids(&args.daily_ids)?;
     let minute = args
         .minute_source
@@ -114,8 +136,7 @@ fn main() -> Result<()> {
             .collect::<Result<Vec<_>>>()?;
         let mut ctes = vec![
             format!(
-                "universe AS (SELECT DISTINCT trade_date,ts_code FROM index_trading_universe WHERE index_code='{}' AND trade_date BETWEEN DATE '{lower}' AND DATE '{upper}')",
-                args.index_code
+                "universe AS (SELECT DISTINCT trade_date,ts_code FROM index_trading_universe WHERE index_code IN ({index_values}) AND trade_date BETWEEN DATE '{lower}' AND DATE '{upper}' AND ts_code<>'000937.SZ')",
             ),
             format!("factors AS ({unions})"),
         ];
@@ -177,7 +198,7 @@ fn main() -> Result<()> {
         serde_json::to_vec_pretty(&json!({
             "version": 2, "factor_ids": all_ids, "daily_factor_ids": daily_ids,
             "minute_factor_sources": minute.iter().map(|(root, values)| json!({"dataset":root,"factor_ids":values})).collect::<Vec<_>>(),
-            "price_basis": "qfq", "index_code": args.index_code, "start": args.start, "end": args.end, "rows": rows,
+            "price_basis": args.price_basis, "index_code": args.index_code, "start": args.start, "end": args.end, "rows": rows,
             "builder": "quant-lgbm-train/build-feature-cache-rust-v1"
         }))?,
     )?;
