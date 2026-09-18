@@ -1,0 +1,16 @@
+{
+  "factor_set_id": "o2o_raw_daily60_minute45_csi500_csi1000_v1",
+  "status": "candidate",
+  "output_frequency": "daily",
+  "factor_count": 105,
+  "universe": {"index_codes": ["000905.SH", "000852.SH"], "overlap_priority": "000905.SH"},
+  "daily_component": {"count": 60, "factor_ids_file": "configs/candidate_factors_daily_o2o_candidate60_raw_v1.txt", "price_basis": "raw"},
+  "minute_components": [
+    {"count": 28, "factor_ids_file": "configs/candidate_factors_minute_ohlcv_open_to_open_abs_icir_gt2_h1_or_h5.txt", "dataset": "A_stock_database/lake/derived/minute_factors/ohlcv_candidates_v1_raw_csi500_csi1000"},
+    {"count": 10, "factor_ids_file": "configs/candidate_factors_minute_core24_o2o_selected10.txt", "dataset": "A_stock_database/lake/derived/minute_factors/core24_raw_csi500_csi1000/v1"},
+    {"count": 7, "factor_ids_file": "configs/candidate_factors_minute_ohlcv_v3_o2o_abs_annual_icir_gt2_h1_or_h5.txt", "dataset": "A_stock_database/lake/derived/minute_factors/ohlcv_candidates_v3_raw_csi500_csi1000"}
+  ],
+  "feature_cache": "A_stock_database/lake/derived/predict_features_o2o_raw_daily60_minute45_csi500_csi1000_v1",
+  "label_basis": "qfq_open_excess_vs_csi500",
+  "production": {"runtime": "rust", "model_training": "python_lightgbm", "shadow_only": true}
+}

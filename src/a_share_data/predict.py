@@ -98,7 +98,7 @@ def all_factor_ids(factor_root: Path) -> tuple[str, ...]:
     return found
 
 
-def build_features(catalog: Path, factor_root: Path, feature_root: Path, start: str | None = None, end: str | None = None, replace: bool = False, factor_ids: tuple[str, ...] = CORE40, minute_factor_sources: tuple[tuple[Path, tuple[str, ...]], ...] = ()) -> dict:
+def build_features(catalog: Path, factor_root: Path, feature_root: Path, start: str | None = None, end: str | None = None, replace: bool = False, factor_ids: tuple[str, ...] = CORE40, minute_factor_sources: tuple[tuple[Path, tuple[str, ...]], ...] = (), universe_index_codes: tuple[str, ...] = ("000300.SH", "000905.SH"), raw_eligible_universe: bool = False) -> dict:
     """Build a daily feature cache from long daily and optional wide minute factors.
 
     Minute candidates remain in their single daily-wide dataset.  Reading them
@@ -138,6 +138,8 @@ def build_features(catalog: Path, factor_root: Path, feature_root: Path, start: 
         "factor_hash": digest,
         "start": start,
         "end": end,
+        "universe_index_codes": universe_index_codes,
+        "raw_eligible_universe": raw_eligible_universe,
     }
     expected_years = {d[:4] for d in _dates(duckdb.connect(str(catalog), read_only=True), start, end)}
     if not replace and manifest_path.exists():
@@ -170,8 +172,18 @@ def build_features(catalog: Path, factor_root: Path, feature_root: Path, start: 
                 minute_joins.append(f"LEFT JOIN minute_{source_index} m{source_index} USING(trade_date, ts_code)")
             minute_sql = ", " + ", ".join(minute_ctes) if minute_ctes else ""
             joins_sql = " ".join(minute_joins)
-            query = f"""WITH universe AS (SELECT DISTINCT trade_date, ts_code FROM index_trading_universe
-                             WHERE index_code IN ('000300.SH','000905.SH') AND trade_date BETWEEN DATE '{lower}' AND DATE '{upper}'), factors AS ({factors_cte}){minute_sql}
+            indexes = ", ".join(f"'{code}'" for code in universe_index_codes)
+            if raw_eligible_universe:
+                universe_sql = f"""SELECT DISTINCT cal.trade_date, c.ts_code
+                    FROM observed_calendar cal
+                    JOIN index_monthly_constituents c ON c.index_code IN ({indexes})
+                      AND c.as_of_date=(SELECT max(c2.as_of_date) FROM index_monthly_constituents c2 WHERE c2.index_code=c.index_code AND c2.as_of_date<=cal.trade_date)
+                    JOIN daily_aggregated d ON d.trade_date=cal.trade_date AND d.ts_code=c.ts_code
+                    WHERE cal.is_observed_market_day AND cal.trade_date BETWEEN DATE '{lower}' AND DATE '{upper}'
+                      AND d.open>0 AND d.high>0 AND d.low>0 AND d.close>0 AND d.amount_cny>0 AND d.volume_share>0 AND d.observation_status='complete_trading'"""
+            else:
+                universe_sql = f"SELECT DISTINCT trade_date,ts_code FROM index_trading_universe WHERE index_code IN ({indexes}) AND trade_date BETWEEN DATE '{lower}' AND DATE '{upper}'"
+            query = f"""WITH universe AS ({universe_sql}), factors AS ({factors_cte}){minute_sql}
                          SELECT u.trade_date, u.ts_code, {columns} FROM universe u LEFT JOIN factors f USING(trade_date, ts_code)
                          {joins_sql}
                          GROUP BY u.trade_date, u.ts_code ORDER BY u.trade_date, u.ts_code"""
@@ -185,15 +197,25 @@ def build_features(catalog: Path, factor_root: Path, feature_root: Path, start: 
     return {"cache_hit": False, "rows": rows, "years": sorted(expected_years), "factor_hash": digest, "factor_count": len(all_factor_ids)}
 
 
-def build_labels(catalog: Path, start: str | None = None, end: str | None = None) -> pl.DataFrame:
+def build_labels(catalog: Path, start: str | None = None, end: str | None = None, universe_index_codes: tuple[str, ...] = INDEX_CODES, raw_eligible_universe: bool = False) -> pl.DataFrame:
     """Executable open-to-open labels: entry T+1, exits T+2/T+6."""
     conn = duckdb.connect(str(catalog), read_only=True)
     try:
         dates = _dates(conn, start, end)
         if not dates: return pl.DataFrame({"trade_date": [], "ts_code": []})
         # Need future rows beyond requested end, so construct from full calendar and filter signal dates last.
-        query = """WITH calendar AS (SELECT trade_date, row_number() over(order by trade_date) n FROM observed_calendar WHERE is_observed_market_day),
-        uni AS (SELECT DISTINCT u.trade_date,u.ts_code FROM index_trading_universe u WHERE index_code IN ('000300.SH','000905.SH')),
+        index_values = ", ".join(f"'{code}'" for code in universe_index_codes)
+        if raw_eligible_universe:
+            universe_sql = f"""SELECT DISTINCT cal.trade_date,c.ts_code
+                FROM observed_calendar cal JOIN index_monthly_constituents c ON c.index_code IN ({index_values})
+                  AND c.as_of_date=(SELECT max(c2.as_of_date) FROM index_monthly_constituents c2 WHERE c2.index_code=c.index_code AND c2.as_of_date<=cal.trade_date)
+                JOIN daily_aggregated d ON d.trade_date=cal.trade_date AND d.ts_code=c.ts_code
+                WHERE cal.is_observed_market_day AND d.open>0 AND d.high>0 AND d.low>0 AND d.close>0
+                  AND d.amount_cny>0 AND d.volume_share>0 AND d.observation_status='complete_trading'"""
+        else:
+            universe_sql = f"SELECT DISTINCT trade_date,ts_code FROM index_trading_universe WHERE index_code IN ({index_values})"
+        query = f"""WITH calendar AS (SELECT trade_date, row_number() over(order by trade_date) n FROM observed_calendar WHERE is_observed_market_day),
+        uni AS ({universe_sql}),
         raw AS (SELECT u.trade_date,u.ts_code,
           d1.qfq_open e, d2.qfq_open x1, d6.qfq_open x5,
           i1.open b1, i2.open b2, i6.open b5,
@@ -665,16 +687,23 @@ def render_backtest_report(portfolio_daily: Path, output: Path, title: str = "Po
     def ann(value: np.ndarray) -> float: return float(np.prod(1+value)**(1/years)-1) if years else 0.0
     def vol(value: np.ndarray) -> float: return float(np.std(value,ddof=1)*np.sqrt(252)) if len(value)>1 else 0.0
     net_excess_wealth = float(net_nav[-1] / csi_nav[-1] - 1)
+    active_returns = net - csi
+    excess_curve = np.cumprod(1.0 + active_returns)
+    excess_running_peak = np.maximum.accumulate(excess_curve)
+    excess_drawdown = 1.0 - excess_curve / excess_running_peak
+    excess_annual_return = float(excess_curve[-1] ** (243.0 / len(active_returns)) - 1.0)
+    excess_sharpe = float(np.mean(active_returns) / np.std(active_returns, ddof=1) * np.sqrt(243)) if np.std(active_returns, ddof=1) else None
+    excess_max_drawdown = float(excess_drawdown.max())
+    excess_calmar = excess_annual_return / excess_max_drawdown if excess_max_drawdown > 0 else None
+    composite_score = 0.9 * excess_sharpe + 0.1 * excess_calmar if excess_sharpe is not None and excess_calmar is not None else None
     net_ann = float(net_nav[-1] ** (1 / years) - 1) if years else 0.0
-    metrics={"days":len(frame),"start":str(frame["execution_date"][0]),"end":str(frame["execution_date"][-1]),"gross_total_return":float(gross_nav[-1]-1),"net_total_return":float(net_nav[-1]-1),"csi500_total_return":float(csi_nav[-1]-1),"net_excess_wealth_vs_csi500":net_excess_wealth,"gross_annualized_return":ann(gross),"net_annualized_return":net_ann,"csi500_annualized_return":ann(csi),"net_annualized_excess_vs_csi500":float((net_nav[-1] / csi_nav[-1]) ** (1 / years) - 1) if years else 0.0,"average_daily_active_return_bps":float(np.mean(net-csi)*10_000),"annualized_tracking_error":vol(net-csi),"net_sharpe":net_ann/vol(net) if vol(net) else None,"information_ratio":float(np.mean(net-csi)/np.std(net-csi,ddof=1)*np.sqrt(252)) if np.std(net-csi,ddof=1) else None,"max_drawdown":float(drawdown.min()),"average_buy_turnover":float(frame["buy_turnover"].mean()),"average_sell_turnover":float(frame["sell_turnover"].mean()),"average_fee_bps":float(np.mean(cost)*10_000),"cumulative_fee_paid_on_initial_nav":float(fee[-1]),"average_holding_count":float(frame["holding_count"].mean())}
+    metrics={"days":len(frame),"start":str(frame["execution_date"][0]),"end":str(frame["execution_date"][-1]),"gross_total_return":float(gross_nav[-1]-1),"net_total_return":float(net_nav[-1]-1),"csi500_total_return":float(csi_nav[-1]-1),"net_excess_wealth_vs_csi500":net_excess_wealth,"gross_annualized_return":ann(gross),"net_annualized_return":net_ann,"csi500_annualized_return":ann(csi),"net_annualized_excess_vs_csi500":float((net_nav[-1] / csi_nav[-1]) ** (1 / years) - 1) if years else 0.0,"excess_curve_total_return":float(excess_curve[-1]-1.0),"excess_annual_return_243":excess_annual_return,"excess_sharpe_243":excess_sharpe,"excess_max_drawdown":excess_max_drawdown,"excess_calmar":excess_calmar,"composite_score":composite_score,"average_daily_active_return_bps":float(np.mean(active_returns)*10_000),"annualized_tracking_error":vol(active_returns),"net_sharpe":net_ann/vol(net) if vol(net) else None,"information_ratio":float(np.mean(active_returns)/np.std(active_returns,ddof=1)*np.sqrt(252)) if np.std(active_returns,ddof=1) else None,"max_drawdown":float(drawdown.min()),"average_buy_turnover":float(frame["buy_turnover"].mean()),"average_sell_turnover":float(frame["sell_turnover"].mean()),"average_fee_bps":float(np.mean(cost)*10_000),"cumulative_fee_paid_on_initial_nav":float(fee[-1]),"average_holding_count":float(frame["holding_count"].mean())}
     holdings = summarize_holdings(target_weights) if target_weights else None
     dates=frame["execution_date"].to_list()
     plt.style.use("seaborn-v0_8-whitegrid")
     gross_net_gap = gross_nav - net_nav
     fig,axes=plt.subplots(2,1,figsize=(12,7),sharex=True,gridspec_kw={"height_ratios":[3,1]}); axes[0].plot(dates,gross_nav,label="Gross NAV",lw=1.8,color="#457b9d"); axes[0].plot(dates,net_nav,label="Net NAV",lw=1.8,color="#e76f51"); axes[0].plot(dates,csi_nav,label="CSI500 NAV",lw=1.5,color="#6b7280"); axes[0].fill_between(dates,net_nav,gross_nav,color="#e9c46a",alpha=.35,label="Cost drag"); axes[0].set_title(title+" — NAV and transaction-cost drag"); axes[0].set_ylabel("Initial NAV = 1"); axes[0].legend(ncol=4,fontsize=9); axes[1].plot(dates,gross_net_gap,label="Gross − Net NAV",lw=1.5,color="#e9c46a"); axes[1].plot(dates,fee,label="Cumulative fee paid",lw=1.2,ls="--",color="#9b5de5"); axes[1].set_ylabel("Initial NAV"); axes[1].legend(ncol=2,fontsize=9); fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(output/"nav_and_fee.png",dpi=160); plt.close(fig)
-    excess_nav = net_nav - csi_nav
-    cumulative_active = np.cumsum(net - csi)
-    fig,axes=plt.subplots(2,1,figsize=(12,7),sharex=True,gridspec_kw={"height_ratios":[2,1]}); axes[0].plot(dates,excess_nav,color="#2a9d8f",lw=1.8,label="Net NAV − CSI500 NAV"); axes[0].fill_between(dates,excess_nav,0,color="#2a9d8f",alpha=.18); axes[0].axhline(0,color="#6b7280",lw=.8); axes[0].set_ylabel("Excess NAV (initial NAV)"); axes[0].set_title(title+" — CSI500 excess return / NAV"); axes[0].legend(fontsize=9); axes[1].plot(dates,cumulative_active,color="#457b9d",lw=1.3,label="Cumulative daily active return"); axes[1].axhline(0,color="#6b7280",lw=.8); axes[1].set_ylabel("Sum of active returns"); axes[1].legend(fontsize=9); fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(output/"excess_performance.png",dpi=160); plt.close(fig)
+    fig,axes=plt.subplots(2,1,figsize=(12,7),sharex=True,gridspec_kw={"height_ratios":[2,1]}); axes[0].plot(dates,excess_curve,color="#2a9d8f",lw=1.8,label="Compounded excess curve C(t)"); axes[0].fill_between(dates,excess_curve,1,color="#2a9d8f",alpha=.18); axes[0].axhline(1,color="#6b7280",lw=.8); axes[0].set_ylabel("C(t), initial = 1"); axes[0].set_title(title+" — compounded daily excess vs CSI500"); axes[0].legend(fontsize=9); axes[1].plot(dates,-excess_drawdown,color="#c44e52",lw=1.3,label="Excess-curve drawdown"); axes[1].axhline(0,color="#6b7280",lw=.8); axes[1].set_ylabel("Drawdown"); axes[1].legend(fontsize=9); fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(output/"excess_performance.png",dpi=160); plt.close(fig)
     fig,axes=plt.subplots(2,1,figsize=(12,7),sharex=True); axes[0].plot(dates,drawdown,color="#c44e52",lw=1.2); axes[0].fill_between(dates,drawdown,0,color="#c44e52",alpha=.2); axes[0].set_ylabel("Net drawdown"); axes[0].set_title(title+" — drawdown and turnover"); axes[1].plot(dates,frame["buy_turnover"].to_numpy(),label="Buy turnover",lw=1); axes[1].plot(dates,frame["sell_turnover"].to_numpy(),label="Sell turnover",lw=1); axes[1].bar(dates,cost,label="Fee",alpha=.35,width=1); axes[1].set_ylabel("Fraction of NAV"); axes[1].legend(ncol=3,fontsize=9); fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(output/"drawdown_turnover_fee.png",dpi=160); plt.close(fig)
     def row(key: str, value: object) -> str:
         value = _format_backtest_report_value(key, value)
@@ -692,7 +721,7 @@ def render_backtest_report(portfolio_daily: Path, output: Path, title: str = "Po
 def main(argv: list[str] | None = None) -> None:
     p=argparse.ArgumentParser(prog="quant-predict"); sub=p.add_subparsers(dest="command",required=True)
     def common(x): x.add_argument("--catalog",type=Path,required=True); x.add_argument("--start"); x.add_argument("--end")
-    b=sub.add_parser("build-features"); common(b); b.add_argument("--factor-root",type=Path,required=True); b.add_argument("--feature-root",type=Path,required=True); b.add_argument("--factor-ids-file",type=Path); b.add_argument("--all-factor-artifacts",action="store_true"); b.add_argument("--no-daily-factors",action="store_true"); b.add_argument("--minute-factor-dataset",type=Path,action="append"); b.add_argument("--minute-factor-ids-file",type=Path,action="append"); b.add_argument("--replace",action="store_true")
+    b=sub.add_parser("build-features"); common(b); b.add_argument("--factor-root",type=Path,required=True); b.add_argument("--feature-root",type=Path,required=True); b.add_argument("--factor-ids-file",type=Path); b.add_argument("--all-factor-artifacts",action="store_true"); b.add_argument("--no-daily-factors",action="store_true"); b.add_argument("--minute-factor-dataset",type=Path,action="append"); b.add_argument("--minute-factor-ids-file",type=Path,action="append"); b.add_argument("--index-codes",default="000300.SH,000905.SH"); b.add_argument("--raw-eligible-universe",action="store_true"); b.add_argument("--replace",action="store_true")
     r=sub.add_parser("run-oos"); common(r); r.add_argument("--oos-start"); r.add_argument("--feature-root",type=Path,required=True); r.add_argument("--output",type=Path,required=True); r.add_argument("--models",nargs="+",choices=["lgbm","mlp","transformer"],default=["lgbm"]); r.add_argument("--refit-months",type=int,default=3); r.add_argument("--neural-epochs",type=int,default=20); r.add_argument("--neural-max-samples",type=int,default=60_000); r.add_argument("--max-features",type=int,default=40); r.add_argument("--min-coverage",type=float,default=.85); r.add_argument("--min-abs-icir",type=float,default=.5); r.add_argument("--max-abs-correlation",type=float,default=.90); r.add_argument("--use-all-features",action="store_true",help="train with every feature meeting the coverage and variance requirements")
     d=sub.add_parser("optimize-dual-alpha"); d.add_argument("--predictions",type=Path,required=True); d.add_argument("--output",type=Path,required=True); d.add_argument("--h1-weight",type=float,default=.5); d.add_argument("--turnover-cap",type=float,default=.30); d.add_argument("--temperature",type=float,default=2.0); d.add_argument("--max-weight",type=float,default=.10); d.add_argument("--min-weight",type=float,default=0.0); d.add_argument("--top-fraction",type=float,default=1.0); d.add_argument("--weighting",choices=["softmax","equal"],default="softmax")
     s=sub.add_parser("staggered-top-quantile"); s.add_argument("--predictions",type=Path,required=True); s.add_argument("--output",type=Path,required=True); s.add_argument("--top-fraction",type=float,default=.10); s.add_argument("--holding-days",type=int,default=5)
@@ -714,7 +743,7 @@ def main(argv: list[str] | None = None) -> None:
         minute_id_files = args.minute_factor_ids_file or []
         if len(minute_datasets) != len(minute_id_files): raise ValueError("provide one --minute-factor-ids-file for each --minute-factor-dataset")
         minute_sources = tuple((dataset, read_factor_ids(ids_file)) for dataset, ids_file in zip(minute_datasets, minute_id_files))
-        result=build_features(args.catalog,args.factor_root,args.feature_root,args.start,args.end,args.replace,daily_ids,minute_sources)
+        result=build_features(args.catalog,args.factor_root,args.feature_root,args.start,args.end,args.replace,daily_ids,minute_sources,tuple(args.index_codes.split(",")),args.raw_eligible_universe)
     elif args.command=="run-oos": result=run_oos(args.catalog,args.feature_root,args.output,args.start,args.end,ensemble=EnsembleSettings(tuple(args.models),args.refit_months,args.neural_epochs,args.neural_max_samples),selection=SelectionSettings(args.min_coverage,args.min_abs_icir,args.max_features,args.max_abs_correlation,use_all_features=args.use_all_features),oos_start=args.oos_start)
     elif args.command=="optimize-dual-alpha": result=optimize_dual_alpha_targets(args.predictions,args.output,args.h1_weight,args.turnover_cap,args.temperature,args.max_weight,args.min_weight,args.top_fraction,args.weighting)
     elif args.command=="staggered-top-quantile": result=staggered_top_quantile_targets(args.predictions,args.output,args.top_fraction,args.holding_days)

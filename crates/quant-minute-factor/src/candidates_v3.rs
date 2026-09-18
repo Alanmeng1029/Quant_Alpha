@@ -72,11 +72,11 @@ struct State {
     stocks: HashMap<String, VecDeque<Hist>>,
 }
 #[derive(Clone, Copy)]
-struct Qfq {
+struct DailyPrice {
     open: f64,
     close: f64,
 }
-type QfqMap = HashMap<(String, String), Qfq>;
+type DailyPriceMap = HashMap<(String, String), DailyPrice>;
 
 fn finite(x: f64) -> Option<f64> {
     x.is_finite().then_some(x)
@@ -301,15 +301,17 @@ fn formulas() -> Vec<FactorFormula> {
         .collect()
 }
 
-fn load_qfq(catalog: &Path, calendar: &[String]) -> Result<QfqMap> {
+/// V3's overnight component is intentionally based on unadjusted daily bars.
+/// Corporate-action-adjusted prices remain reserved for labels and accounting.
+fn load_raw_daily(catalog: &Path, calendar: &[String]) -> Result<DailyPriceMap> {
     let conn = duckdb::Connection::open_with_flags(
         catalog,
         duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?,
     )?;
     let start = calendar.first().context("empty calendar")?;
     let end = calendar.last().context("empty calendar")?;
-    let mut out = QfqMap::new();
-    let mut st=conn.prepare("SELECT trade_date::VARCHAR, ts_code, open, close FROM baostock_qfq_daily WHERE trade_date BETWEEN ?::DATE AND ?::DATE AND open>0 AND close>0")?;
+    let mut out = DailyPriceMap::new();
+    let mut st=conn.prepare("SELECT trade_date::VARCHAR, ts_code, open, close FROM daily_aggregated WHERE trade_date BETWEEN ?::DATE AND ?::DATE AND open>0 AND close>0")?;
     for row in st.query_map([start, end], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -319,7 +321,7 @@ fn load_qfq(catalog: &Path, calendar: &[String]) -> Result<QfqMap> {
         ))
     })? {
         let (d, c, o, cl) = row?;
-        out.insert((d, c), Qfq { open: o, close: cl });
+        out.insert((d, c), DailyPrice { open: o, close: cl });
     }
     Ok(out)
 }
@@ -344,6 +346,8 @@ pub fn run(args: BuildArgs) -> Result<PathBuf> {
         "1900-01-01",
         &args.end,
         args.memory_limit_mb,
+        &args.index_codes,
+        args.raw_eligible_universe,
     )?);
     let blocks = Arc::new(pipeline::plan_blocks(
         &ctx.calendar,
@@ -355,12 +359,12 @@ pub fn run(args: BuildArgs) -> Result<PathBuf> {
     if blocks.is_empty() {
         bail!("no market dates")
     };
-    let qfq = Arc::new(load_qfq(&catalog, &ctx.calendar)?);
+    let daily_prices = Arc::new(load_raw_daily(&catalog, &ctx.calendar)?);
     let mut src = BTreeMap::new();
     src.insert("catalog".into(), catalog.display().to_string());
     src.insert("minute_root".into(), root.display().to_string());
-    src.insert("daily_qfq_source".into(), "baostock_qfq_daily".into());
-    src.insert("universe".into(), "dynamic CSI300 union CSI500".into());
+    src.insert("daily_price_source".into(), "daily_aggregated (raw)".into());
+    src.insert("universe".into(), format!("dynamic {}", args.index_codes.join(" union ")));
     let mp = output.join("manifest.json");
     let mut p = manifest::default_parameters(args.block_days, args.jobs, 1, args.memory_limit_mb);
     p.warmup_days = 40;
@@ -387,7 +391,7 @@ pub fn run(args: BuildArgs) -> Result<PathBuf> {
     std::thread::scope(|scope| {
         for _ in 0..args.jobs {
             let ctx = ctx.clone();
-            let qfq = qfq.clone();
+            let daily_prices = daily_prices.clone();
             let blocks = blocks.clone();
             let manifest = manifest.clone();
             let next = next.clone();
@@ -399,7 +403,7 @@ pub fn run(args: BuildArgs) -> Result<PathBuf> {
                 if i >= blocks.len() {
                     break;
                 }
-                if let Err(e) = run_block(&ctx, &qfq, &manifest, &root, &output, &blocks[i]) {
+                if let Err(e) = run_block(&ctx, &daily_prices, &manifest, &root, &output, &blocks[i]) {
                     failures.lock().unwrap().push(format!("block {i}: {e:#}"));
                     break;
                 }
@@ -420,7 +424,7 @@ pub fn run(args: BuildArgs) -> Result<PathBuf> {
 
 fn run_block(
     ctx: &pipeline::MarketContext,
-    qfq: &QfqMap,
+    daily_prices: &DailyPriceMap,
     manifest: &Arc<Mutex<Manifest>>,
     root: &Path,
     output: &Path,
@@ -450,7 +454,7 @@ fn run_block(
         let codes: Vec<_> = day.stocks.iter().map(|x| x.0.clone()).collect();
         let mut raws = HashMap::new();
         for (code, bars) in &day.stocks {
-            let gap = previous_gap(qfq, &ctx.calendar, di, code);
+            let gap = previous_gap(daily_prices, &ctx.calendar, di, code);
             raws.insert(code.clone(), raw(bars, gap));
         }
         let members: Vec<_> = codes
@@ -618,7 +622,7 @@ fn record(m: &Arc<Mutex<Manifest>>, output: &Path, d: &str, s: &str, n: usize) -
     x.save(&output.join("manifest.json"))?;
     Ok(())
 }
-fn previous_gap(q: &QfqMap, cal: &[String], di: usize, c: &str) -> Option<f64> {
+fn previous_gap(q: &DailyPriceMap, cal: &[String], di: usize, c: &str) -> Option<f64> {
     if di == 0 {
         return None;
     };

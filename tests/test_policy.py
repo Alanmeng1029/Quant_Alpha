@@ -1,6 +1,7 @@
 from datetime import date
 
 import polars as pl
+import pytest
 
 from a_share_data.policy import (
     LimitedReplacementConfig,
@@ -56,6 +57,30 @@ def test_unchanged_members_are_not_rebalanced_daily() -> None:
     assert first_weights != second_weights
 
 
+def test_weekly_policy_only_makes_rank_replacements_on_last_signal_of_week() -> None:
+    config = LimitedReplacementConfig(
+        target_holdings=2, entry_rank=2, exit_rank=3, max_daily_replacements=1,
+        max_weight=0.9, rebalance_to_weight=0.8, min_new_weight=0.01,
+        cash_reserve=0.02, daily_buy_budget=0.5, daily_sell_budget=0.5,
+        initial_capital=10_000.0, rebalance_frequency="weekly",
+    )
+    signal_days = [date(2024, 1, day) for day in (1, 2, 3, 4, 5, 8)]
+    execution_days = [date(2024, 1, day) for day in (2, 3, 4, 5, 8, 9)]
+    rows = []
+    for index, (signal, execution) in enumerate(zip(signal_days, execution_days)):
+        ranked = ["A", "B", "C", "D"] if index == 0 else ["C", "D", "A", "B"]
+        rows.extend({"trade_date": signal, "execution_date": execution, "ts_code": code,
+                     "pred_h1": float(4 - rank), "pred_h5": float(4 - rank)}
+                    for rank, code in enumerate(ranked))
+    predictions = pl.DataFrame(rows)
+    quotes = {(day, code): (10.0, 1.0, True) for day in execution_days for code in ("A", "B", "C", "D")}
+    _, orders, _, _, _ = _run_account(
+        predictions, quotes, {day: 100.0 for day in execution_days}, config, 2.1, 7.1)
+    replacements = orders.filter(pl.col("reason") == "rank_exit")
+    assert replacements.height == 1
+    assert replacements["signal_date"].to_list() == [date(2024, 1, 5)]
+
+
 def test_policy_rejects_calendar_day_execution(tmp_path):
     import duckdb
     import pytest
@@ -81,3 +106,26 @@ def test_dynamic_top10_initial_holdings():
     daily, _, _, holdings, _ = _run_account(predictions,quotes,{d:100. for d in days},config,2.1,7.1)
     assert daily['holding_count'][0] == 3
     assert set(holdings['ts_code']) == {'S027','S028','S029'}
+
+
+def test_initial_build_respects_explicit_sleeve_nav_targets():
+    days = [date(2024, 1, 3), date(2024, 1, 4)]
+    codes = ["A", "B", "C", "D"]
+    sleeves = {"A": "500", "B": "500", "C": "1000", "D": "1000"}
+    predictions = pl.DataFrame([
+        {"trade_date": date(2024, 1, 2 + index), "execution_date": day, "ts_code": code,
+         "pred_h1": float(4 - rank), "pred_h5": float(4 - rank), "sleeve": sleeves[code]}
+        for index, day in enumerate(days) for rank, code in enumerate(codes)
+    ])
+    config = LimitedReplacementConfig(
+        target_holdings=4, entry_rank=4, exit_rank=4, max_daily_replacements=1,
+        max_weight=.5, rebalance_to_weight=.45, min_new_weight=.005,
+        initial_capital=100_000, sleeve_nav_targets={"500": .80, "1000": .18},
+        sleeve_target_holdings={"500": 2, "1000": 2},
+    )
+    quotes = {(day, code): (10.0, 1.0, True) for day in days for code in codes}
+    _, _, _, holdings, _ = _run_account(predictions, quotes, {day: 100.0 for day in days}, config, 2.1, 7.1)
+    weights = holdings.with_columns(pl.col("ts_code").replace_strict(sleeves).alias("sleeve")).group_by("sleeve").agg(pl.col("weight").sum())
+    actual = dict(weights.iter_rows())
+    assert actual["500"] == pytest.approx(0.80, abs=.011)
+    assert actual["1000"] == pytest.approx(0.18, abs=.011)

@@ -1,0 +1,13 @@
+{
+  "strategy_id": "csi500_csi1000_raw_candidate_v1",
+  "status": "candidate_shadow",
+  "benchmark": {"index_code": "000905.SH"},
+  "sleeves": {"000905.SH": {"target_holdings": 80, "entry_rank": 80, "exit_rank": 96, "equity_weight": 0.8}, "000852.SH": {"target_holdings": 20, "entry_rank": 20, "exit_rank": 24, "equity_weight": 0.2}},
+  "overlap_priority": "000905.SH",
+  "max_daily_replacements_shared": 3,
+  "cash_reserve": 0.02,
+  "costs_bps": {"buy": 2.1, "sell": 7.1},
+  "lot_size": 100,
+  "max_weight": 0.03,
+  "rebalance_to_weight": 0.028
+}

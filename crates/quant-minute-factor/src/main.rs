@@ -70,6 +70,14 @@ pub(crate) struct BuildArgs {
     /// Factor registry to produce: core24 or ohlcv_candidates_v1.
     #[arg(long, default_value = "core24")]
     pub(crate) factor_set: String,
+    /// Comma-separated point-in-time index membership used for the output
+    /// universe. The raw 500+1000 candidate uses 000905.SH,000852.SH.
+    #[arg(long, value_delimiter = ',', default_value = "000300.SH,000905.SH")]
+    pub(crate) index_codes: Vec<String>,
+    /// Derive membership from index snapshots and raw complete-trading daily
+    /// bars instead of the qfq-backed legacy trading universe.
+    #[arg(long)]
+    pub(crate) raw_eligible_universe: bool,
 }
 
 fn day_file(output: &Path, trade_date: &str) -> PathBuf {
@@ -155,6 +163,8 @@ fn run_build(args: BuildArgs) -> Result<PathBuf> {
         &args.start,
         &args.end,
         args.memory_limit_mb,
+        &args.index_codes,
+        args.raw_eligible_universe,
     )?);
     let blocks = plan_blocks(
         &context.calendar,
@@ -366,7 +376,7 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use crate::schema::{FACTOR_NAMES, N_FACTORS, SESSION_BARS};
-    use arrow::array::{Array as _, Date32Array, Float64Array, RecordBatch, StringArray};
+    use arrow::array::{Array as _, Float64Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use parquet::arrow::ArrowWriter;
     use std::sync::Arc;
@@ -532,6 +542,8 @@ mod tests {
             memory_limit_mb: 2_000,
             replace: false,
             factor_set: "core24".into(),
+            index_codes: vec!["000300.SH".into(), "000905.SH".into()],
+            raw_eligible_universe: false,
         }
     }
 

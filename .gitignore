@@ -23,3 +23,6 @@ research/minute_factor_sources/papers/
 research/minute_factor_sources/reports/hf_stock_factors/
 research/minute_factor_sources/reports/fangzheng_intraday_momentum_overnight_reversal_industry.pdf
 research/minute_factor_sources/metadata/cicc_high_freq_factor_handbook_wechat.html
+
+# Local API credentials.
+/api_credentials.local.json

@@ -1086,6 +1086,8 @@ def cmd_build_catalog(args: argparse.Namespace) -> None:
             SELECT 'trading_universe', min(trade_date), max(trade_date), count(*) FROM trading_universe
             """
         )
+        from .ftshare import register_views
+        register_views(conn, paths)
         print(json.dumps({"catalog": str(paths.catalog), "views": 15}, ensure_ascii=False))
     finally:
         conn.close()
@@ -1234,6 +1236,12 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build and maintain the local A-share minute-data lake")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    from .ftshare import cmd_ingest_ftshare
+    ftshare = subparsers.add_parser("ingest-ftshare", help="Ingest a verified FTShare daily/minute snapshot")
+    add_common_arguments(ftshare)
+    ftshare.add_argument("--source-dir", required=True)
+    ftshare.set_defaults(handler=cmd_ingest_ftshare)
 
     inventory = subparsers.add_parser("inventory", help="Record source-file metadata")
     add_common_arguments(inventory)

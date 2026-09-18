@@ -513,7 +513,7 @@ def run_research_oos(config_path: Path, start_override: str | None = None, end_o
         raise ValueError("existing research output has a different input/configuration fingerprint")
     _write_json(manifest_path, {"fingerprint": fingerprint, "config": config, "feature_manifest": feature_manifest, "source_fingerprints": source_fingerprints, "dependencies": {"lightgbm": lgb.__version__, "python": sys.version, "platform": platform.platform()}})
     files = sorted(feature_root.glob("year=*/features.parquet")); features = pl.concat([pl.read_parquet(path) for path in files]).with_columns(pl.col("trade_date").cast(pl.Date)).filter(~pl.col("ts_code").is_in(INFEASIBLE_EXECUTION_CODES))
-    labels = build_labels(catalog)
+    labels = build_labels(catalog, universe_index_codes=tuple(config.get("universe_index_codes", ("000300.SH", "000905.SH"))), raw_eligible_universe=bool(config.get("raw_eligible_universe", False)))
     panel = standardize_features(features, factor_ids).join(labels, on=["trade_date", "ts_code"], how="left")
     dates = _date_strings(panel); windows = quarter_windows(dates, start, end)
     if not windows: raise ValueError("no valid quarterly windows in requested OOS range")

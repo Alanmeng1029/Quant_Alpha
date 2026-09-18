@@ -42,6 +42,10 @@ class LimitedReplacementConfig:
     buy_bps: float = 2.1
     sell_bps: float = 7.1
     target_fraction: float | None = None
+    rebalance_frequency: str = "daily"
+    sleeve_nav_targets: dict[str, float] | None = None
+    sleeve_target_holdings: dict[str, int] | None = None
+    sleeve_rebalance_tolerance: float = 0.0025
 
     def validate(self) -> None:
         if self.target_fraction is not None and not 0 < self.target_fraction <= 1:
@@ -56,8 +60,23 @@ class LimitedReplacementConfig:
             raise ValueError("min_new_weight must not exceed rebalance_to_weight")
         if not (0 <= self.cash_reserve < 1 and 0 < self.daily_buy_budget <= 1 and 0 < self.daily_sell_budget <= 1):
             raise ValueError("invalid cash reserve or daily budgets")
-        if not (0 <= self.h1_weight <= 1 and self.entry_sizing in {"equal", "rank_tilt"} and 0 <= self.rank_tilt < 1 and self.lot_size > 0 and self.initial_capital > 0 and self.buy_bps >= 0 and self.sell_bps >= 0):
+        if not (0 <= self.h1_weight <= 1 and self.entry_sizing in {"equal", "rank_tilt", "cash_balanced"} and 0 <= self.rank_tilt < 1 and self.lot_size > 0 and self.initial_capital > 0 and self.buy_bps >= 0 and self.sell_bps >= 0):
             raise ValueError("invalid execution parameters")
+        if self.rebalance_frequency not in {"daily", "weekly"}:
+            raise ValueError("rebalance_frequency must be daily or weekly")
+        if (self.sleeve_nav_targets is None) != (self.sleeve_target_holdings is None):
+            raise ValueError("sleeve targets and holding counts must be configured together")
+        if self.sleeve_nav_targets is not None:
+            if set(self.sleeve_nav_targets) != set(self.sleeve_target_holdings or {}):
+                raise ValueError("sleeve target keys must match")
+            if any(value <= 0 for value in self.sleeve_nav_targets.values()):
+                raise ValueError("sleeve NAV targets must be positive")
+            if sum(self.sleeve_nav_targets.values()) > 1.0 - self.cash_reserve + 1e-12:
+                raise ValueError("sleeve NAV targets exceed investable NAV")
+            if sum((self.sleeve_target_holdings or {}).values()) != self.target_holdings:
+                raise ValueError("sleeve holding counts must sum to target_holdings")
+            if self.sleeve_rebalance_tolerance < 0:
+                raise ValueError("sleeve rebalance tolerance must be non-negative")
 
 
 def _fingerprint(path: Path) -> str:
@@ -166,6 +185,13 @@ def _run_account(predictions: pl.DataFrame, quotes: dict[tuple[date, str], tuple
     # The final signal has no next opening price to mark the account.  It is
     # therefore intentionally not traded in this open-to-open simulation.
     base_config = config
+    weekly_rebalance_dates: set[date] = set()
+    if base_config.rebalance_frequency == "weekly":
+        by_week: dict[tuple[int, int], date] = {}
+        for signal_date, _, _ in valid_days[:-1]:
+            calendar = signal_date.isocalendar()
+            by_week[(calendar.year, calendar.week)] = signal_date
+        weekly_rebalance_dates = set(by_week.values())
     for day_index, (signal_date, execution_day, raw_frame) in enumerate(valid_days[:-1]):
         if base_config.target_fraction is not None:
             count = max(1, int(np.ceil(raw_frame.height * base_config.target_fraction)))
@@ -174,6 +200,7 @@ def _run_account(predictions: pl.DataFrame, quotes: dict[tuple[date, str], tuple
                              max_daily_replacements=min(count, base_config.max_daily_replacements))
         frame = _score_frame(raw_frame, config.h1_weight)
         ranks = dict(frame.select("ts_code", "rank").iter_rows())
+        sleeve_by_code = dict(frame.select("ts_code", "sleeve").iter_rows()) if "sleeve" in frame.columns else {}
         signal_codes = set(frame.get_column("ts_code").to_list())
         quotes_today = {code: quotes[(execution_day, code)] for code in set(shares) | signal_codes if (execution_day, code) in quotes}
         for code, quantity in list(shares.items()):
@@ -215,15 +242,21 @@ def _run_account(predictions: pl.DataFrame, quotes: dict[tuple[date, str], tuple
             order_rows.append(event); execution_rows.append(event.copy())
             return True
 
-        def buy(code: str, reason: str) -> bool:
+        def buy(code: str, reason: str, requested_notional: float | None = None, exact_amount: bool = False) -> bool:
             nonlocal cash, bought, transaction_cost, buy_budget
             quote = quotes_today.get(code)
             if not quote or not quote[2]:
                 order_rows.append({"signal_date": signal_date, "execution_date": execution_day, "ts_code": code, "side": "buy", "reason": reason, "status": "unfilled", "shares": None, "notional": None, "budget_exception": False})
                 return False
             price = quote[0]
-            reference = equity * (1.0 - config.cash_reserve) / config.target_holdings
-            if config.entry_sizing == "rank_tilt":
+            sleeve = sleeve_by_code.get(code)
+            if config.sleeve_nav_targets and sleeve in config.sleeve_nav_targets:
+                reference = equity * config.sleeve_nav_targets[sleeve] / config.sleeve_target_holdings[sleeve]
+            else:
+                reference = equity * (1.0 - config.cash_reserve) / config.target_holdings
+            if exact_amount:
+                reference = max(0.0, requested_notional or 0.0)
+            elif config.entry_sizing == "rank_tilt":
                 # A bounded, mean-one tilt: rank 1 receives 1 + tilt times
                 # the equal entry amount, rank 80 receives 1 - tilt.  It
                 # uses score strength only when opening a position, so it
@@ -231,12 +264,16 @@ def _run_account(predictions: pl.DataFrame, quotes: dict[tuple[date, str], tuple
                 denominator = max(config.entry_rank - 1, 1)
                 rank_fraction = (ranks.get(code, config.entry_rank) - 1) / denominator
                 reference *= 1.0 + config.rank_tilt * (1.0 - 2.0 * rank_fraction)
+            if requested_notional is not None and not exact_amount:
+                reference = max(reference, min(requested_notional, equity * config.max_weight))
             # The reserve is a hard account constraint, rather than merely a
             # reference sizing convention.  In particular, lot rounding and
             # rank tilts must not quietly consume it during the initial build.
             affordable = max(0.0, cash - equity * config.cash_reserve) / (1.0 + buy_bps / 10_000)
-            minimum = equity * config.min_new_weight
-            notional = min(max(reference, minimum), affordable, buy_budget)
+            minimum = 0.0 if exact_amount and code in shares else equity * config.min_new_weight
+            current_value = shares.get(code, 0.0) * price
+            cap_room = max(0.0, equity * config.max_weight - current_value)
+            notional = min(max(reference, minimum), affordable, buy_budget, cap_room)
             quantity = _round_lot(notional, price, config.lot_size)
             notional = quantity * price
             if notional < minimum - 1e-8:
@@ -273,10 +310,12 @@ def _run_account(predictions: pl.DataFrame, quotes: dict[tuple[date, str], tuple
                 sell(code, max(shares[code] - desired, 0.0), "single_name_cap", budget_exception=True)
 
         current_codes = set(shares)
+        rebalance_today = (first or base_config.rebalance_frequency == "daily" or
+                           signal_date in weekly_rebalance_dates)
         if first:
             buy_list = [code for code in frame.get_column("ts_code").to_list()[:config.target_holdings] if code not in current_codes]
             buy_reason = "initial_top_rank"
-        else:
+        elif rebalance_today:
             normal_sells, normal_buys = _desired_replacements(frame.get_column("ts_code").to_list(), current_codes, config)
             # Constituents forced out of the pool consume the same five-entry
             # capacity as ordinary replacements.  Reserve those slots first;
@@ -296,8 +335,79 @@ def _run_account(predictions: pl.DataFrame, quotes: dict[tuple[date, str], tuple
             fill_candidates = [code for code in frame.get_column("ts_code").to_list()[:config.entry_rank] if code not in current_codes and code not in replacements]
             buy_list = replacements + fill_candidates[:max(0, min(config.max_daily_replacements - len(replacements), vacancies))]
             buy_reason = "rank_entry"
-        for code in buy_list:
-            buy(code, buy_reason)
+        else:
+            buy_list = []
+            buy_reason = "weekly_hold"
+        for position, code in enumerate(buy_list):
+            requested_notional = None
+            if not first and config.entry_sizing == "cash_balanced":
+                # Recycle sale proceeds instead of letting gains from exited
+                # positions accumulate permanently as idle cash.  Spread the
+                # deployable cash over today's remaining admitted names, with
+                # the declared single-name cap as a hard ceiling.
+                # Include vacancies that cannot be filled today because of
+                # the shared replacement limit.  Dividing only by today's
+                # buy list overfunds the first few names after a batch index
+                # rebalance and leaves no cash for the deferred refills.
+                deployable = max(0.0, cash - equity * config.cash_reserve) / (1.0 + buy_bps / 10_000)
+                sleeve = sleeve_by_code.get(code)
+                if config.sleeve_nav_targets and sleeve in config.sleeve_nav_targets:
+                    sleeve_codes = [held for held in shares if sleeve_by_code.get(held) == sleeve]
+                    sleeve_value = sum(shares[held] * quotes_today[held][0] for held in sleeve_codes if held in quotes_today)
+                    sleeve_capacity = max(0.0, equity * config.sleeve_nav_targets[sleeve] - sleeve_value)
+                    sleeve_vacancies = max(1, config.sleeve_target_holdings[sleeve] - len(sleeve_codes))
+                    requested_notional = min(deployable, sleeve_capacity) / sleeve_vacancies
+                else:
+                    remaining = max(config.target_holdings - len(shares), len(buy_list) - position)
+                    requested_notional = deployable / remaining if remaining else None
+            buy(code, buy_reason, requested_notional)
+
+        if config.sleeve_nav_targets:
+            # Keep the capital sleeves close to their declared NAV weights.
+            # Partial sizing trades do not change the selected stock list.
+            tolerance_value = equity * config.sleeve_rebalance_tolerance
+
+            def sleeve_codes(name: str) -> list[str]:
+                return [code for code in shares if sleeve_by_code.get(code) == name and code in quotes_today]
+
+            def sleeve_value(name: str) -> float:
+                return sum(shares[code] * quotes_today[code][0] for code in sleeve_codes(name))
+
+            # Trim an overweight sleeve first so its proceeds can fund the
+            # underweight sleeve without consuming the cash reserve.
+            for sleeve, target_weight in sorted(config.sleeve_nav_targets.items()):
+                excess = sleeve_value(sleeve) - equity * target_weight
+                if excess <= tolerance_value:
+                    continue
+                for code in sorted(sleeve_codes(sleeve), key=lambda item: (-ranks.get(item, config.entry_rank + 1), item)):
+                    if excess <= tolerance_value:
+                        break
+                    price = quotes_today[code][0]
+                    sellable = max(0.0, shares[code] - config.lot_size)
+                    quantity = min(sellable, _round_lot(excess, price, config.lot_size))
+                    if quantity > 0 and sell(code, quantity, "sleeve_weight_rebalance", budget_exception=True):
+                        excess -= quantity * price
+
+            # Deploy available cash into the underweight sleeve, starting with
+            # its most underweight selected names.  The 10% daily buy budget
+            # and the 3% single-name cap remain effective.
+            for sleeve, target_weight in sorted(config.sleeve_nav_targets.items()):
+                deficit = equity * target_weight - sleeve_value(sleeve)
+                if deficit <= tolerance_value or buy_budget <= 0:
+                    continue
+                target_per_name = equity * target_weight / config.sleeve_target_holdings[sleeve]
+                candidates = []
+                for code in sleeve_codes(sleeve):
+                    current_value = shares[code] * quotes_today[code][0]
+                    candidates.append((max(0.0, target_per_name - current_value), ranks.get(code, config.entry_rank + 1), code))
+                for gap, _, code in sorted(candidates, key=lambda row: (-row[0], row[1], row[2])):
+                    if deficit <= tolerance_value or cash <= equity * config.cash_reserve or buy_budget <= 0:
+                        break
+                    amount = min(deficit, max(gap, equity * config.sleeve_rebalance_tolerance))
+                    before = bought
+                    if buy(code, "sleeve_weight_rebalance", amount, exact_amount=True):
+                        filled = bought - before
+                        deficit -= filled
 
         # Mark to the next executable open and keep a record of actual shares.
         next_execution = valid_days[day_index + 1][1]

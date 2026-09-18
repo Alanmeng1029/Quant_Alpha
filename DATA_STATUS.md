@@ -3,6 +3,15 @@
 更新时间：2026-08-30。本文记录本地 `A_stock_database` 的真实建设状态；
 `daily_aggregated` 均由分钟数据聚合，不应称作交易所官方日线。
 
+## 2026-09-17 增量接入：FTShare
+
+已在同一 DuckDB 目录接入 FTShare 单日快照：5,208 只股票、1,255,128 条分钟线、
+5,208 条供应商日线；查询的 5,220 只股票中，12 只无行情且均有停牌记录。
+新数据在 `canonical/ftshare/trade_date=2026-09-17/`，统一查询使用
+`market_minute_bars` / `market_daily_aggregated`；供应商日线使用 `ftshare_daily_bars`。
+原研究基线、观察日历和回测股票池未变更。8 月 28 日至 9 月 17 日之间尚有数据缺口，
+新日期缺少复权与基准配套数据。详情和复现命令见 [FTShare 接入说明](docs/ftshare_ingestion.md)。
+
 ## 已完成
 
 | 数据集 / DuckDB 视图 | 覆盖与规模 | 主要来源 | 用途与备注 |

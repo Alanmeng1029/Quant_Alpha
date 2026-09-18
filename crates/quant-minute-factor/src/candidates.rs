@@ -506,6 +506,8 @@ pub fn run(args: BuildArgs) -> Result<PathBuf> {
         &args.start,
         &args.end,
         args.memory_limit_mb,
+        &args.index_codes,
+        args.raw_eligible_universe,
     )?);
     let blocks = pipeline::plan_blocks(&ctx.calendar, &args.start, &args.end, args.block_days, 20);
     if blocks.is_empty() {

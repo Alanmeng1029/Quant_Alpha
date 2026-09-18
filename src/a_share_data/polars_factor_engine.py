@@ -160,11 +160,18 @@ def load_calendar_panel(
     start: str | None = None,
     end: str | None = None,
     lookback_sessions: int = 0,
+    price_basis: str = "qfq",
 ) -> pl.LazyFrame:
-    """Read valid qfq bars and expand to a calendar-aligned long panel."""
+    """Read one price basis and expand to a calendar-aligned long panel."""
+    if price_basis not in {"qfq", "raw"}:
+        raise ValueError("price_basis must be qfq or raw")
+    source = "daily_qfq q" if price_basis == "qfq" else "daily_aggregated q"
+    fields = ("q.qfq_open, q.qfq_high, q.qfq_low, q.qfq_close, q.qfq_vwap" if price_basis == "qfq"
+              else "q.open AS qfq_open, q.high AS qfq_high, q.low AS qfq_low, q.close AS qfq_close, q.amount_cny/nullif(q.volume_share,0) AS qfq_vwap")
+    price_prefix = "q.qfq_" if price_basis == "qfq" else "q."
     clauses = [
-        "q.qfq_open > 0", "q.qfq_high > 0", "q.qfq_low > 0",
-        "q.qfq_close > 0", "q.volume_share >= 0",
+        f"{price_prefix}open > 0", f"{price_prefix}high > 0", f"{price_prefix}low > 0",
+        f"{price_prefix}close > 0", "q.volume_share > 0",
     ]
     if end:
         clauses.append(f"q.trade_date <= DATE '{end}'")
@@ -185,9 +192,8 @@ def load_calendar_panel(
         if effective_start:
             clauses.append(f"q.trade_date >= DATE '{effective_start}'")
         bars = pl.from_arrow(connection.execute(
-            "SELECT q.trade_date, q.ts_code, q.qfq_open, q.qfq_high, q.qfq_low, "
-            "q.qfq_close, q.qfq_vwap, q.volume_share "
-            "FROM daily_qfq q WHERE " + " AND ".join(clauses)
+            "SELECT q.trade_date, q.ts_code, " + fields + ", q.volume_share "
+            "FROM " + source + " WHERE " + " AND ".join(clauses)
         ).arrow())
         calendar_where = ["is_observed_market_day"]
         if effective_start:
