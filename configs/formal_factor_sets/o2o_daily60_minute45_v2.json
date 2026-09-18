@@ -10,7 +10,10 @@
   "daily_component": {
     "count": 60,
     "factor_ids_file": "configs/candidate_factors_daily_o2o_candidate60.txt",
-    "artifact_root": "A_stock_database/lake/derived/factors"
+    "artifact_root": "A_stock_database/lake/derived/factors",
+    "price_basis": "qfq",
+    "artifact_policy": "frozen_production_snapshot",
+    "artifact_set_sha256": "eb097bf9b74ee053f5338873696444dd94eb2ea667772f38c901072305347dd9"
   },
   "minute_components": [
     {
@@ -31,6 +34,15 @@
   ],
   "active_feature_cache": "A_stock_database/lake/derived/predict_features_o2o_daily60_minute45_v2",
   "active_prediction": "results/predict/research-oos-daily60-minute45-v2/predictions/lgbm_default105.parquet",
+  "rust_baseline_reproduction": {
+    "training_universe": ["000300.SH", "000905.SH"],
+    "portfolio_universe": "000905.SH",
+    "feature_cache": "A_stock_database/lake/derived/predict_features_o2o_daily60_minute45_v2",
+    "result_root": "results/predict/research-oos-qfq-old105-csi300-csi500-rust-raw-universe-v2",
+    "excess_sharpe_243": 1.0644551885118596,
+    "excess_curve_total_return": 0.6043191321443393,
+    "validated_through": "2026-08-28"
+  },
   "strategy": "limited_replacement_v2",
   "active_strategy_config": "configs/production_strategy_csi500_top100_v1.json"
 }
