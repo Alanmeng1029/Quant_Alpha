@@ -1391,6 +1391,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "quant-lgbm-train"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "duckdb",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "quant-minute-factor"
 version = "0.1.0"
 dependencies = [

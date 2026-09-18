@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use duckdb::{AccessMode, Config, Connection};
 use serde::Serialize;
@@ -27,6 +27,28 @@ struct Args {
     csi500_turnover: f64,
     #[arg(long, default_value_t = 0.02)]
     csi1000_turnover: f64,
+    /// Rank beyond which a CSI500 holding leaves in buffer mode.
+    #[arg(long, default_value_t = 120)]
+    csi500_exit_rank: usize,
+    /// Rank beyond which a CSI1000 holding leaves in buffer mode.
+    #[arg(long, default_value_t = 1000)]
+    csi1000_exit_rank: usize,
+    /// Exponential smoothing weight on today's standardized joint score.
+    /// One disables smoothing; 0.5 gives a roughly three-day memory.
+    #[arg(long, default_value_t = 1.0)]
+    score_ema_alpha: f64,
+    /// Prediction-only dates used to initialize the EMA before trading.
+    #[arg(long, default_value_t = 0)]
+    ema_warmup_days: usize,
+    /// Number of trading days over which the initial portfolio is phased in.
+    #[arg(long, default_value_t = 1)]
+    initial_build_days: usize,
+    /// Consecutive dates beyond the exit rank required before replacement.
+    #[arg(long, default_value_t = 1)]
+    exit_confirm_days: usize,
+    /// Minimum smoothed-score improvement required for a rank replacement.
+    #[arg(long, default_value_t = 0.0)]
+    replacement_score_margin: f64,
     #[arg(long, default_value_t = 2.1)]
     buy_bps: f64,
     #[arg(long, default_value_t = 7.1)]
@@ -37,6 +59,10 @@ struct Args {
     csi500_weight: f64,
     #[arg(long, default_value_t = 10_000_000.0)]
     initial_capital: f64,
+    /// DuckDB working-memory cap for scans and sorts. Rust-owned portfolio
+    /// state is outside this limit.
+    #[arg(long, default_value_t = 2048)]
+    memory_limit_mb: usize,
     #[arg(long, default_value = "independent")]
     selection_mode: String,
     #[arg(long, default_value_t = 3)]
@@ -64,13 +90,22 @@ struct DayTarget {
     next_execution: String,
     codes: BTreeSet<String>,
 }
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct AccountSummary {
     total_return: f64,
     average_buy_turnover: f64,
     average_sell_turnover: f64,
     average_cash_weight: f64,
     average_holding_count: f64,
+}
+#[derive(Clone, Serialize)]
+struct AnnualMetrics {
+    days: usize,
+    total_return: f64,
+    csi500_return: f64,
+    excess_curve_return: f64,
+    excess_sharpe_243: f64,
+    average_buy_turnover: f64,
 }
 #[derive(Serialize)]
 struct Metrics {
@@ -91,6 +126,9 @@ struct Metrics {
     average_holding_count: f64,
     csi500: AccountSummary,
     csi1000: AccountSummary,
+    annual: BTreeMap<String, AnnualMetrics>,
+    csi500_annual: BTreeMap<String, AnnualMetrics>,
+    csi1000_annual: BTreeMap<String, AnnualMetrics>,
 }
 #[derive(Clone)]
 struct Daily {
@@ -110,9 +148,39 @@ struct Daily {
 fn sql_quote(path: &Path) -> String {
     path.to_string_lossy().replace(char::from(39), "''")
 }
-fn open(catalog: &Path) -> Result<Connection> {
+fn date_id(value: &str) -> u32 {
+    value
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .fold(0_u32, |acc, digit| acc * 10 + u32::from(digit - b'0'))
+}
+fn code_id(value: &str) -> u32 {
+    let number = value
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .fold(0_u32, |acc, digit| acc * 10 + u32::from(digit - b'0'));
+    let exchange = if value.ends_with(".SH") {
+        1_u32
+    } else if value.ends_with(".SZ") {
+        2_u32
+    } else if value.ends_with(".BJ") {
+        3_u32
+    } else {
+        0_u32
+    };
+    number | (exchange << 20)
+}
+fn quote_key(day: &str, code: &str) -> u64 {
+    (u64::from(date_id(day)) << 32) | u64::from(code_id(code))
+}
+fn open(catalog: &Path, memory_limit_mb: usize) -> Result<Connection> {
     let cfg = Config::default().access_mode(AccessMode::ReadOnly)?;
-    Ok(Connection::open_with_flags(catalog, cfg)?)
+    let conn = Connection::open_with_flags(catalog, cfg)?;
+    conn.execute_batch(&format!(
+        "SET threads=1; SET memory_limit='{}MB'; SET preserve_insertion_order=false;",
+        memory_limit_mb.max(256)
+    ))?;
+    Ok(conn)
 }
 fn population_z(values: &[f64]) -> Vec<f64> {
     let mean = values.iter().sum::<f64>() / values.len() as f64;
@@ -173,6 +241,106 @@ fn choose(
         held.remove(&old);
         held.insert(new_code);
         remaining -= 1;
+    }
+}
+
+/// Apply entry/exit rank hysteresis without a separate replacement quota.
+/// Every holding beyond `exit_rank` leaves, then vacancies are filled from
+/// the current top-ranked names. Constituent exits are handled by `retain`.
+fn choose_buffer(
+    ranked: &[String],
+    members: &HashMap<String, String>,
+    sleeve: &str,
+    held: &mut BTreeSet<String>,
+    target: usize,
+    exit_rank: usize,
+) {
+    held.retain(|c| members.get(c).map(String::as_str) == Some(sleeve));
+    let sleeve_ranked: Vec<&String> = ranked
+        .iter()
+        .filter(|c| members.get(*c).map(String::as_str) == Some(sleeve))
+        .collect();
+    let ranks: HashMap<&str, usize> = sleeve_ranked
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.as_str(), i + 1))
+        .collect();
+    held.retain(|c| ranks.get(c.as_str()).copied().unwrap_or(usize::MAX) <= exit_rank);
+    for code in sleeve_ranked {
+        if held.len() >= target {
+            break;
+        }
+        held.insert(code.clone());
+    }
+}
+
+fn choose_adaptive_buffer(
+    ranked: &[(String, f64)],
+    members: &HashMap<String, String>,
+    sleeve: &str,
+    held: &mut BTreeSet<String>,
+    outside_days: &mut HashMap<String, usize>,
+    target: usize,
+    exit_rank: usize,
+    confirm_days: usize,
+    score_margin: f64,
+) {
+    held.retain(|c| members.get(c).map(String::as_str) == Some(sleeve));
+    outside_days.retain(|c, _| held.contains(c));
+    let sleeve_ranked: Vec<&(String, f64)> = ranked
+        .iter()
+        .filter(|(c, _)| members.get(c).map(String::as_str) == Some(sleeve))
+        .collect();
+    let ranks: HashMap<&str, usize> = sleeve_ranked
+        .iter()
+        .enumerate()
+        .map(|(i, (c, _))| (c.as_str(), i + 1))
+        .collect();
+    let scores: HashMap<&str, f64> = sleeve_ranked
+        .iter()
+        .map(|(c, score)| (c.as_str(), *score))
+        .collect();
+    for code in held.iter() {
+        if ranks.get(code.as_str()).copied().unwrap_or(usize::MAX) > exit_rank {
+            *outside_days.entry(code.clone()).or_default() += 1;
+        } else {
+            outside_days.remove(code);
+        }
+    }
+    let mut eligible = held
+        .iter()
+        .filter(|code| outside_days.get(*code).copied().unwrap_or(0) >= confirm_days)
+        .map(|code| {
+            (
+                ranks.get(code.as_str()).copied().unwrap_or(usize::MAX),
+                code.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    eligible.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    for (_, old) in eligible {
+        let Some((new, new_score)) = sleeve_ranked
+            .iter()
+            .find_map(|(code, score)| (!held.contains(code)).then_some((code.as_str(), *score)))
+        else {
+            break;
+        };
+        let old_score = scores
+            .get(old.as_str())
+            .copied()
+            .unwrap_or(f64::NEG_INFINITY);
+        if new_score - old_score < score_margin {
+            continue;
+        }
+        held.remove(&old);
+        outside_days.remove(&old);
+        held.insert(new.to_string());
+    }
+    for (code, _) in sleeve_ranked {
+        if held.len() >= target {
+            break;
+        }
+        held.insert(code.clone());
     }
 }
 
@@ -281,10 +449,12 @@ fn load_inputs(
     HashMap<String, String>,
     HashMap<String, HashMap<String, String>>,
 )> {
-    let conn = open(&args.catalog)?;
+    let conn = open(&args.catalog, args.memory_limit_mb)?;
     let pred_path = sql_quote(&args.predictions);
     let mut preds = BTreeMap::<String, Vec<Prediction>>::new();
-    let query=format!("SELECT trade_date::VARCHAR,execution_date::VARCHAR,ts_code,pred_h1::DOUBLE,pred_h5::DOUBLE FROM read_parquet('{pred_path}') WHERE execution_date IS NOT NULL AND isfinite(pred_h1) AND isfinite(pred_h5) ORDER BY 1,3");
+    let query = format!(
+        "SELECT trade_date::VARCHAR,execution_date::VARCHAR,ts_code,pred_h1::DOUBLE,pred_h5::DOUBLE FROM read_parquet('{pred_path}') WHERE execution_date IS NOT NULL AND isfinite(pred_h1) AND isfinite(pred_h5) ORDER BY 1,3"
+    );
     let mut stmt = conn.prepare(&query)?;
     let rows = stmt.query_map([], |r| {
         Ok((
@@ -330,7 +500,9 @@ fn load_inputs(
     }
     let mut membership = HashMap::new();
     for d in &days {
-        let r = raw.get(d).context("missing point-in-time membership")?;
+        // Consume one date at a time so the verbose source representation and
+        // compact sleeve map do not coexist for the full backtest window.
+        let r = raw.remove(d).context("missing point-in-time membership")?;
         let mut m = HashMap::new();
         if let Some(x) = r.get(CSI500) {
             for c in x {
@@ -358,6 +530,9 @@ fn build_targets(
     let mut h1000 = BTreeSet::new();
     let mut t500 = Vec::new();
     let mut t1000 = Vec::new();
+    let mut smoothed_scores = HashMap::<String, f64>::new();
+    let mut outside500 = HashMap::<String, usize>::new();
+    let mut outside1000 = HashMap::<String, usize>::new();
     for (i, day) in days.iter().enumerate() {
         let p = &preds[day];
         let m = &membership[day];
@@ -369,26 +544,76 @@ fn build_targets(
             .iter()
             .enumerate()
             .filter(|(_, x)| m.contains_key(&x.code))
-            .map(|(j, x)| (x.code.clone(), 0.5 * z1[j] + 0.5 * z5[j]))
+            .map(|(j, x)| {
+                let current = 0.5 * z1[j] + 0.5 * z5[j];
+                let smooth = smoothed_scores
+                    .get(&x.code)
+                    .map(|previous| {
+                        args.score_ema_alpha * current + (1.0 - args.score_ema_alpha) * previous
+                    })
+                    .unwrap_or(current);
+                smoothed_scores.insert(x.code.clone(), smooth);
+                (x.code.clone(), smooth)
+            })
             .collect();
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let ranked: Vec<String> = ranked.into_iter().map(|x| x.0).collect();
-        if i == 0 {
+        if i < args.ema_warmup_days {
+            continue;
+        }
+        let active_day = i - args.ema_warmup_days;
+        let ranked_codes: Vec<String> = ranked.iter().map(|x| x.0.clone()).collect();
+        if active_day < args.initial_build_days {
+            let build_step = active_day + 1;
+            let target500 = (args.csi500_holdings * build_step).div_ceil(args.initial_build_days);
+            let target1000 = (args.csi1000_holdings * build_step).div_ceil(args.initial_build_days);
+            choose(&ranked_codes, m, CSI500, &mut h500, target500, target500);
             choose(
+                &ranked_codes,
+                m,
+                CSI1000,
+                &mut h1000,
+                target1000,
+                target1000,
+            );
+        } else if args.selection_mode == "adaptive-buffer" {
+            choose_adaptive_buffer(
                 &ranked,
                 m,
                 CSI500,
                 &mut h500,
+                &mut outside500,
                 args.csi500_holdings,
-                args.csi500_holdings,
+                args.csi500_exit_rank,
+                args.exit_confirm_days,
+                args.replacement_score_margin,
             );
-            choose(
+            choose_adaptive_buffer(
                 &ranked,
                 m,
                 CSI1000,
                 &mut h1000,
+                &mut outside1000,
                 args.csi1000_holdings,
+                args.csi1000_exit_rank,
+                args.exit_confirm_days,
+                args.replacement_score_margin,
+            );
+        } else if args.selection_mode == "buffer" {
+            choose_buffer(
+                &ranked_codes,
+                m,
+                CSI500,
+                &mut h500,
+                args.csi500_holdings,
+                args.csi500_exit_rank,
+            );
+            choose_buffer(
+                &ranked_codes,
+                m,
+                CSI1000,
+                &mut h1000,
                 args.csi1000_holdings,
+                args.csi1000_exit_rank,
             );
         } else if args.selection_mode == "shared" {
             let slots = if i % args.rebalance_every == 0 {
@@ -397,7 +622,7 @@ fn build_targets(
                 0
             };
             choose_shared(
-                &ranked,
+                &ranked_codes,
                 m,
                 &mut h500,
                 &mut h1000,
@@ -423,7 +648,7 @@ fn build_targets(
                 0
             };
             choose(
-                &ranked,
+                &ranked_codes,
                 m,
                 CSI500,
                 &mut h500,
@@ -431,7 +656,7 @@ fn build_targets(
                 slots500,
             );
             choose(
-                &ranked,
+                &ranked_codes,
                 m,
                 CSI1000,
                 &mut h1000,
@@ -477,8 +702,8 @@ fn load_market(
     args: &Args,
     start: &str,
     end: &str,
-) -> Result<(HashMap<(String, String), Quote>, HashMap<String, f64>)> {
-    let conn = open(&args.catalog)?;
+) -> Result<(HashMap<u64, Quote>, HashMap<u32, f64>)> {
+    let conn = open(&args.catalog, args.memory_limit_mb)?;
     let pred = sql_quote(&args.predictions);
     let sql = format!(
         r#"SELECT d.trade_date::VARCHAR,d.ts_code,d.open::DOUBLE,d.qfq_open/d.open,
@@ -499,7 +724,7 @@ fn load_market(
     })? {
         let (d, c, o, ratio, tradable) = row?;
         quotes.insert(
-            (d, c),
+            quote_key(&d, &c),
             Quote {
                 raw_open: o,
                 ratio,
@@ -507,20 +732,22 @@ fn load_market(
             },
         );
     }
-    let sql=format!("SELECT trade_date::VARCHAR,open::DOUBLE FROM index_daily WHERE index_code='{CSI500}' AND trade_date BETWEEN DATE '{start}' AND DATE '{end}' AND open>0");
+    let sql = format!(
+        "SELECT trade_date::VARCHAR,open::DOUBLE FROM index_daily WHERE index_code='{CSI500}' AND trade_date BETWEEN DATE '{start}' AND DATE '{end}' AND open>0"
+    );
     let mut bench = HashMap::new();
     let mut stmt = conn.prepare(&sql)?;
     for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))? {
         let (d, o) = row?;
-        bench.insert(d, o);
+        bench.insert(date_id(&d), o);
     }
     Ok((quotes, bench))
 }
 
 fn account(
     targets: &[DayTarget],
-    quotes: &HashMap<(String, String), Quote>,
-    benchmark: &HashMap<String, f64>,
+    quotes: &HashMap<u64, Quote>,
+    benchmark: &HashMap<u32, f64>,
     initial: f64,
     n: usize,
     max_weight: f64,
@@ -535,7 +762,7 @@ fn account(
     let mut out = Vec::new();
     for target in targets {
         for (c, q) in shares.clone() {
-            if let Some(x) = quotes.get(&(target.execution.clone(), c.clone())) {
+            if let Some(x) = quotes.get(&quote_key(&target.execution, &c)) {
                 if let Some(old) = ratios.get(&c) {
                     shares.insert(c.clone(), q * x.ratio / old);
                 }
@@ -547,7 +774,7 @@ fn account(
                 .iter()
                 .map(|(c, q)| {
                     quotes
-                        .get(&(target.execution.clone(), c.clone()))
+                        .get(&quote_key(&target.execution, c))
                         .map(|x| q * x.raw_open)
                         .unwrap_or(*last.get(c).unwrap_or(&0.0))
                 })
@@ -561,7 +788,7 @@ fn account(
             .cloned()
             .collect();
         for c in exits {
-            if let Some(x) = quotes.get(&(target.execution.clone(), c.clone())) {
+            if let Some(x) = quotes.get(&quote_key(&target.execution, &c)) {
                 if x.tradable {
                     let q = shares.remove(&c).unwrap();
                     let value = q * x.raw_open;
@@ -581,7 +808,7 @@ fn account(
             .cloned()
             .collect();
         for (k, c) in missing.iter().enumerate() {
-            if let Some(x) = quotes.get(&(target.execution.clone(), c.clone())) {
+            if let Some(x) = quotes.get(&quote_key(&target.execution, &c)) {
                 if x.tradable {
                     let affordable = (cash - equity * args.cash_reserve).max(0.0)
                         / (1.0 + args.buy_bps / 10000.0);
@@ -608,8 +835,8 @@ fn account(
         }
         let mut ending = cash;
         for (c, q) in &shares {
-            let current = quotes.get(&(target.execution.clone(), c.clone()));
-            let future = quotes.get(&(target.next_execution.clone(), c.clone()));
+            let current = quotes.get(&quote_key(&target.execution, c));
+            let future = quotes.get(&quote_key(&target.next_execution, c));
             if let (Some(a), Some(b)) = (current, future) {
                 ending += q * b.ratio / a.ratio * b.raw_open;
             } else {
@@ -622,8 +849,8 @@ fn account(
         let gross = (ending - previous + fees) / previous;
         let net = ending / previous - 1.0;
         let b = benchmark
-            .get(&target.execution)
-            .zip(benchmark.get(&target.next_execution))
+            .get(&date_id(&target.execution))
+            .zip(benchmark.get(&date_id(&target.next_execution)))
             .map(|(a, z)| z / a - 1.0)
             .unwrap_or(0.0);
         out.push(Daily {
@@ -652,6 +879,48 @@ fn summary(d: &[Daily]) -> AccountSummary {
         average_cash_weight: d.iter().map(|x| x.cash_weight).sum::<f64>() / d.len() as f64,
         average_holding_count: d.iter().map(|x| x.holdings as f64).sum::<f64>() / d.len() as f64,
     }
+}
+fn annual_metrics(d: &[Daily]) -> BTreeMap<String, AnnualMetrics> {
+    let mut years: BTreeMap<String, Vec<&Daily>> = BTreeMap::new();
+    for day in d {
+        years
+            .entry(day.execution[..4].to_string())
+            .or_default()
+            .push(day);
+    }
+    years
+        .into_iter()
+        .map(|(year, rows)| {
+            let n = rows.len();
+            let total_return = rows.iter().fold(1.0, |acc, x| acc * (1.0 + x.net)) - 1.0;
+            let csi500_return = rows.iter().fold(1.0, |acc, x| acc * (1.0 + x.benchmark)) - 1.0;
+            let active = rows.iter().map(|x| x.net - x.benchmark).collect::<Vec<_>>();
+            let excess_curve_return = active.iter().fold(1.0, |acc, x| acc * (1.0 + x)) - 1.0;
+            let mean = active.iter().sum::<f64>() / n as f64;
+            let sd = if n > 1 {
+                (active.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt()
+            } else {
+                0.0
+            };
+            let excess_sharpe_243 = if sd > 1e-12 {
+                mean / sd * 243f64.sqrt()
+            } else {
+                0.0
+            };
+            let average_buy_turnover = rows.iter().map(|x| x.buy).sum::<f64>() / n as f64;
+            (
+                year,
+                AnnualMetrics {
+                    days: n,
+                    total_return,
+                    csi500_return,
+                    excess_curve_return,
+                    excess_sharpe_243,
+                    average_buy_turnover,
+                },
+            )
+        })
+        .collect()
 }
 fn metric(combined: &[Daily], s500: AccountSummary, s1000: AccountSummary) -> Metrics {
     let n = combined.len();
@@ -693,6 +962,9 @@ fn metric(combined: &[Daily], s500: AccountSummary, s1000: AccountSummary) -> Me
         average_holding_count: combined.iter().map(|x| x.holdings as f64).sum::<f64>() / n as f64,
         csi500: s500,
         csi1000: s1000,
+        annual: annual_metrics(combined),
+        csi500_annual: BTreeMap::new(),
+        csi1000_annual: BTreeMap::new(),
     }
 }
 fn svg_points(values: &[f64], width: f64, height: f64) -> String {
@@ -725,6 +997,32 @@ fn write_html(args: &Args, d: &[Daily], metrics: &Metrics) -> Result<()> {
         benchmarks.push(benchmark);
         excesses.push(excess);
     }
+    let annual_rows = metrics
+        .annual
+        .iter()
+        .map(|(year, annual)| {
+            let sleeve500 = metrics
+                .csi500_annual
+                .get(year)
+                .map(|x| x.total_return)
+                .unwrap_or(0.0);
+            let sleeve1000 = metrics
+                .csi1000_annual
+                .get(year)
+                .map(|x| x.total_return)
+                .unwrap_or(0.0);
+            format!(
+                "<tr><td>{year}</td><td>{:.2}%</td><td>{:.2}%</td><td>{:.2}%</td><td>{:.2}%</td><td>{:.3}</td><td>{:.2}%</td><td>{:.2}%</td></tr>",
+                100.0 * annual.total_return,
+                100.0 * sleeve500,
+                100.0 * sleeve1000,
+                100.0 * annual.excess_curve_return,
+                annual.excess_sharpe_243,
+                100.0 * annual.csi500_return,
+                100.0 * annual.average_buy_turnover,
+            )
+        })
+        .collect::<String>();
     let html = format!(
         r##"<!doctype html><meta charset="utf-8"><title>Rust dual-sleeve backtest</title>
 <style>body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:1180px;margin:30px auto;padding:0 20px;color:#18202a}}.grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}}.card{{border:1px solid #dfe5ec;border-radius:10px;padding:14px;background:#fff}}.v{{font-size:25px;font-weight:700;margin-top:5px}}svg{{width:100%;height:360px;border:1px solid #e3e7eb;background:#fafbfd}}table{{border-collapse:collapse;width:100%}}th,td{{padding:9px;border-bottom:1px solid #ddd;text-align:right}}th:first-child,td:first-child{{text-align:left}}.legend span{{margin-right:20px}}@media(max-width:800px){{.grid{{grid-template-columns:repeat(2,1fr)}}}}</style>
@@ -763,6 +1061,12 @@ fn write_html(args: &Args, d: &[Daily], metrics: &Metrics) -> Result<()> {
         100.0 * metrics.csi1000.average_cash_weight,
         metrics.csi1000.average_holding_count
     );
+    let html = html.replace(
+        "<h2>袖套执行</h2>",
+        &format!(
+            "<h2>年度拆解</h2><table><tr><th>年份</th><th>组合收益</th><th>500袖套</th><th>1000袖套</th><th>超额复利</th><th>超额Sharpe</th><th>CSI500</th><th>日均买入换手</th></tr>{annual_rows}</table><h2>袖套执行</h2>"
+        ),
+    );
     fs::write(args.output.join("report.html"), html)?;
     Ok(())
 }
@@ -770,7 +1074,10 @@ fn write_output(args: &Args, d: &[Daily], metrics: &Metrics) -> Result<()> {
     fs::create_dir_all(&args.output)?;
     let tsv = args.output.join("portfolio_daily.tsv");
     let mut w = BufWriter::new(File::create(&tsv)?);
-    writeln!(w,"signal_date\texecution_date\tnext_execution_date\tgross_return\tnet_return\ttransaction_cost\tbuy_turnover\tsell_turnover\tholding_count\tcash_weight\tcsi500_return\tactive_return")?;
+    writeln!(
+        w,
+        "signal_date\texecution_date\tnext_execution_date\tgross_return\tnet_return\ttransaction_cost\tbuy_turnover\tsell_turnover\tholding_count\tcash_weight\tcsi500_return\tactive_return"
+    )?;
     for x in d {
         writeln!(
             w,
@@ -830,8 +1137,12 @@ fn write_targets(args: &Args, a: &[DayTarget], b: &[DayTarget]) -> Result<()> {
 }
 fn main() -> Result<()> {
     let args = Args::parse();
-    if args.selection_mode != "independent" && args.selection_mode != "shared" {
-        bail!("selection-mode must be independent or shared")
+    if args.selection_mode != "independent"
+        && args.selection_mode != "shared"
+        && args.selection_mode != "buffer"
+        && args.selection_mode != "adaptive-buffer"
+    {
+        bail!("selection-mode must be independent, shared, buffer, or adaptive-buffer")
     }
     if args.rebalance_every == 0 {
         bail!("rebalance-every must be positive")
@@ -839,13 +1150,33 @@ fn main() -> Result<()> {
     if !(0.0..=1.0).contains(&args.csi500_weight) || args.initial_capital <= 0.0 {
         bail!("csi500-weight must be in [0,1] and initial-capital must be positive")
     }
+    if !(0.0 < args.score_ema_alpha && args.score_ema_alpha <= 1.0) {
+        bail!("score-ema-alpha must be in (0,1]")
+    }
+    if args.initial_build_days == 0 || args.exit_confirm_days == 0 {
+        bail!("initial-build-days and exit-confirm-days must be positive")
+    }
+    if args.csi500_exit_rank < args.csi500_holdings
+        || args.csi1000_exit_rank < args.csi1000_holdings
+    {
+        bail!("exit ranks must be at least their sleeve holding counts")
+    }
     if !(0.0..=1.0).contains(&args.csi500_turnover) || !(0.0..=1.0).contains(&args.csi1000_turnover)
     {
         bail!("turnover must be in [0,1]")
     }
     let (days, preds, executions, membership) = load_inputs(&args)?;
+    if args.ema_warmup_days + args.initial_build_days >= days.len() {
+        bail!("EMA warm-up and initial build consume the complete prediction window")
+    }
     let (t500, t1000) = build_targets(&args, &days, &preds, &executions, &membership);
     write_targets(&args, &t500, &t1000)?;
+    // Quotes are the next large phase. Release the 1.95M prediction rows and
+    // point-in-time membership maps before allocating the quote table.
+    drop(days);
+    drop(preds);
+    drop(executions);
+    drop(membership);
     let start = &t500[0].execution;
     let end = &t500.last().unwrap().next_execution;
     let (quotes, benchmark) = load_market(&args, start, end)?;
@@ -887,7 +1218,9 @@ fn main() -> Result<()> {
             benchmark: a.benchmark,
         })
         .collect();
-    let metrics = metric(&combined, summary(&d500), summary(&d1000));
+    let mut metrics = metric(&combined, summary(&d500), summary(&d1000));
+    metrics.csi500_annual = annual_metrics(&d500);
+    metrics.csi1000_annual = annual_metrics(&d1000);
     write_output(&args, &combined, &metrics)?;
     println!("{}", serde_json::to_string(&metrics)?);
     Ok(())
@@ -904,5 +1237,99 @@ mod tests {
     #[test]
     fn zscore_constant_is_zero() {
         assert_eq!(population_z(&[2.0, 2.0]), vec![0.0, 0.0]);
+    }
+    #[test]
+    fn buffer_mode_replaces_only_names_beyond_exit_rank() {
+        let ranked = (1..=8).map(|i| format!("S{i}")).collect::<Vec<_>>();
+        let members = ranked
+            .iter()
+            .map(|code| (code.clone(), CSI500.to_string()))
+            .collect::<HashMap<_, _>>();
+        let mut held = ["S2", "S4", "S7"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        choose_buffer(&ranked, &members, CSI500, &mut held, 3, 6);
+        assert_eq!(
+            held,
+            ["S1", "S2", "S4"].into_iter().map(str::to_string).collect()
+        );
+    }
+    #[test]
+    fn compact_quote_keys_preserve_date_code_and_exchange() {
+        assert_ne!(
+            quote_key("2024-01-02", "600000.SH"),
+            quote_key("2024-01-02", "600000.SZ")
+        );
+        assert_ne!(
+            quote_key("2024-01-02", "600000.SH"),
+            quote_key("2024-01-03", "600000.SH")
+        );
+        assert_eq!(date_id("2024-01-02"), 20240102);
+    }
+    #[test]
+    fn annual_metrics_compound_daily_active_returns() {
+        let rows = [("2025-01-02", 0.02, 0.01), ("2025-01-03", -0.01, -0.02)]
+            .into_iter()
+            .map(|(execution, net, benchmark)| Daily {
+                signal: execution.to_string(),
+                execution: execution.to_string(),
+                next_execution: execution.to_string(),
+                gross: net,
+                net,
+                cost: 0.0,
+                buy: 0.03,
+                sell: 0.0,
+                holdings: 10,
+                cash_weight: 0.02,
+                benchmark,
+            })
+            .collect::<Vec<_>>();
+        let annual = annual_metrics(&rows);
+        let year = &annual["2025"];
+        assert!((year.total_return - (1.02 * 0.99 - 1.0)).abs() < 1e-12);
+        assert!((year.excess_curve_return - (1.01 * 1.01 - 1.0)).abs() < 1e-12);
+        assert!((year.average_buy_turnover - 0.03).abs() < 1e-12);
+    }
+    #[test]
+    fn adaptive_buffer_requires_confirmation_before_replacement() {
+        let ranked = vec![
+            ("S1".to_string(), 1.0),
+            ("S2".to_string(), 0.9),
+            ("S3".to_string(), 0.0),
+        ];
+        let members = ranked
+            .iter()
+            .map(|(code, _)| (code.clone(), CSI500.to_string()))
+            .collect::<HashMap<_, _>>();
+        let mut held = ["S2", "S3"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let mut outside = HashMap::new();
+        choose_adaptive_buffer(
+            &ranked,
+            &members,
+            CSI500,
+            &mut held,
+            &mut outside,
+            2,
+            2,
+            2,
+            0.15,
+        );
+        assert!(held.contains("S3"));
+        choose_adaptive_buffer(
+            &ranked,
+            &members,
+            CSI500,
+            &mut held,
+            &mut outside,
+            2,
+            2,
+            2,
+            0.15,
+        );
+        assert_eq!(held, ["S1", "S2"].into_iter().map(str::to_string).collect());
     }
 }
