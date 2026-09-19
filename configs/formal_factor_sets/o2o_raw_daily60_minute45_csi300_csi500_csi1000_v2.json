@@ -1,0 +1,50 @@
+{
+  "factor_set_id": "o2o_raw_daily60_minute45_csi300_csi500_csi1000_v2",
+  "status": "production_candidate",
+  "output_frequency": "daily",
+  "factor_count": 105,
+  "feature_basis": "raw_ohlcv_only",
+  "production_universe": {
+    "index_codes": ["000300.SH", "000905.SH", "000852.SH"],
+    "membership": "point_in_time",
+    "deduplicate_on": ["trade_date", "ts_code"],
+    "cross_section": "full_deduplicated_union"
+  },
+  "daily_component": {
+    "count": 60,
+    "factor_ids_file": "configs/candidate_factors_daily_o2o_candidate60_raw_v1.txt",
+    "price_basis": "raw",
+    "target_runtime": "rust",
+    "python_runtime": "reference_oracle_only",
+    "dataset": "A_stock_database/lake/derived/factors_raw_o2o_csi300_csi500_csi1000_v2"
+  },
+  "minute_components": [
+    {
+      "count": 28,
+      "factor_ids_file": "configs/candidate_factors_minute_ohlcv_open_to_open_abs_icir_gt2_h1_or_h5.txt",
+      "dataset": "A_stock_database/lake/derived/minute_factors/ohlcv_candidates_v1_raw_csi300_csi500_csi1000_v2"
+    },
+    {
+      "count": 10,
+      "factor_ids_file": "configs/candidate_factors_minute_core24_o2o_selected10.txt",
+      "dataset": "A_stock_database/lake/derived/minute_factors/core24_raw_csi300_csi500_csi1000_v2"
+    },
+    {
+      "count": 7,
+      "factor_ids_file": "configs/candidate_factors_minute_ohlcv_v3_o2o_abs_annual_icir_gt2_h1_or_h5.txt",
+      "dataset": "A_stock_database/lake/derived/minute_factors/ohlcv_candidates_v3_raw_csi300_csi500_csi1000_v2"
+    }
+  ],
+  "feature_cache": "A_stock_database/lake/derived/predict_features_o2o_raw_daily60_minute45_csi300_csi500_csi1000_v2",
+  "labels": {
+    "price_basis": "qfq",
+    "h1": "T+1 open to T+2 open excess versus CSI500",
+    "h5": "T+1 open to T+6 open excess versus CSI500",
+    "h10": "T+1 open to T+11 open excess versus CSI500",
+    "maturity_lag_sessions": 11
+  },
+  "models": [
+    {"model_id": "csi300_csi500_joint", "training_index_codes": ["000300.SH", "000905.SH"]},
+    {"model_id": "csi1000_only", "training_index_codes": ["000852.SH"], "exclude_overlaps_with": ["000300.SH", "000905.SH"]}
+  ]
+}

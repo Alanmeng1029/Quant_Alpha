@@ -13,7 +13,9 @@ const FLOAT32: c_int = 0;
 const PREDICT_NORMAL: c_int = 0;
 const SEED: u64 = 20_260_908;
 const TRAIN_DAYS: usize = 756;
-const LABEL_LAG: usize = 6;
+const HORIZONS: [usize; 3] = [1, 5, 10];
+// A signal formed on T enters at T+1. H10 matures at the T+11 open.
+const LABEL_LAG: usize = 11;
 
 type DatasetHandle = *mut c_void;
 type BoosterHandle = *mut c_void;
@@ -111,8 +113,10 @@ struct Panel {
     x: Vec<f32>,
     raw_h1: Vec<f32>,
     raw_h5: Vec<f32>,
+    raw_h10: Vec<f32>,
     win_h1: Vec<f32>,
     win_h5: Vec<f32>,
+    win_h10: Vec<f32>,
 }
 
 struct DayRow {
@@ -121,6 +125,7 @@ struct DayRow {
     x: Vec<f64>,
     h1: f64,
     h5: f64,
+    h10: f64,
 }
 
 struct Matrix {
@@ -152,8 +157,10 @@ struct WindowLog {
     test_end: String,
     training_rows_h1: usize,
     training_rows_h5: usize,
+    training_rows_h10: usize,
     rounds_h1: usize,
     rounds_h5: usize,
+    rounds_h10: usize,
 }
 
 fn lgb_check(status: c_int) -> Result<()> {
@@ -257,15 +264,19 @@ fn append_day(panel: &mut Panel, date: String, rows: Vec<DayRow>) {
     }
     let h1 = rows.iter().map(|row| row.h1).collect::<Vec<_>>();
     let h5 = rows.iter().map(|row| row.h5).collect::<Vec<_>>();
+    let h10 = rows.iter().map(|row| row.h10).collect::<Vec<_>>();
     let win_h1 = clipped(&h1);
     let win_h5 = clipped(&h5);
+    let win_h10 = clipped(&h10);
     for (index, row) in rows.into_iter().enumerate() {
         panel.codes.push(row.code);
         panel.executions.push(row.execution);
         panel.raw_h1.push(row.h1 as f32);
         panel.raw_h5.push(row.h5 as f32);
+        panel.raw_h10.push(row.h10 as f32);
         panel.win_h1.push(win_h1[index]);
         panel.win_h5.push(win_h5[index]);
+        panel.win_h10.push(win_h10[index]);
     }
     panel.x.extend(standardized);
     panel.dates.push(date);
@@ -281,7 +292,7 @@ fn load_panel(args: &Args, factors: &[String]) -> Result<Panel> {
         .collect::<Result<Vec<_>>>()?
         .join(",");
     let exclude_overlap = if args.index_code == "000852.SH" {
-        "AND NOT EXISTS (SELECT 1 FROM index_monthly_constituents c5 WHERE c5.index_code='000905.SH' AND c5.ts_code=c.ts_code AND c5.as_of_date=(SELECT max(c6.as_of_date) FROM index_monthly_constituents c6 WHERE c6.index_code='000905.SH' AND c6.as_of_date<=cal.trade_date))"
+        "AND NOT EXISTS (SELECT 1 FROM index_monthly_constituents co WHERE co.index_code IN ('000300.SH','000905.SH') AND co.ts_code=c.ts_code AND co.as_of_date=(SELECT max(co2.as_of_date) FROM index_monthly_constituents co2 WHERE co2.index_code=co.index_code AND co2.as_of_date<=cal.trade_date))"
     } else {
         ""
     };
@@ -340,17 +351,21 @@ fn load_panel(args: &Args, factors: &[String]) -> Result<Panel> {
           CASE WHEN d1.qfq_open>0 AND d2.qfq_open>0 AND i1.open>0 AND i2.open>0 AND d1.amount_cny>0 AND d2.amount_cny>0 AND d1.observation_status='complete_trading' AND d2.observation_status='complete_trading'
             THEN d2.qfq_open/d1.qfq_open-i2.open/i1.open ELSE CAST('NaN' AS DOUBLE) END h1,
           CASE WHEN d1.qfq_open>0 AND d6.qfq_open>0 AND i1.open>0 AND i6.open>0 AND d1.amount_cny>0 AND d6.amount_cny>0 AND d1.observation_status='complete_trading' AND d6.observation_status='complete_trading'
-            THEN d6.qfq_open/d1.qfq_open-i6.open/i1.open ELSE CAST('NaN' AS DOUBLE) END h5
+            THEN d6.qfq_open/d1.qfq_open-i6.open/i1.open ELSE CAST('NaN' AS DOUBLE) END h5,
+          CASE WHEN d1.qfq_open>0 AND d11.qfq_open>0 AND i1.open>0 AND i11.open>0 AND d1.amount_cny>0 AND d11.amount_cny>0 AND d1.observation_status='complete_trading' AND d11.observation_status='complete_trading'
+            THEN d11.qfq_open/d1.qfq_open-i11.open/i1.open ELSE CAST('NaN' AS DOUBLE) END h10
         FROM read_parquet('{feature_glob}') f
         JOIN universe u USING(trade_date,ts_code)
         JOIN calendar c ON c.trade_date=f.trade_date
-        LEFT JOIN calendar ce ON ce.n=c.n+1 LEFT JOIN calendar c2 ON c2.n=c.n+2 LEFT JOIN calendar c6 ON c6.n=c.n+6
+        LEFT JOIN calendar ce ON ce.n=c.n+1 LEFT JOIN calendar c2 ON c2.n=c.n+2 LEFT JOIN calendar c6 ON c6.n=c.n+6 LEFT JOIN calendar c11 ON c11.n=c.n+11
         LEFT JOIN daily_qfq d1 ON d1.ts_code=f.ts_code AND d1.trade_date=ce.trade_date
         LEFT JOIN daily_qfq d2 ON d2.ts_code=f.ts_code AND d2.trade_date=c2.trade_date
         LEFT JOIN daily_qfq d6 ON d6.ts_code=f.ts_code AND d6.trade_date=c6.trade_date
+        LEFT JOIN daily_qfq d11 ON d11.ts_code=f.ts_code AND d11.trade_date=c11.trade_date
         LEFT JOIN index_daily i1 ON i1.index_code='000905.SH' AND i1.trade_date=ce.trade_date
         LEFT JOIN index_daily i2 ON i2.index_code='000905.SH' AND i2.trade_date=c2.trade_date
         LEFT JOIN index_daily i6 ON i6.index_code='000905.SH' AND i6.trade_date=c6.trade_date
+        LEFT JOIN index_daily i11 ON i11.index_code='000905.SH' AND i11.trade_date=c11.trade_date
         ORDER BY f.trade_date,f.ts_code"#,
     );
     let mut statement = conn.prepare(&query)?;
@@ -367,6 +382,7 @@ fn load_panel(args: &Args, factors: &[String]) -> Result<Panel> {
             x,
             row.get::<_, f64>(3 + factor_count)?,
             row.get::<_, f64>(4 + factor_count)?,
+            row.get::<_, f64>(5 + factor_count)?,
         ))
     })?;
     let mut panel = Panel {
@@ -376,7 +392,7 @@ fn load_panel(args: &Args, factors: &[String]) -> Result<Panel> {
     let mut current = String::new();
     let mut day = Vec::new();
     for item in mapped {
-        let (date, execution, code, x, h1, h5) = item?;
+        let (date, execution, code, x, h1, h5, h10) = item?;
         if !current.is_empty() && date != current {
             append_day(&mut panel, current, std::mem::take(&mut day));
         }
@@ -387,6 +403,7 @@ fn load_panel(args: &Args, factors: &[String]) -> Result<Panel> {
             x,
             h1,
             h5,
+            h10,
         });
     }
     append_day(&mut panel, current, day);
@@ -410,6 +427,8 @@ fn extract_labeled(
         (1, true) => &panel.win_h1,
         (5, false) => &panel.raw_h5,
         (5, true) => &panel.win_h5,
+        (10, false) => &panel.raw_h10,
+        (10, true) => &panel.win_h10,
         _ => unreachable!(),
     };
     let mut x = Vec::new();
@@ -656,7 +675,7 @@ fn main() -> Result<()> {
     let mut writer = BufWriter::new(File::create(&tsv)?);
     writeln!(
         writer,
-        "trade_date\tts_code\traw_h1\traw_h5\tpred_h1\tpred_h5\texecution_date"
+        "trade_date\tts_code\traw_h1\traw_h5\traw_h10\tpred_h1\tpred_h5\tpred_h10\texecution_date"
     )?;
     let model_root = args.output.join("models");
     fs::create_dir_all(&model_root)?;
@@ -674,7 +693,7 @@ fn main() -> Result<()> {
         let mut outputs = Vec::new();
         let mut rounds_record = Vec::new();
         let mut training_rows = Vec::new();
-        for horizon in [1, 5] {
+        for horizon in HORIZONS {
             let early_train = extract_labeled(&panel, train_begin, early_end, horizon, true);
             let validation = extract_labeled(&panel, valid_begin, train_end, horizon, false);
             let rounds =
@@ -703,21 +722,25 @@ fn main() -> Result<()> {
             let count = end - begin;
             let z1 = zscore(&outputs[0][offset..offset + count]);
             let z5 = zscore(&outputs[1][offset..offset + count]);
+            let z10 = zscore(&outputs[2][offset..offset + count]);
             for local in 0..count {
                 let row = begin + local;
                 if let Some(execution) = &panel.executions[row]
                     && z1[local].is_finite()
                     && z5[local].is_finite()
+                    && z10[local].is_finite()
                 {
                     writeln!(
                         writer,
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         panel.dates[date_index],
                         panel.codes[row],
                         outputs[0][offset + local],
                         outputs[1][offset + local],
+                        outputs[2][offset + local],
                         z1[local],
                         z5[local],
+                        z10[local],
                         execution
                     )?;
                 }
@@ -729,8 +752,10 @@ fn main() -> Result<()> {
             test_end: panel.dates[test_end - 1].clone(),
             training_rows_h1: training_rows[0],
             training_rows_h5: training_rows[1],
+            training_rows_h10: training_rows[2],
             rounds_h1: rounds_record[0],
             rounds_h5: rounds_record[1],
+            rounds_h10: rounds_record[2],
         });
         fs::write(
             args.output.join("training_log.json"),
@@ -742,7 +767,7 @@ fn main() -> Result<()> {
     let src = sql_quote(&tsv);
     let dst = sql_quote(&args.output.join("predictions.parquet"));
     conn.execute_batch(&format!(
-        "COPY (SELECT CAST(trade_date AS DATE) trade_date,ts_code,raw_h1::DOUBLE raw_h1,raw_h5::DOUBLE raw_h5,pred_h1::DOUBLE pred_h1,pred_h5::DOUBLE pred_h5,CAST(execution_date AS DATE) execution_date FROM read_csv('{src}',delim='\\t',header=true)) TO '{dst}' (FORMAT PARQUET,COMPRESSION ZSTD)"
+        "COPY (SELECT CAST(trade_date AS DATE) trade_date,ts_code,raw_h1::DOUBLE raw_h1,raw_h5::DOUBLE raw_h5,raw_h10::DOUBLE raw_h10,pred_h1::DOUBLE pred_h1,pred_h5::DOUBLE pred_h5,pred_h10::DOUBLE pred_h10,CAST(execution_date AS DATE) execution_date FROM read_csv('{src}',delim='\\t',header=true)) TO '{dst}' (FORMAT PARQUET,COMPRESSION ZSTD)"
     ))?;
     fs::remove_file(tsv)?;
     fs::write(
@@ -754,6 +779,7 @@ fn main() -> Result<()> {
             "factor_count": factors.len(),
             "training_days": TRAIN_DAYS,
             "label_lag": LABEL_LAG,
+            "horizons": HORIZONS,
             "oos_start": args.oos_start,
             "oos_end": args.oos_end,
             "features": args.feature_root,

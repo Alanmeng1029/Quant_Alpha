@@ -1,7 +1,7 @@
 //! quant-minute-factor: minute-bar daily wide-factor production.
 //!
 //! Reads per-trade-date minute parquet partitions, computes the 24 core factors
-//! per stock-day, crops to the dynamic CSI300 ∪ CSI500 universe, and writes one
+//! per stock-day, crops to a configured point-in-time index union, and writes one
 //! wide parquet per trade date under `<output>/year=YYYY/`.  Blocks of
 //! `--block-days` market days (plus 20 warm-up days) run in parallel; each block
 //! owns an independent rolling state, so block layout and thread count cannot
@@ -16,14 +16,14 @@ mod schema;
 mod state;
 mod writer;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use manifest::{BuildParameters, DayStatus, Manifest};
-use pipeline::{plan_blocks, process_day, Block, MarketContext};
+use pipeline::{Block, MarketContext, plan_blocks, process_day};
 
 #[derive(Parser)]
 #[command(
@@ -71,8 +71,12 @@ pub(crate) struct BuildArgs {
     #[arg(long, default_value = "core24")]
     pub(crate) factor_set: String,
     /// Comma-separated point-in-time index membership used for the output
-    /// universe. The raw 500+1000 candidate uses 000905.SH,000852.SH.
-    #[arg(long, value_delimiter = ',', default_value = "000300.SH,000905.SH")]
+    /// universe. Production raw factors use CSI300 ∪ CSI500 ∪ CSI1000.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "000300.SH,000905.SH,000852.SH"
+    )]
     pub(crate) index_codes: Vec<String>,
     /// Derive membership from index snapshots and raw complete-trading daily
     /// bars instead of the qfq-backed legacy trading universe.

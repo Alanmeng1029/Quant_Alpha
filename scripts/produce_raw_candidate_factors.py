@@ -1,4 +1,4 @@
-"""Produce raw CSI500+CSI1000 candidate factors for completed input dates.
+"""Produce raw CSI300+CSI500+CSI1000 factors for completed input dates.
 
 This command does not download data, retrain models, select securities, or
 change the active strategy.  ``--plan`` performs the same input checks without
@@ -16,8 +16,8 @@ from pathlib import Path
 import duckdb
 
 ROOT = Path(__file__).resolve().parents[1]
-INDEXES = ("000905.SH", "000852.SH")
-FACTOR_SET = "o2o_raw_daily60_minute45_csi500_csi1000_v1"
+INDEXES = ("000300.SH", "000905.SH", "000852.SH")
+FACTOR_SET = "o2o_raw_daily60_minute45_csi300_csi500_csi1000_v2"
 
 
 def dates(catalog: Path, start: str | None, end: str | None) -> list[str]:
@@ -32,7 +32,7 @@ def validate_day(catalog: Path, minute_root: Path, day: str) -> dict[str, int]:
     with duckdb.connect(str(catalog), read_only=True) as conn:
         expected, raw_ok = conn.execute("""WITH members AS (
             SELECT DISTINCT c.ts_code FROM index_monthly_constituents c
-            WHERE c.index_code IN ('000905.SH','000852.SH') AND c.as_of_date=(
+            WHERE c.index_code IN ('000300.SH','000905.SH','000852.SH') AND c.as_of_date=(
               SELECT max(c2.as_of_date) FROM index_monthly_constituents c2
               WHERE c2.index_code=c.index_code AND c2.as_of_date<=?::DATE))
             SELECT count(*),count(*) FILTER(WHERE d.open>0 AND d.high>0 AND d.low>0 AND d.close>0
@@ -45,12 +45,20 @@ def validate_day(catalog: Path, minute_root: Path, day: str) -> dict[str, int]:
     with duckdb.connect(str(catalog), read_only=True) as conn:
         full_minute = conn.execute(f"""WITH members AS (
             SELECT DISTINCT c.ts_code FROM index_monthly_constituents c
-            WHERE c.index_code IN ('000905.SH','000852.SH') AND c.as_of_date=(
+            WHERE c.index_code IN ('000300.SH','000905.SH','000852.SH') AND c.as_of_date=(
               SELECT max(c2.as_of_date) FROM index_monthly_constituents c2
               WHERE c2.index_code=c.index_code AND c2.as_of_date<=?::DATE)),
             bars AS (SELECT ts_code,count(*) n FROM read_parquet('{glob}') GROUP BY ts_code)
             SELECT count(*) FROM members m JOIN bars b USING(ts_code) WHERE b.n=241""", [day]).fetchone()[0]
-    if not expected or raw_ok != expected or full_minute < expected:
+    # Constituent history begins at the first available month-end snapshot.
+    # Earlier calendar days are legitimate warm-up/replay days with no output
+    # universe, not input failures.
+    if expected == 0:
+        return {"members": 0, "raw_daily": 0, "full_minute": 0}
+    # Suspended, not-yet-listed and otherwise incomplete members are excluded
+    # by the raw eligibility contract. Every raw-eligible member must have a
+    # complete 241-bar minute session, but not every index member must trade.
+    if raw_ok == 0 or full_minute < raw_ok:
         raise RuntimeError(f"{day}: incomplete input (members={expected}, raw={raw_ok}, full_minute={full_minute})")
     return {"members": expected, "raw_daily": raw_ok, "full_minute": full_minute}
 
@@ -77,11 +85,12 @@ def main() -> None:
     if args.plan:
         print(json.dumps(result, ensure_ascii=False)); return
     invoke([sys.executable, "-m", "a_share_data.raw_daily_factors", "--catalog", str(catalog),
-        "--output-root", "A_stock_database/lake/derived/factors_raw_o2o_csi500_csi1000_v1",
-        "--factor-ids-file", "configs/candidate_factors_daily_o2o_candidate60_raw_v1.txt", "--start", days[0], "--end", days[-1]])
-    groups = (("ohlcv_candidates_v1", "A_stock_database/lake/derived/minute_factors/ohlcv_candidates_v1_raw_csi500_csi1000", 2),
-              ("core24", "A_stock_database/lake/derived/minute_factors/core24_raw_csi500_csi1000/v1", 2),
-              ("ohlcv_candidates_v3", "A_stock_database/lake/derived/minute_factors/ohlcv_candidates_v3_raw_csi500_csi1000", 1))
+        "--output-root", "A_stock_database/lake/derived/factors_raw_o2o_csi300_csi500_csi1000_v2",
+        "--factor-ids-file", "configs/candidate_factors_daily_o2o_candidate60_raw_v1.txt", "--start", days[0], "--end", days[-1],
+        "--index-codes", ",".join(INDEXES)])
+    groups = (("ohlcv_candidates_v1", "A_stock_database/lake/derived/minute_factors/ohlcv_candidates_v1_raw_csi300_csi500_csi1000_v2", 2),
+              ("core24", "A_stock_database/lake/derived/minute_factors/core24_raw_csi300_csi500_csi1000_v2", 2),
+              ("ohlcv_candidates_v3", "A_stock_database/lake/derived/minute_factors/ohlcv_candidates_v3_raw_csi300_csi500_csi1000_v2", 1))
     for name, output, threads in groups:
         invoke(["cargo", "run", "--release", "-p", "quant-minute-factor", "--", "build", "--catalog", str(catalog),
           "--minute-root", str(minute_root), "--output", output, "--factor-set", name, "--index-codes", ",".join(INDEXES),

@@ -21,7 +21,7 @@ pub struct MarketContext {
     pub calendar: Vec<String>,
     /// Position of a trade date inside `calendar` for O(1) day stamps.
     positions: HashMap<String, u32>,
-    /// Dynamic CSI300 ∪ CSI500 membership per trade date.
+    /// Configured point-in-time index-union membership per trade date.
     pub universe: HashMap<String, HashSet<String>>,
 }
 
@@ -68,22 +68,32 @@ pub fn load_market_context(
     }
 
     let universe: HashMap<String, HashSet<String>> = {
-        let placeholders = std::iter::repeat("?").take(index_codes.len()).collect::<Vec<_>>().join(",");
+        let placeholders = std::iter::repeat("?")
+            .take(index_codes.len())
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = if raw_eligible_universe {
-            format!("SELECT cal.trade_date::VARCHAR, c.ts_code FROM observed_calendar cal \
+            format!(
+                "SELECT cal.trade_date::VARCHAR, c.ts_code FROM observed_calendar cal \
              JOIN index_monthly_constituents c ON c.index_code IN ({placeholders}) \
               AND c.as_of_date=(SELECT max(c2.as_of_date) FROM index_monthly_constituents c2 WHERE c2.index_code=c.index_code AND c2.as_of_date<=cal.trade_date) \
              JOIN daily_aggregated d ON d.trade_date=cal.trade_date AND d.ts_code=c.ts_code \
              WHERE cal.is_observed_market_day AND cal.trade_date BETWEEN ?::DATE AND ?::DATE \
               AND d.open>0 AND d.high>0 AND d.low>0 AND d.close>0 AND d.volume_share>0 AND d.amount_cny>0 AND d.observation_status='complete_trading' \
-             GROUP BY cal.trade_date,c.ts_code")
+             GROUP BY cal.trade_date,c.ts_code"
+            )
         } else {
-            format!("SELECT trade_date::VARCHAR, ts_code FROM index_trading_universe \
+            format!(
+                "SELECT trade_date::VARCHAR, ts_code FROM index_trading_universe \
              WHERE index_code IN ({placeholders}) AND trade_date BETWEEN ?::DATE AND ?::DATE \
-             GROUP BY trade_date, ts_code")
+             GROUP BY trade_date, ts_code"
+            )
         };
         let mut statement = conn.prepare(&sql)?;
-        let mut params: Vec<&dyn duckdb::ToSql> = index_codes.iter().map(|code| code as &dyn duckdb::ToSql).collect();
+        let mut params: Vec<&dyn duckdb::ToSql> = index_codes
+            .iter()
+            .map(|code| code as &dyn duckdb::ToSql)
+            .collect();
         params.push(&start);
         params.push(&end);
         let rows = statement.query_map(params.as_slice(), |row| {

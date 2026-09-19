@@ -18,9 +18,9 @@ struct Args {
     minute_source: Vec<(PathBuf, PathBuf)>,
     #[arg(long)]
     output: PathBuf,
-    #[arg(long, default_value = "000905.SH")]
+    #[arg(long, default_value = "000300.SH,000905.SH,000852.SH")]
     index_code: String,
-    #[arg(long, default_value = "qfq")]
+    #[arg(long, default_value = "raw")]
     price_basis: String,
     #[arg(long, default_value = "2018-01-01")]
     start: String,
@@ -134,12 +134,16 @@ fn main() -> Result<()> {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut ctes = vec![
+        let universe = if args.price_basis == "raw" {
             format!(
-                "universe AS (SELECT DISTINCT trade_date,ts_code FROM index_trading_universe WHERE index_code IN ({index_values}) AND trade_date BETWEEN DATE '{lower}' AND DATE '{upper}' AND ts_code<>'000937.SZ')",
-            ),
-            format!("factors AS ({unions})"),
-        ];
+                "universe AS (SELECT DISTINCT cal.trade_date,c.ts_code FROM observed_calendar cal JOIN index_monthly_constituents c ON c.index_code IN ({index_values}) AND c.as_of_date=(SELECT max(c2.as_of_date) FROM index_monthly_constituents c2 WHERE c2.index_code=c.index_code AND c2.as_of_date<=cal.trade_date) JOIN daily_aggregated d ON d.trade_date=cal.trade_date AND d.ts_code=c.ts_code WHERE cal.is_observed_market_day AND cal.trade_date BETWEEN DATE '{lower}' AND DATE '{upper}' AND d.open>0 AND d.high>0 AND d.low>0 AND d.close>0 AND d.volume_share>0 AND d.amount_cny>0 AND d.observation_status='complete_trading' AND c.ts_code<>'000937.SZ')"
+            )
+        } else {
+            format!(
+                "universe AS (SELECT DISTINCT trade_date,ts_code FROM index_trading_universe WHERE index_code IN ({index_values}) AND trade_date BETWEEN DATE '{lower}' AND DATE '{upper}' AND ts_code<>'000937.SZ')"
+            )
+        };
+        let mut ctes = vec![universe, format!("factors AS ({unions})")];
         let mut joins = Vec::new();
         let mut minute_cols = Vec::new();
         for (i, (root, values)) in minute.iter().enumerate() {

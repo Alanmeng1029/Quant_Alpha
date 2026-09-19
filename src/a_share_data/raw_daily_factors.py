@@ -1,4 +1,4 @@
-"""Raw-price daily factor bootstrap for configurable index universes.
+"""Daily factor bootstrap for configurable index universes and price bases.
 
 The module is deliberately separate from ``factors.py``: it cannot overwrite
 the active qfq artifacts and it never reads a qfq field.  It is the Python
@@ -21,6 +21,9 @@ import polars as pl
 from a_share_data import factors
 from a_share_data import polars_factor_engine
 from a_share_data.dual_sleeve import CSI500, CSI1000
+
+CSI300 = "000300.SH"
+PRODUCTION_INDEXES = (CSI300, CSI500, CSI1000)
 
 
 def _atomic(frame: pl.DataFrame, path: Path) -> None:
@@ -66,14 +69,28 @@ def raw_factor_id(qfq_id: str) -> str:
     return qfq_id.replace("_qfq_v1", "_raw_v1")
 
 
-def build(catalog: Path, output_root: Path, ids_file: Path, start: str | None, end: str | None,
-          index_codes: tuple[str, ...] = (CSI500, CSI1000)) -> dict[str, object]:
+def build(
+    catalog: Path,
+    output_root: Path,
+    ids_file: Path,
+    start: str | None,
+    end: str | None,
+    index_codes: tuple[str, ...] = PRODUCTION_INDEXES,
+    price_basis: str = "raw",
+) -> dict[str, object]:
+    if price_basis not in {"raw", "qfq"}:
+        raise ValueError(f"unsupported price basis: {price_basis}")
     ids = tuple(line.strip() for line in ids_file.read_text().splitlines() if line.strip() and not line.startswith("#"))
-    panel = polars_factor_engine.load_calendar_panel(catalog, start, end, lookback_sessions=252, price_basis="raw")
+    # Materialize the shared calendar panel once before evaluating formulas.
+    # Besides avoiding 60 repeated DuckDB scans, this preserves the established
+    # staged window semantics used by factors.py build-batch.
+    panel = polars_factor_engine.load_calendar_panel(
+        catalog, start, end, lookback_sessions=254, price_basis=price_basis
+    ).collect().lazy()
     members = _membership(catalog, start, end, index_codes)
     written: list[str] = []
-    for raw_id in ids:
-        qfq_id = raw_id.replace("_raw_v1", "_qfq_v1")
+    for factor_id in ids:
+        qfq_id = factor_id.replace("_raw_v1", "_qfq_v1")
         family, number, *_ = qfq_id.split("_")
         definition = factors._definition(family, int(number.removeprefix("alpha")))
         if definition.polars_status != "implemented":
@@ -86,7 +103,7 @@ def build(catalog: Path, output_root: Path, ids_file: Path, start: str | None, e
         frame = frame.join(members, on=["trade_date", "ts_code"], how="inner").drop("sleeve")
         if frame.is_empty():
             raise RuntimeError(f"{qfq_id}: no raw eligible index-universe rows")
-        target = output_root / raw_id.removesuffix("_v1") / "v1" / "factor.parquet"
+        target = output_root / factor_id.removesuffix("_v1") / "v1" / "factor.parquet"
         # A daily run computes only its requested dates (with the 252-session
         # warm-up above) and replaces only those keys.  It must never truncate
         # a completed historical artifact.
@@ -98,14 +115,33 @@ def build(catalog: Path, output_root: Path, ids_file: Path, start: str | None, e
                 previous = previous.filter(pl.col("trade_date") > pl.lit(end).str.to_date())
             frame = pl.concat([previous, frame]).unique(["trade_date", "ts_code"], keep="last").sort(["trade_date", "ts_code"])
         _atomic(frame, target)
+        input_fields = (
+            [
+                "daily_aggregated.open",
+                "high",
+                "low",
+                "close",
+                "amount_cny/volume_share",
+                "volume_share",
+            ]
+            if price_basis == "raw"
+            else [
+                "daily_qfq.qfq_open",
+                "qfq_high",
+                "qfq_low",
+                "qfq_close",
+                "qfq_vwap",
+                "volume_share",
+            ]
+        )
         manifest = {
-            "factor_id": raw_id, "source_factor_id": qfq_id, "price_basis": "raw", "input_fields": ["daily_aggregated.open", "high", "low", "close", "amount_cny/volume_share", "volume_share"],
-            "storage_universe": f"point-in-time {' union '.join(index_codes)}", "calculation_universe": "all valid raw daily observations", "runtime": "python_reference_oracle_pending_rust_port",
+            "factor_id": factor_id, "source_factor_id": qfq_id, "price_basis": price_basis, "input_fields": input_fields,
+            "storage_universe": f"point-in-time {' union '.join(index_codes)}", "calculation_universe": f"all valid {price_basis} daily observations", "runtime": "python_reference_oracle_pending_rust_port",
             "rows": frame.height, "start": str(frame["trade_date"].min()), "end": str(frame["trade_date"].max()), "sha256": hashlib.sha256(target.read_bytes()).hexdigest(), "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         }
         (target.parent / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
-        written.append(raw_id)
-    return {"factor_count": len(written), "factor_ids": written, "output_root": str(output_root)}
+        written.append(factor_id)
+    return {"factor_count": len(written), "factor_ids": written, "output_root": str(output_root), "price_basis": price_basis}
 
 
 def main() -> None:
@@ -115,12 +151,13 @@ def main() -> None:
     p.add_argument("--factor-ids-file", type=Path, required=True)
     p.add_argument("--start")
     p.add_argument("--end")
-    p.add_argument("--index-codes", default=f"{CSI500},{CSI1000}")
+    p.add_argument("--index-codes", default=",".join(PRODUCTION_INDEXES))
+    p.add_argument("--price-basis", choices=("raw", "qfq"), default="raw")
     args = p.parse_args()
     index_codes = tuple(code.strip() for code in args.index_codes.split(",") if code.strip())
     if not index_codes:
         raise SystemExit("--index-codes must contain at least one code")
-    print(json.dumps(build(args.catalog, args.output_root, args.factor_ids_file, args.start, args.end, index_codes), ensure_ascii=False))
+    print(json.dumps(build(args.catalog, args.output_root, args.factor_ids_file, args.start, args.end, index_codes, args.price_basis), ensure_ascii=False))
 
 
 if __name__ == "__main__":

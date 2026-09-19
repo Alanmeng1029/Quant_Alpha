@@ -1,6 +1,6 @@
 {
   "factor_set_id": "o2o_raw_daily60_minute45_csi500_csi1000_v1",
-  "status": "candidate",
+  "status": "superseded_by_o2o_raw_daily60_minute45_csi300_csi500_csi1000_v2",
   "output_frequency": "daily",
   "factor_count": 105,
   "universe": {"index_codes": ["000905.SH", "000852.SH"], "overlap_priority": "000905.SH"},
