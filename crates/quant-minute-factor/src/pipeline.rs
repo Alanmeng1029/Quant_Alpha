@@ -58,8 +58,26 @@ pub fn load_market_context(
         memory_limit_mb.max(1)
     ))?;
 
+    let has_market_view: bool = conn.query_row(
+        "SELECT count(*)>0 FROM duckdb_views() WHERE view_name='market_daily_aggregated'",
+        [],
+        |row| row.get(0),
+    )?;
+    let daily_source = if has_market_view {
+        "market_daily_aggregated"
+    } else {
+        "daily_aggregated"
+    };
+    let calendar_source = if has_market_view {
+        "(SELECT trade_date FROM observed_calendar WHERE is_observed_market_day UNION SELECT DISTINCT trade_date FROM market_daily_aggregated)"
+    } else {
+        "(SELECT trade_date FROM observed_calendar WHERE is_observed_market_day)"
+    };
+
     let calendar: Vec<String> = conn
-        .prepare("SELECT trade_date::VARCHAR FROM observed_calendar WHERE is_observed_market_day ORDER BY trade_date")?
+        .prepare(&format!(
+            "SELECT trade_date::VARCHAR FROM {calendar_source} ORDER BY trade_date"
+        ))?
         .query_map([], |row| row.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut positions = HashMap::with_capacity(calendar.len());
@@ -74,11 +92,11 @@ pub fn load_market_context(
             .join(",");
         let sql = if raw_eligible_universe {
             format!(
-                "SELECT cal.trade_date::VARCHAR, c.ts_code FROM observed_calendar cal \
+                "SELECT cal.trade_date::VARCHAR, c.ts_code FROM {calendar_source} cal \
              JOIN index_monthly_constituents c ON c.index_code IN ({placeholders}) \
               AND c.as_of_date=(SELECT max(c2.as_of_date) FROM index_monthly_constituents c2 WHERE c2.index_code=c.index_code AND c2.as_of_date<=cal.trade_date) \
-             JOIN daily_aggregated d ON d.trade_date=cal.trade_date AND d.ts_code=c.ts_code \
-             WHERE cal.is_observed_market_day AND cal.trade_date BETWEEN ?::DATE AND ?::DATE \
+             JOIN {daily_source} d ON d.trade_date=cal.trade_date AND d.ts_code=c.ts_code \
+             WHERE cal.trade_date BETWEEN ?::DATE AND ?::DATE \
               AND d.open>0 AND d.high>0 AND d.low>0 AND d.close>0 AND d.volume_share>0 AND d.amount_cny>0 AND d.observation_status='complete_trading' \
              GROUP BY cal.trade_date,c.ts_code"
             )

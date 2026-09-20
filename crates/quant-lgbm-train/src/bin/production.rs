@@ -54,6 +54,9 @@ struct RunArgs {
     /// Override automatic lookup of the latest earlier positions.parquet.
     #[arg(long)]
     previous_positions: Option<PathBuf>,
+    /// Start deployment from cash instead of carrying any earlier position artifact.
+    #[arg(long, conflicts_with = "previous_positions")]
+    start_flat: bool,
 }
 
 #[derive(Clone)]
@@ -151,7 +154,7 @@ fn run_command(program: &Path, arguments: &[String]) -> Result<()> {
 fn validate_date(conn: &Connection, date: &str) -> Result<()> {
     let observed: bool = conn
         .query_row(
-            "SELECT coalesce(bool_or(is_observed_market_day),false) FROM observed_calendar WHERE trade_date=?::DATE",
+            "SELECT count(*)>0 FROM (SELECT trade_date FROM observed_calendar WHERE is_observed_market_day UNION SELECT DISTINCT trade_date FROM market_daily_aggregated) WHERE trade_date=?::DATE",
             [date],
             |r| r.get(0),
         )
@@ -289,7 +292,7 @@ fn build_features(
         fs::remove_file(&temp)?;
     }
     let query = format!(
-        "WITH universe AS (SELECT DISTINCT c.ts_code, ?::DATE trade_date FROM index_monthly_constituents c JOIN daily_aggregated b ON b.ts_code=c.ts_code AND b.trade_date=?::DATE WHERE c.index_code IN ({index_values}) AND c.as_of_date=(SELECT max(c2.as_of_date) FROM index_monthly_constituents c2 WHERE c2.index_code=c.index_code AND c2.as_of_date<=?::DATE) AND b.open>0 AND b.high>0 AND b.low>0 AND b.close>0 AND b.volume_share>0 AND b.amount_cny>0 AND b.observation_status='complete_trading' AND c.ts_code<>'000937.SZ') SELECT u.trade_date,u.ts_code,{} FROM universe u {} ORDER BY u.ts_code",
+        "WITH universe AS (SELECT DISTINCT c.ts_code, ?::DATE trade_date FROM index_monthly_constituents c JOIN market_daily_aggregated b ON b.ts_code=c.ts_code AND b.trade_date=?::DATE WHERE c.index_code IN ({index_values}) AND c.as_of_date=(SELECT max(c2.as_of_date) FROM index_monthly_constituents c2 WHERE c2.index_code=c.index_code AND c2.as_of_date<=?::DATE) AND b.open>0 AND b.high>0 AND b.low>0 AND b.close>0 AND b.volume_share>0 AND b.amount_cny>0 AND b.observation_status='complete_trading' AND c.ts_code<>'000937.SZ') SELECT u.trade_date,u.ts_code,{} FROM universe u {} ORDER BY u.ts_code",
         selects.join(","),
         joins.join(" ")
     );
@@ -397,6 +400,11 @@ fn run(args: RunArgs) -> Result<()> {
             .output_root
             .join("_minute_cache")
             .join(source.factor_set);
+        let live_file = day_file(&live_root, &args.date);
+        if !args.replace_minute && parquet_has_date(&conn, &live_file, &args.date)? {
+            minute_files.push(live_file);
+            continue;
+        }
         let threads = if matches!(source.factor_set, "ohlcv_candidates_v3" | "dos_minute_v1") {
             "1"
         } else {
@@ -430,11 +438,10 @@ fn run(args: RunArgs) -> Result<()> {
             command.push("--replace".into());
         }
         run_command(&minute_bin, &command)?;
-        let file = day_file(&live_root, &args.date);
-        if !parquet_has_date(&conn, &file, &args.date)? {
-            bail!("Rust minute build did not publish {}", file.display())
+        if !parquet_has_date(&conn, &live_file, &args.date)? {
+            bail!("Rust minute build did not publish {}", live_file.display())
         }
-        minute_files.push(file);
+        minute_files.push(live_file);
     }
     let factor_file = day_dir.join("factors.parquet");
     let factor_rows = build_features(
@@ -462,9 +469,10 @@ fn run(args: RunArgs) -> Result<()> {
             prediction_file.display().to_string(),
         ],
     )?;
-    let previous = match args.previous_positions {
-        Some(x) => Some(x),
-        None => latest_previous(&args.output_root, &args.date)?,
+    let previous = match (args.start_flat, args.previous_positions) {
+        (true, _) => None,
+        (false, Some(x)) => Some(x),
+        (false, None) => latest_previous(&args.output_root, &args.date)?,
     };
     let position_file = day_dir.join("positions.parquet");
     let mut position_args = vec![

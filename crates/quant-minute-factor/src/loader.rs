@@ -73,15 +73,30 @@ fn f64_column(
 /// Load one trade date.  `Ok(None)` means the partition directory is absent.
 pub fn load_day(minute_root: &Path, trade_date: &str) -> Result<Option<DayData>> {
     let partition = day_partition(minute_root, trade_date);
-    if !partition.is_dir() {
-        return Ok(None);
+    let mut parts: Vec<PathBuf> = if partition.is_dir() {
+        std::fs::read_dir(&partition)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // New vendor snapshots are stored as one immutable file per day rather
+    // than in the legacy year/month/day tree.  When the default legacy root
+    // has no partition, discover its canonical FTShare sibling.
+    if parts.is_empty()
+        && let Some(canonical_root) = minute_root.parent()
+    {
+        let ftshare = canonical_root
+            .join("ftshare")
+            .join(format!("trade_date={trade_date}"))
+            .join("minute.parquet");
+        if ftshare.is_file() {
+            parts.push(ftshare);
+        }
     }
-    let mut parts: Vec<PathBuf> = std::fs::read_dir(&partition)?
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
-        .collect();
     parts.sort();
     if parts.is_empty() {
         return Ok(None);

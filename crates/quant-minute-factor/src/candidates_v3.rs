@@ -1,18 +1,17 @@
 //! V3 minute-OHLCV candidates.  Unlike the older candidate sets this module
 //! deliberately keeps a whole block single-threaded: the only parallelism is
 //! between independent, warm-up-overlapped blocks.
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    loader,
+    BuildArgs, loader,
     manifest::{self, DayStatus, Manifest},
     pipeline,
     schema::{FactorFormula, SESSION_BARS},
     writer::{self, DynamicWideRow},
-    BuildArgs,
 };
 
 const N: usize = 20;
@@ -311,7 +310,17 @@ fn load_raw_daily(catalog: &Path, calendar: &[String]) -> Result<DailyPriceMap> 
     let start = calendar.first().context("empty calendar")?;
     let end = calendar.last().context("empty calendar")?;
     let mut out = DailyPriceMap::new();
-    let mut st=conn.prepare("SELECT trade_date::VARCHAR, ts_code, open, close FROM daily_aggregated WHERE trade_date BETWEEN ?::DATE AND ?::DATE AND open>0 AND close>0")?;
+    let has_market_view: bool = conn.query_row(
+        "SELECT count(*)>0 FROM duckdb_views() WHERE view_name='market_daily_aggregated'",
+        [],
+        |row| row.get(0),
+    )?;
+    let daily_source = if has_market_view {
+        "market_daily_aggregated"
+    } else {
+        "daily_aggregated"
+    };
+    let mut st=conn.prepare(&format!("SELECT trade_date::VARCHAR, ts_code, open, close FROM {daily_source} WHERE trade_date BETWEEN ?::DATE AND ?::DATE AND open>0 AND close>0"))?;
     for row in st.query_map([start, end], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -363,8 +372,14 @@ pub fn run(args: BuildArgs) -> Result<PathBuf> {
     let mut src = BTreeMap::new();
     src.insert("catalog".into(), catalog.display().to_string());
     src.insert("minute_root".into(), root.display().to_string());
-    src.insert("daily_price_source".into(), "daily_aggregated (raw)".into());
-    src.insert("universe".into(), format!("dynamic {}", args.index_codes.join(" union ")));
+    src.insert(
+        "daily_price_source".into(),
+        "market_daily_aggregated when available; otherwise daily_aggregated (raw)".into(),
+    );
+    src.insert(
+        "universe".into(),
+        format!("dynamic {}", args.index_codes.join(" union ")),
+    );
     let mp = output.join("manifest.json");
     let mut p = manifest::default_parameters(args.block_days, args.jobs, 1, args.memory_limit_mb);
     p.warmup_days = 40;
@@ -398,14 +413,18 @@ pub fn run(args: BuildArgs) -> Result<PathBuf> {
             let root = root.clone();
             let output = output.clone();
             let failures = &failures;
-            scope.spawn(move || loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if i >= blocks.len() {
-                    break;
-                }
-                if let Err(e) = run_block(&ctx, &daily_prices, &manifest, &root, &output, &blocks[i]) {
-                    failures.lock().unwrap().push(format!("block {i}: {e:#}"));
-                    break;
+            scope.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if i >= blocks.len() {
+                        break;
+                    }
+                    if let Err(e) =
+                        run_block(&ctx, &daily_prices, &manifest, &root, &output, &blocks[i])
+                    {
+                        failures.lock().unwrap().push(format!("block {i}: {e:#}"));
+                        break;
+                    }
                 }
             });
         }
