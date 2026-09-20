@@ -1391,6 +1391,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "quant-daily-factor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "duckdb",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "quant-lgbm-train"
 version = "0.1.0"
 dependencies = [
@@ -1400,6 +1412,7 @@ dependencies = [
  "duckdb",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

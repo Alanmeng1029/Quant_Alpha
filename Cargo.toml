@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/quant-backtest", "crates/quant-lgbm-train", "crates/quant-minute-factor"]
+members = ["crates/quant-backtest", "crates/quant-daily-factor", "crates/quant-lgbm-train", "crates/quant-minute-factor"]
 resolver = "2"
 
 [workspace.package]

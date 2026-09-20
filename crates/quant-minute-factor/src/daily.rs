@@ -10,11 +10,7 @@ use crate::loader::Bar;
 use crate::schema::*;
 
 fn finite(value: f64) -> Option<f64> {
-    if value.is_finite() {
-        Some(value)
-    } else {
-        None
-    }
+    if value.is_finite() { Some(value) } else { None }
 }
 
 /// Log returns.  `r[0] = ln(close_0/open_0)` captures the opening auction bar;
@@ -361,6 +357,8 @@ mod tests {
         Box::new(std::array::from_fn(|t| Bar {
             minute_index: t as u8,
             open: price,
+            high: price,
+            low: price,
             close: price,
             volume_share: volume as f64,
             amount,

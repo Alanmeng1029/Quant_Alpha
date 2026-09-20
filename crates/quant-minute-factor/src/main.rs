@@ -9,6 +9,7 @@
 mod candidates;
 mod candidates_v3;
 mod daily;
+mod dos_candidates;
 mod loader;
 mod manifest;
 mod pipeline;
@@ -67,7 +68,8 @@ pub(crate) struct BuildArgs {
     /// Recompute the requested range even when the manifest marks it complete.
     #[arg(long)]
     pub(crate) replace: bool,
-    /// Factor registry to produce: core24 or ohlcv_candidates_v1.
+    /// Factor registry to produce: core24, ohlcv_candidates_v1,
+    /// ohlcv_candidates_v3, or dos_minute_v1.
     #[arg(long, default_value = "core24")]
     pub(crate) factor_set: String,
     /// Comma-separated point-in-time index membership used for the output
@@ -124,9 +126,12 @@ fn run_build(args: BuildArgs) -> Result<PathBuf> {
     if args.factor_set == "ohlcv_candidates_v3" {
         return candidates_v3::run(args);
     }
+    if args.factor_set == "dos_minute_v1" {
+        return dos_candidates::run(args);
+    }
     if args.factor_set != "core24" {
         bail!(
-            "unknown --factor-set {}; expected core24, ohlcv_candidates_v1, or ohlcv_candidates_v3",
+            "unknown --factor-set {}; expected core24, ohlcv_candidates_v1, ohlcv_candidates_v3, or dos_minute_v1",
             args.factor_set
         );
     }
@@ -498,6 +503,8 @@ mod tests {
             Field::new("ts_code", DataType::Utf8, false),
             Field::new("minute_index", DataType::UInt8, false),
             Field::new("open", DataType::Float64, true),
+            Field::new("high", DataType::Float64, true),
+            Field::new("low", DataType::Float64, true),
             Field::new("close", DataType::Float64, true),
             Field::new("volume_share", DataType::Int64, true),
             Field::new("amount_cny", DataType::Float64, true),
@@ -513,6 +520,12 @@ mod tests {
                 )),
                 Arc::new(Float64Array::from(
                     rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter().map(|r| r.2.max(r.3)).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter().map(|r| r.2.min(r.3)).collect::<Vec<_>>(),
                 )),
                 Arc::new(Float64Array::from(
                     rows.iter().map(|r| r.3).collect::<Vec<_>>(),

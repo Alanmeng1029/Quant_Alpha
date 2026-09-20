@@ -15,6 +15,8 @@ use crate::schema::SESSION_BARS;
 pub struct Bar {
     pub minute_index: u8,
     pub open: f64,
+    pub high: f64,
+    pub low: f64,
     pub close: f64,
     pub volume_share: f64,
     pub amount: f64,
@@ -98,6 +100,8 @@ pub fn load_day(minute_root: &Path, trade_date: &str) -> Result<Option<DayData>>
             "ts_code",
             "minute_index",
             "open",
+            "high",
+            "low",
             "close",
             "volume_share",
             "amount_cny",
@@ -132,6 +136,8 @@ pub fn load_day(minute_root: &Path, trade_date: &str) -> Result<Option<DayData>>
                 .context("minute_index is not UInt8")
                 .map(|a| a.clone())?;
             let opens = f64_column(&batch, "open")?;
+            let highs = f64_column(&batch, "high")?;
+            let lows = f64_column(&batch, "low")?;
             let closes = f64_column(&batch, "close")?;
             let volumes = f64_column(&batch, "volume_share")?;
             let amounts = f64_column(&batch, "amount_cny")?;
@@ -150,6 +156,8 @@ pub fn load_day(minute_root: &Path, trade_date: &str) -> Result<Option<DayData>>
                     Box::new(std::array::from_fn(|_| Bar {
                         minute_index: 0,
                         open: f64::NAN,
+                        high: f64::NAN,
+                        low: f64::NAN,
                         close: f64::NAN,
                         volume_share: 0.0,
                         amount: 0.0,
@@ -158,6 +166,8 @@ pub fn load_day(minute_root: &Path, trade_date: &str) -> Result<Option<DayData>>
                 slot[index as usize] = Bar {
                     minute_index: index,
                     open: opens.value(row),
+                    high: highs.value(row),
+                    low: lows.value(row),
                     close: closes.value(row),
                     volume_share: volumes.value(row),
                     amount: amounts.value(row),
@@ -173,7 +183,14 @@ pub fn load_day(minute_root: &Path, trade_date: &str) -> Result<Option<DayData>>
             continue;
         }
         if day_bars.iter().any(|bar| {
-            !(bar.open.is_finite() && bar.close.is_finite() && bar.open > 0.0 && bar.close > 0.0)
+            !(bar.open.is_finite()
+                && bar.close.is_finite()
+                && bar.high.is_finite()
+                && bar.low.is_finite()
+                && bar.open > 0.0
+                && bar.close > 0.0
+                && bar.high > 0.0
+                && bar.low > 0.0)
         }) {
             excluded.push((code, "invalid_price"));
             continue;
@@ -200,6 +217,8 @@ mod tests {
             Field::new("ts_code", DataType::Utf8, false),
             Field::new("minute_index", DataType::UInt8, false),
             Field::new("open", DataType::Float64, true),
+            Field::new("high", DataType::Float64, true),
+            Field::new("low", DataType::Float64, true),
             Field::new("close", DataType::Float64, true),
             Field::new("volume_share", DataType::Int64, true),
             Field::new("amount_cny", DataType::Float64, true),
@@ -215,6 +234,12 @@ mod tests {
                 )),
                 Arc::new(Float64Array::from(
                     rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter().map(|r| r.2.max(r.3)).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter().map(|r| r.2.min(r.3)).collect::<Vec<_>>(),
                 )),
                 Arc::new(Float64Array::from(
                     rows.iter().map(|r| r.3).collect::<Vec<_>>(),
