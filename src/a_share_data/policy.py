@@ -39,8 +39,8 @@ class LimitedReplacementConfig:
     rank_tilt: float = 0.15
     lot_size: int = 100
     initial_capital: float = 10_000_000.0
-    buy_bps: float = 2.1
-    sell_bps: float = 7.1
+    buy_bps: float = 2.0
+    sell_bps: float = 2.0
     target_fraction: float | None = None
     rebalance_frequency: str = "daily"
     sleeve_nav_targets: dict[str, float] | None = None

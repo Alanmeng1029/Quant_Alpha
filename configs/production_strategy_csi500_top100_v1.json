@@ -1,6 +1,6 @@
 {
   "strategy_id": "csi500_top100_swap3_v1",
-  "status": "active",
+  "status": "superseded",
   "model_factor_set": "o2o_daily60_minute45_v2",
   "prediction_config": "configs/prediction_research_105_v2.json",
   "prediction_artifact": "results/predict/research-oos-daily60-minute45-v2/predictions/lgbm_default105.parquet",

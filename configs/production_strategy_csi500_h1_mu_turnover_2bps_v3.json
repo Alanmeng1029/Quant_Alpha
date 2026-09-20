@@ -1,0 +1,50 @@
+{
+  "strategy_id": "csi500_h1_mu_turnover_2bps_v3",
+  "status": "active",
+  "model_factor_set": "o2o_raw_daily60_minute45_dos20_v1",
+  "prediction_artifact": "results/predict/research-oos-raw-daily60-minute45-dos20-csi300-csi500-h1-h5-h10-v1/predictions.parquet",
+  "model": {
+    "algorithm": "default_lgbm_regression",
+    "training_universe": "CSI300_union_CSI500",
+    "refit_frequency": "quarterly_rolling_oos",
+    "production_signal": "H1_only"
+  },
+  "universe": {
+    "index_code": "000905.SH",
+    "name": "CSI500",
+    "membership_timing": "signal_date",
+    "membership_source": "index_trading_universe"
+  },
+  "portfolio": {
+    "strategy": "mu_minus_symmetric_turnover_cost_no_risk_v1",
+    "objective": "maximize mu*w - buy_cost*buys - sell_cost*sells",
+    "risk_term": null,
+    "invested_weight": 0.98,
+    "max_weight": 0.01,
+    "expected_target_holdings": 98,
+    "signal": "raw_h1",
+    "lot_size": 100,
+    "initial_capital": 10000000.0
+  },
+  "costs": {
+    "buy_bps": 2.0,
+    "sell_bps": 2.0
+  },
+  "evidence": {
+    "comparison": "results/predict/regression-105-125-execution-2bps-v1/comparison.csv",
+    "report": "results/predict/regression-105-125-execution-2bps-v1/new125/optimizer/report/report.html",
+    "evaluation_window": "2021-04-02_to_2026-08-27",
+    "net_total_return": 1.474565442077116,
+    "csi500_total_return": 0.25692677691883214,
+    "relative_total_return": 0.9687427203541186,
+    "information_ratio": 1.2930044292363687,
+    "max_drawdown": -0.28073936374184794,
+    "average_buy_turnover": 0.39155829850927804,
+    "average_sell_turnover": 0.3909877486556644
+  },
+  "approval": {
+    "approved_by": "Alanmxy",
+    "approved_on": "2026-09-20",
+    "approval_note": "Replaces the 105-factor limited-replacement baseline. Production must keep the 2bps symmetric cost convention and monitor realized turnover and capacity."
+  }
+}

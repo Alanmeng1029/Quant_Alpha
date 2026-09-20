@@ -1,0 +1,22 @@
+# dos_minute_v1 candidates selected on CSI300+CSI500 by maximum absolute
+# exponentially weighted H1/H5 Rank-ICIR through 2024-12-31.
+mf_dos_corr_ret_amount
+mf_dos_corr_ret_lag_amount
+mf_dos_corr_lag_ret_amount
+mf_dos_flash_volatility
+mf_dos_vsa_ratio
+mf_dos_p_dis_vol
+mf_dos_fall_center_dev
+mf_dos_consist_volume
+mf_dos_b_dis_vol
+mf_dos_dawn_fog_vol_persist
+mf_dos_ratio_fuzziness_amt_corr
+mf_dos_volume_peak_count
+mf_dos_corr_lag_ret_adj_amount
+mf_dos_corr_ret_lag_adj_amount
+mf_dos_patv
+mf_dos_ratio_fuzziness_amount
+mf_dos_ratio_fuzziness_volume
+mf_dos_single_vol_prop_entropy
+mf_dos_vol_prop_entropy
+mf_dos_resilience_cov

@@ -1,6 +1,6 @@
 # Quant_Alpha 架构与产物
 
-更新：2026-09-16。
+更新：2026-09-20。
 
 项目是一条有明确数据契约的研究流水线：
 
@@ -15,12 +15,12 @@ Data → Factor research / production → Model / prediction → Portfolio polic
 | 层 | 当前正式口径 | 版本来源 |
 | --- | --- | --- |
 | 数据 | 2018-01-02 至 2026-08-28 的本地分钟湖与聚合日频 | `DATA_STATUS.md` |
-| 因子 | `o2o_daily60_minute45_v2`，105 因子，状态 `active` | `configs/formal_factor_sets/o2o_daily60_minute45_v2.json` |
-| 模型 | `lgbm_default105`，季度滚动样本外 | `configs/prediction_research_105_v2.json` |
-| 组合 | 历史 CSI500 内 `limited_replacement_v2`，Top100 / 退出 Top120 / 每日最多替换 3 只 | `configs/production_strategy_csi500_top100_v1.json` |
+| 因子 | `o2o_raw_daily60_minute45_dos20_v1`，125 因子，状态 `active` | `configs/formal_factor_sets/o2o_raw_daily60_minute45_dos20_v1.json` |
+| 模型 | 默认 LightGBM 回归 H1，季度滚动样本外 | `results/predict/research-oos-raw-daily60-minute45-dos20-csi300-csi500-h1-h5-h10-v1/` |
+| 组合 | 历史 CSI500 内，`mu - turnover cost` optimizer；98%投资、单票上限1%、无风险项 | `configs/production_strategy_csi500_h1_mu_turnover_2bps_v3.json` |
 | 回测 | 2021-04-02 至 2026-08-27，已计买卖费用 | `docs/PRODUCTION_BACKTEST.md` |
 
-98 因子 `o2o_daily60_minute38_v1` 已标记为 `superseded`。它仍是有效的历史基线，但不应在新文档中称为“当前正式版本”。
+旧105因子和98因子版本均已标记为 `superseded`。它们仍是有效的历史基线，但不应在新文档中称为“当前正式版本”。
 
 ## 1. Data
 
@@ -56,7 +56,7 @@ Python/Polars 和 Rust 引擎在完整历史截面计算候选因子；批量评
 
 正式因子集由版本化 JSON 冻结。研究因子不会自动晋级：正式因子必须保留公式、输入、区间、行数、哈希和审批证据，并通过 `quant-factor-store` 注册和启用。
 
-当前正式集 [`o2o_daily60_minute45_v2`](../configs/formal_factor_sets/o2o_daily60_minute45_v2.json) 包含：
+当前正式集 [`o2o_raw_daily60_minute45_dos20_v1`](../configs/formal_factor_sets/o2o_raw_daily60_minute45_dos20_v1.json) 包含：
 
 | 组件 | 数量 | 来源 |
 | --- | ---: | --- |
@@ -64,8 +64,9 @@ Python/Polars 和 Rust 引擎在完整历史截面计算候选因子；批量评
 | Minute OHLCV v1 | 28 | `candidate_factors_minute_ohlcv_open_to_open_abs_icir_gt2_h1_or_h5.txt` |
 | Minute Core24 | 10 | `candidate_factors_minute_core24_o2o_selected10.txt` |
 | Minute OHLCV v3 | 7 | `candidate_factors_minute_ohlcv_v3_o2o_abs_annual_icir_gt2_h1_or_h5.txt` |
+| DOS Minute v1 | 20 | `candidate_factors_minute_dos_v1_selected20.txt` |
 
-共 105 个特征。详细分钟因子公式、筛选结果和生产约束见 [`MINUTE_FACTOR_FRAMEWORK.md`](MINUTE_FACTOR_FRAMEWORK.md) 与 `research/minute_factor_sources/`。
+共125个特征。详细分钟因子公式、筛选结果和生产约束见 [`MINUTE_FACTOR_FRAMEWORK.md`](MINUTE_FACTOR_FRAMEWORK.md) 与 `research/minute_factor_sources/`。
 
 ## 3. Model / prediction
 
@@ -80,29 +81,29 @@ Python/Polars 和 Rust 引擎在完整历史截面计算候选因子；批量评
 
 `quant-predict research-oos` 每季度重训 H1/H5 两个 LightGBM。训练只使用此前 756 个交易日，并与测试段留出 6 个交易日的标签成熟间隔。每个信号日的特征做截面去极值和标准化，不使用未来截面。
 
-当前模型为默认参数的 `lgbm_default105`。105 因子版本的全段平均 Rank IC 为 H1 0.03517、H5 0.03086；预测和模型文件保存在本地 `results/predict/research-oos-daily60-minute45-v2/`。
+当前模型为125因子默认 LightGBM 回归的 H1 输出。预测和模型文件保存在本地 `results/predict/research-oos-raw-daily60-minute45-dos20-csi300-csi500-h1-h5-h10-v1/`。
 
 ## 4. Portfolio policy / backtest
 
 ### 正式规则
 
-`limited_replacement_v2` 从真实成交后的现金和持仓继续下一日决策，而不是把昨日目标权重当成已成交仓位。
+当前组合使用精确可分的无风险项 optimizer：保留原仓位的边际价值为 `mu + sell_cost`，新增仓位的边际价值为 `mu - buy_cost`，据此分配目标权重；回测仍从真实成交后的现金和持仓继续下一日。
 
 | 参数 | 值 |
 | --- | ---: |
 | 选股股票池 | 信号日历史 CSI500 成分 |
-| 目标持股 / 进入排名 / 退出排名 | 100 / 100 / 120 |
-| 每日最多主动替换 | 3 只 |
-| 单票上限 / 风险降至 | 3.0% / 2.8% |
-| 现金预留 | 2% |
-| 每日买入 / 卖出预算 | 各 10% NAV |
-| H1 / H5 权重 | 50% / 50% |
+| 目标投资权重 | 98% |
+| 单票上限 | 1% |
+| 目标持股数 | 通常98只 |
+| 信号 | H1-only |
+| 风险项 | 无 |
+| 换手硬限制 | 无；通过目标函数中的成本惩罚控制 |
 | 整手 | 100 股 |
-| 买入 / 卖出成本 | 2.1bp / 7.1bp |
+| 买入 / 卖出成本 | 2bp / 2bp |
 
 回测按 T+1 开盘成交并逐日记录订单、未成交原因、成交、现金、复权等价股数、费用和 NAV。独立零费率账户只用于诊断成本拖累，不能与含费账户拼接。
 
-正式结果为累计净收益 106.14%、年化 14.92%、最大回撤 -23.36%、信息比率 0.974。完整说明和标准 HTML 生成命令见 [`PRODUCTION_BACKTEST.md`](PRODUCTION_BACKTEST.md)。
+正式结果为累计净收益147.46%、年化19.03%、最大回撤-28.07%、信息比率1.293。完整说明见 [`PRODUCTION_BACKTEST.md`](PRODUCTION_BACKTEST.md)。
 
 ## 模块接口
 
@@ -127,7 +128,7 @@ Python/Polars 和 Rust 引擎在完整历史截面计算候选因子；批量评
 - `target/`、`__pycache__/`、`.pytest_cache/`、`.DS_Store`、编辑器状态；
 - 本地下载的论文、研报 PDF 和网页快照，除非许可明确且有必要随仓库发布。
 
-HTML、PNG 等回测展示由现有 `quant-predict render-backtest-report` 从本地账本生成。当前正式版本的轻量发布快照位于 `docs/reports/csi500_top100_swap3/`；它不替代本地 Parquet 审计账本。
+HTML、PNG 等回测展示由现有 `quant-predict render-backtest-report` 从本地账本生成。`docs/reports/csi500_top100_swap3/` 只保留旧基线的历史快照；当前 optimizer 报告位于本地 `results/predict/regression-105-125-execution-2bps-v1/`，不能替代 Parquet 审计账本。
 
 ## 仍未覆盖的生产风险
 

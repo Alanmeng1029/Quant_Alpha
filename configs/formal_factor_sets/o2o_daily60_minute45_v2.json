@@ -1,6 +1,6 @@
 {
   "factor_set_id": "o2o_daily60_minute45_v2",
-  "status": "active",
+  "status": "superseded",
   "output_frequency": "daily",
   "factor_count": 105,
   "approval": {

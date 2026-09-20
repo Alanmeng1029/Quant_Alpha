@@ -1,0 +1,26 @@
+{
+  "factor_set_id": "o2o_raw_daily60_minute45_dos20_v1",
+  "status": "active",
+  "output_frequency": "daily",
+  "factor_count": 125,
+  "price_basis": "raw_features_qfq_labels",
+  "approval": {
+    "approved_by": "Alanmxy",
+    "approved_on": "2026-09-20",
+    "approval_note": "Promoted with the H1 regression and cost-aware no-risk optimizer after a common 2bps execution comparison against the previous 105-factor baseline."
+  },
+  "daily_component": {
+    "count": 60,
+    "factor_ids_file": "configs/candidate_factors_daily_o2o_candidate60_raw_v1.txt"
+  },
+  "minute_components": [
+    {"count": 28, "dataset": "A_stock_database/lake/derived/minute_factors/ohlcv_candidates_v1_raw_csi300_csi500_csi1000_v2"},
+    {"count": 10, "dataset": "A_stock_database/lake/derived/minute_factors/core24_raw_csi300_csi500_csi1000_v2"},
+    {"count": 7, "dataset": "A_stock_database/lake/derived/minute_factors/ohlcv_candidates_v3_raw_csi300_csi500_csi1000_v2"},
+    {"count": 20, "factor_ids_file": "configs/candidate_factors_minute_dos_v1_selected20.txt", "dataset": "A_stock_database/lake/derived/minute_factors/dos_minute_v1_raw_csi300_csi500_v1"}
+  ],
+  "active_feature_cache": "A_stock_database/lake/derived/predict_features_o2o_raw_daily60_minute45_dos20_csi300_csi500_v1",
+  "active_prediction": "results/predict/research-oos-raw-daily60-minute45-dos20-csi300-csi500-h1-h5-h10-v1/predictions.parquet",
+  "strategy": "mu_minus_symmetric_turnover_cost_no_risk_v1",
+  "active_strategy_config": "configs/production_strategy_csi500_h1_mu_turnover_2bps_v3.json"
+}
