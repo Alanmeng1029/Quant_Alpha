@@ -12,6 +12,11 @@ required-features = ["optimizer"]
 name = "quant-dual-sleeve-backtest"
 path = "src/bin/dual_sleeve_backtest.rs"
 
+[[bin]]
+name = "risk_multiperiod_optimizer"
+path = "src/bin/risk_multiperiod_optimizer.rs"
+required-features = ["optimizer"]
+
 [dependencies]
 anyhow = "1"
 chrono = "0.4"

@@ -1,0 +1,91 @@
+/**
+成交量波峰计数因子
+
+- 成交量波峰：成交量大于当日成交量均值 + 1 倍标准差的时刻
+- 成交量波峰计数因子：统计每条记录与上一条记录时间差超过 1 分钟的记录条数
+
+DolphinDB server version:3.00.2.5 2025.05.26 LINUX x86_64
+DolphinDB server version:2.00.15 2025.01.20 LINUX x86_64(test)
+Storage engine: TSDB
+Last modification time: 2025.11.02
+*/
+
+//自定义因子计算函数
+def volumePeakCount(minKTB){
+    /*@test 少量数据临时调试
+    minKTB =
+        select SecurityID, date(DateTime) as TradeDate, time(DateTime) as TradeTime, LastPx, Volume
+        from loadTable("dfs://stockMinKSH", "stockMinKSH")
+        where SecurityID in `603189`000088, date(DateTime)=2021.01.04, LastPx>0
+    */
+    //计算筛选阈值
+    threshold = 
+        select
+            SecurityID, TradeDate,
+            mean(Volume)+std(Volume) as thresholdTradeQty
+        from minKTB
+        group by SecurityID, TradeDate
+    //计算时间差
+    resTemp = 
+        select 
+            SecurityID, TradeDate, TradeTime, 
+            Volume,
+            deltas(TradeTime) as deltasTime
+        from lj(minKTB, threshold, `SecurityID`TradeDate) 
+        where Volume>thresholdTradeQty
+        context by SecurityID, TradeDate
+    //保留时间差超过1分钟的数据并统计数量，统计剩余数据的的个数即为成交量波峰计数
+    res = 
+        select
+            SecurityID, 
+            TradeDate,
+            count(Volume) as value,
+            "volumePeakCount" as factorName, 
+            now() as updateTime
+        from resTemp
+        where deltasTime > 60000
+        group by TradeDate, SecurityID
+    return res
+}
+
+//后台任务计算函数模版
+def factorjob(conf){
+    dataTB = loadTable(conf[`dataDB], conf[`dataTB])
+    days = conf[`startDay]..conf[`endDay]
+    startTime = 09:30:00.000
+    endTime = 14:57:00.000
+    //提取计算所需数据，sqlDS生成元代码
+    ds = sqlDS(<select SecurityID, date(DateTime) as TradeDate, time(DateTime) as TradeTime, LastPx, Volume
+        from dataTB 
+        where date(DateTime) in days and (time(DateTime) between startTime and endTime) and (SecurityID like "00%" or SecurityID like "30%" or SecurityID like "6%") and LastPx>0>)
+    //计算因子，mr函数将因子在不同节点并行计算，unionAll函数将不同节点的计算结果汇总
+    res = mr(ds, conf[`func]).unionAll()
+    //写入因子库，存储到磁盘做持久化
+    loadTable(conf[`factorDB], conf[`factorTB]).append!(select * from res)
+}
+
+// 配置计算因子的参数
+conf = {
+    func : volumePeakCount,
+    funcsec : NULL,
+    factorname : `volumePeakCount,
+    dataDB : "dfs://stockMinKSH",
+    dataTB : "stockMinKSH",
+    factorDB : "dfs://factor_day",
+    factorTB : `factor_day,
+    startDay : 2021.01.01,
+    endDay : 2021.01.31
+}
+
+//提交计算和存储因子的任务到服务器
+id = submitJob("factor_job", conf[`factorname], factorjob, conf)
+
+//查看任务完成情况
+getJobStatus(id)
+
+//因子数据查看
+data = select * from loadTable("dfs://factor_day","factor_day") where TradeDate=2021.01.04, factorname="volumePeakCount", SecurityID in `603189`000088 order by updateTime desc
+
+select count(*) from loadTable("dfs://factor_day","factor_day") where factorname="volumePeakCount" group by TradeDate
+
+select startTime, endTime, (endTime-startTime)\1000 from getJobStatus(id)

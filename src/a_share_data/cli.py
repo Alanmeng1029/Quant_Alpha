@@ -871,7 +871,11 @@ def cmd_fetch_index_daily(args: argparse.Namespace) -> None:
     if login.error_code != "0": raise RuntimeError(f"BaoStock login failed: {login.error_msg}")
     try:
         frames = []
-        for source_code, index_code, name in (("sh.000300", "000300.SH", "CSI300"), ("sh.000905", "000905.SH", "CSI500")):
+        for source_code, index_code, name in (
+            ("sh.000300", "000300.SH", "CSI300"),
+            ("sh.000905", "000905.SH", "CSI500"),
+            ("sh.000852", "000852.SH", "CSI1000"),
+        ):
             rs = bs.query_history_k_data_plus(source_code, "date,open,high,low,close,preclose,volume,amount,pctChg", start_date=args.start, end_date=args.end, frequency="d", adjustflag="3")
             if rs.error_code != "0": raise RuntimeError(f"BaoStock {source_code}: {rs.error_msg}")
             rows=[]
@@ -1242,6 +1246,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_arguments(ftshare)
     ftshare.add_argument("--source-dir", required=True)
     ftshare.set_defaults(handler=cmd_ingest_ftshare)
+
+    from .ftshare import cmd_ingest_ftshare_adjust
+    ftshare_adjust = subparsers.add_parser("ingest-ftshare-adjust", help="Ingest one day's FTShare adjustment factors")
+    add_common_arguments(ftshare_adjust)
+    ftshare_adjust.add_argument("--source-dir", required=True, help="Day directory containing adjust_factors.json")
+    ftshare_adjust.set_defaults(handler=cmd_ingest_ftshare_adjust)
 
     inventory = subparsers.add_parser("inventory", help="Record source-file metadata")
     add_common_arguments(inventory)

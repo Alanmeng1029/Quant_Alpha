@@ -1,0 +1,52 @@
+{
+  "strategy_id": "csi500_h1h5_five_period_mu_turnover_2bps_v4",
+  "status": "superseded",
+  "superseded_by": "configs/production_strategy_csi500_h1h5_blend_80_20_2bps_v5.json",
+  "model_factor_set": "o2o_raw_daily60_minute45_dos20_v1",
+  "prediction_artifact": "results/predict/research-oos-raw-daily60-minute45-dos20-csi300-csi500-h1-h5-h10-v1/predictions.parquet",
+  "model": {
+    "algorithm": "default_lgbm_regression",
+    "training_universe": "CSI300_union_CSI500",
+    "refit_frequency": "quarterly_rolling_oos",
+    "production_signals": ["H1", "H5"]
+  },
+  "universe": {
+    "index_code": "000905.SH",
+    "membership_timing": "signal_date",
+    "membership_source": "index_trading_universe"
+  },
+  "portfolio": {
+    "strategy": "five_period_receding_horizon_mu_turnover_no_risk_v1",
+    "objective": "maximize sum_t alpha_t*w_t - buy_cost*buys_t - sell_cost*sells_t",
+    "forecast_curve": {
+      "period_1": "raw_h1",
+      "periods_2_to_5": "(raw_h5-raw_h1)/4"
+    },
+    "execution_policy": "solve five periods daily and execute only period-1 target",
+    "risk_term": null,
+    "invested_weight": 0.98,
+    "max_weight": 0.01,
+    "expected_target_holdings": 98,
+    "lot_size": 100,
+    "initial_capital": 10000000.0
+  },
+  "costs": {"buy_bps": 2.0, "sell_bps": 2.0},
+  "evidence": {
+    "full_report": "results/predict/new125-multiperiod-optimizer-2bps-v1/report/report.html",
+    "fresh_2025_report": "results/predict/new125-multiperiod-from-2025-2bps-v1/h1h5_5period/report/report.html",
+    "evaluation_window": "2021-04-02_to_2026-08-27",
+    "net_total_return": 1.6722596878235763,
+    "csi500_total_return": 0.25692677691883214,
+    "relative_total_return": 1.12602654100044,
+    "information_ratio": 1.4318603165079187,
+    "max_drawdown": -0.27319547117682885,
+    "average_buy_turnover": 0.38726699627022615,
+    "fresh_2025_net_total_return": 0.49567264961137547,
+    "fresh_2025_relative_total_return": 0.07716929271264727
+  },
+  "approval": {
+    "approved_by": "Alanmxy",
+    "approved_on": "2026-09-20",
+    "approval_note": "Promoted after outperforming the single-period H1 optimizer in the full OOS window and in a fresh-capital backtest beginning in 2025."
+  }
+}

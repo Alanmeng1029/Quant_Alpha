@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::schema::{formulas, MIN_BASELINE_OBS, MIN_SMART_PRIOR_OBS};
+use crate::schema::{MIN_BASELINE_OBS, MIN_SMART_PRIOR_OBS, formulas};
 
 pub const MANIFEST_VERSION: u32 = 1;
 

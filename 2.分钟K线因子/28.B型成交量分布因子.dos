@@ -1,0 +1,122 @@
+/**
+B型成交量分布因子
+
+- 同价成交量：将日内分钟收盘价相同的成交量累加在一起，得到成交量随价格的分布
+- 成交量支撑点和成交量支撑区域：成交量累计最大的价格及其附近区域（区域累积成交量达全天成交量50%的最小区域）
+- B型成交量分布：成交量支撑区域上限价格与当日最最低价之差
+
+DolphinDB server version:3.00.2.5 2025.05.26 LINUX x86_64
+DolphinDB server version:2.00.15 2025.01.20 LINUX x86_64(test)
+Storage engine: TSDB
+Last modification time: 2025.11.03
+ */
+
+//自定义因子计算函数
+def bDisVol(minKTB){
+    /**@test 少量数据临时调试
+    minKTB = 
+        select SecurityID, date(DateTime) as TradeDate, time(DateTime) as TradeTime, LowPx, LastPx, Volume
+        from loadTable("dfs://stockMinKSH", "stockMinKSH")
+        where date(DateTime)=2021.01.04, SecurityID in `603189`000001 and LastPx>0
+    */
+    //计算同价成交量
+    adjVol = 
+        select
+            SecurityID,
+            TradeDate,
+            LastPx,
+            min(LowPx) as minLow,
+            sum(Volume) as adjVolume
+        from minKTB
+        group by SecurityID, TradeDate, LastPx
+        order by SecurityID, TradeDate, LastPx
+    //计算每只票每日最高价、成交量支撑点、同价成交量最大值及成交总量
+    volSupportPx = 
+        select
+            SecurityID,
+            TradeDate,
+            min(minLow) as lowPrice,
+            aggrTopN(first, LastPx, adjVolume, 1, false) as volSupportPrice,
+            max(adjVolume) as maxAdjVol,
+            sum(adjVolume) as totalVolume
+        from adjVol
+        group by SecurityID, TradeDate
+    //计算成交量支撑区域
+    tmp1 = 
+        select 
+            *,
+            abs(LastPx-volSupportPrice) as deltasVSP,
+            adjVolume\totalVolume as propVol
+        from lj(adjVol, volSupportPx, `SecurityID`TradeDate)
+        order by SecurityID, TradeDate, deltasVSP asc, adjVolume desc
+    tmp2 =
+        select
+            SecurityID,
+            TradeDate,
+            ifirstHit(>=, cumsum(propVol), 0.5) as VSP
+        from tmp1 
+        group by SecurityID, TradeDate
+    volSupportArea = 
+        select 
+            *, 
+            rowNo(SecurityID) as rowNum 
+        from lj(tmp1, tmp2, `SecurityID`TradeDate) 
+        context by SecurityID, TradeDate
+    //B型成交量分布：成交量支撑区域上限价格与当日最最低价之差
+    res =
+        select
+            SecurityID,
+            TradeDate,
+            max(LastPx)-min(lowPrice) as Value,
+            "bDisVol" as factorName,
+            now() as updateTime
+        from volSupportArea
+        where rowNum <= VSP
+        group by SecurityID, TradeDate
+    return res
+}
+
+//后台任务计算函数模版
+def factorjob(conf){
+    dataTB = loadTable(conf[`dataDB], conf[`dataTB])
+    days = conf[`startDay]..conf[`endDay]
+    startTime = 09:30:00.000
+    endTime = 14:57:00.000
+    //提取计算所需数据，sqlDS生成元代码
+    ds = sqlDS(<select SecurityID, date(DateTime) as TradeDate, time(DateTime) as TradeTime, LowPx, LastPx, Volume
+        from dataTB
+        where date(DateTime) in days and (time(DateTime) between startTime and endTime) and (SecurityID like "00%" or SecurityID like "30%" or SecurityID like "6%") and LastPx>0>)
+    //计算因子，mr函数将因子在不同节点并行计算，unionAll函数将不同节点的计算结果汇总
+    res = mr(ds, conf[`func]).unionAll()
+    //写入因子库，存储到磁盘做持久化
+    loadTable(conf[`factorDB], conf[`factorTB]).append!(select * from res)
+}
+
+//计算模版配置参数
+conf = {
+    func : bDisVol,
+    funcsec : NULL,
+    factorname : "bDisVol",
+    dataDB : "dfs://stockMinKSH",
+    dataTB : "stockMinKSH",
+    factorDB : "dfs://factor_day",
+    factorTB : "factor_day",
+    startDay : 2021.01.01,
+    endDay : 2021.01.31
+}
+
+//提交计算和存储因子的任务到服务器
+id = submitJob("factorjob", conf[`factorname], factorjob, conf)
+
+//查看任务完成情况
+getJobStatus(id)
+
+//3个月计算耗时
+(2025.07.03 23:22:24.168-2025.07.03 23:20:47.453)\1000 //96s 无缓存，全部从磁盘读取L2原始行情
+
+//因子数据查看
+data = select * from loadTable("dfs://factor_day","factor_day") where TradeDate=2021.01.04, SecurityID in `603189, factorname="bDisVol"
+
+select count(*) from loadTable("dfs://factor_day","factor_day") where factorname="bDisVol" group by TradeDate
+
+select (endTime-startTime)\1000 from getJobStatus(id)

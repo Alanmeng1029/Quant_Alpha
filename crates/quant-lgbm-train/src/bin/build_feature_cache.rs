@@ -10,10 +10,14 @@ use std::path::{Path, PathBuf};
 struct Args {
     #[arg(long)]
     catalog: PathBuf,
-    #[arg(long)]
-    daily_root: PathBuf,
-    #[arg(long)]
-    daily_ids: PathBuf,
+    /// Long-format daily-factor root. Omit together with --daily-ids for a
+    /// minute-only research cache.
+    #[arg(long, requires = "daily_ids")]
+    daily_root: Option<PathBuf>,
+    /// Daily factor ID list. Omit together with --daily-root for a
+    /// minute-only research cache.
+    #[arg(long, requires = "daily_root")]
+    daily_ids: Option<PathBuf>,
     #[arg(long, value_parser = parse_source)]
     minute_source: Vec<(PathBuf, PathBuf)>,
     #[arg(long)]
@@ -28,6 +32,10 @@ struct Args {
     end: String,
     #[arg(long, default_value_t = 4096)]
     memory_limit_mb: usize,
+    /// Validate the assembled feature count. Production keeps the 105-factor
+    /// default; explicit research ablations may override it.
+    #[arg(long, default_value_t = 105)]
+    expected_factor_count: usize,
 }
 
 fn parse_source(value: &str) -> Result<(PathBuf, PathBuf), String> {
@@ -84,7 +92,12 @@ fn main() -> Result<()> {
         .map(|code| format!("'{code}'"))
         .collect::<Vec<_>>()
         .join(",");
-    let daily_ids = ids(&args.daily_ids)?;
+    let daily_ids = args
+        .daily_ids
+        .as_deref()
+        .map(ids)
+        .transpose()?
+        .unwrap_or_default();
     let minute = args
         .minute_source
         .iter()
@@ -94,16 +107,23 @@ fn main() -> Result<()> {
     for (_, values) in &minute {
         all_ids.extend(values.iter().cloned());
     }
-    if all_ids.len() != 105 {
-        bail!("expected 105 factors, found {}", all_ids.len());
+    if all_ids.len() != args.expected_factor_count {
+        bail!(
+            "expected {} factors, found {}",
+            args.expected_factor_count,
+            all_ids.len()
+        );
     }
 
     fs::create_dir_all(&args.output)?;
+    let temp_directory = args.output.join("_duckdb_tmp");
+    fs::create_dir_all(&temp_directory)?;
     let config = Config::default().access_mode(AccessMode::ReadOnly)?;
     let conn = Connection::open_with_flags(&args.catalog, config)?;
     conn.execute_batch(&format!(
-        "SET threads=1; SET memory_limit='{}MB'; SET preserve_insertion_order=false;",
-        args.memory_limit_mb
+        "SET threads=1; SET memory_limit='{}MB'; SET temp_directory='{}'; SET preserve_insertion_order=false;",
+        args.memory_limit_mb,
+        quote(&temp_directory)
     ))?;
     let start_year: i32 = args.start[..4].parse()?;
     let end_year: i32 = args.end[..4].parse()?;
@@ -121,7 +141,7 @@ fn main() -> Result<()> {
         };
         let unions = daily_ids.iter().map(|factor| {
             let stem = factor.strip_suffix("_v1").unwrap_or(factor);
-            let path = args.daily_root.join(stem).join("v1/factor.parquet");
+            let path = args.daily_root.as_ref().expect("clap validates daily source pair").join(stem).join("v1/factor.parquet");
             if !path.exists() { bail!("missing {}", path.display()); }
             Ok(format!("SELECT trade_date,ts_code,factor_value,'{factor}' factor_id FROM read_parquet('{}') WHERE trade_date BETWEEN DATE '{lower}' AND DATE '{upper}'", quote(&path)))
         }).collect::<Result<Vec<_>>>()?.join(" UNION ALL ");
@@ -129,7 +149,7 @@ fn main() -> Result<()> {
             .iter()
             .map(|factor| {
                 Ok(format!(
-                    "max(f.factor_value) FILTER(WHERE f.factor_id='{factor}')::FLOAT AS {}",
+                    "try_cast(max(f.factor_value) FILTER(WHERE f.factor_id='{factor}') AS FLOAT) AS {}",
                     ident(factor)?
                 ))
             })
@@ -143,7 +163,10 @@ fn main() -> Result<()> {
                 "universe AS (SELECT DISTINCT trade_date,ts_code FROM index_trading_universe WHERE index_code IN ({index_values}) AND trade_date BETWEEN DATE '{lower}' AND DATE '{upper}' AND ts_code<>'000937.SZ')"
             )
         };
-        let mut ctes = vec![universe, format!("factors AS ({unions})")];
+        let mut ctes = vec![universe];
+        if !daily_ids.is_empty() {
+            ctes.push(format!("factors AS ({unions})"));
+        }
         let mut joins = Vec::new();
         let mut minute_cols = Vec::new();
         for (i, (root, values)) in minute.iter().enumerate() {
@@ -173,8 +196,13 @@ fn main() -> Result<()> {
         if temporary.exists() {
             fs::remove_file(&temporary)?;
         }
+        let daily_join = if daily_ids.is_empty() {
+            ""
+        } else {
+            "LEFT JOIN factors f USING(trade_date,ts_code)"
+        };
         let query = format!(
-            "WITH {} SELECT u.trade_date,u.ts_code,{columns} FROM universe u LEFT JOIN factors f USING(trade_date,ts_code) {} GROUP BY u.trade_date,u.ts_code ORDER BY u.trade_date,u.ts_code",
+            "WITH {} SELECT u.trade_date,u.ts_code,{columns} FROM universe u {daily_join} {} GROUP BY u.trade_date,u.ts_code ORDER BY u.trade_date,u.ts_code",
             ctes.join(","),
             joins.join(" ")
         );
@@ -208,7 +236,7 @@ fn main() -> Result<()> {
     )?;
     println!(
         "{}",
-        json!({"rows":rows,"factors":105,"output":args.output})
+        json!({"rows":rows,"factors":all_ids.len(),"output":args.output})
     );
     Ok(())
 }

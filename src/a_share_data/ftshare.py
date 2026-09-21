@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 from datetime import date
@@ -45,6 +46,47 @@ def register_views(conn: duckdb.DuckDBPyConnection, paths: Paths) -> None:
         WHERE NOT EXISTS (SELECT 1 FROM daily_aggregated h
                           WHERE h.trade_date=f.trade_date AND h.ts_code=f.ts_code)
     ''')
+    # Adjustment factors live in their own tree so installed bar partitions stay
+    # immutable; qfq/hfq are derived views, never stored prices.
+    adjust_root = paths.lake / 'canonical' / 'ftshare_adjust'
+    if not list(adjust_root.glob('trade_date=*/adjust_factors.parquet')):
+        return
+    conn.execute(f"CREATE OR REPLACE VIEW ftshare_adjust_factors AS SELECT * FROM read_parquet('{sql_path(adjust_root / 'trade_date=*' / 'adjust_factors.parquet')}', hive_partitioning=false)")
+    # Each day's vendor factor is anchored at that download date; re-anchor to the
+    # latest stored factor per stock so the whole series stays return-consistent.
+    conn.execute('''CREATE OR REPLACE VIEW ftshare_adjust_ratio AS
+        SELECT ts_code, trade_date, adj_factor,
+               adj_factor / first_value(adj_factor) OVER (PARTITION BY ts_code ORDER BY trade_date DESC) AS qfq_ratio
+        FROM ftshare_adjust_factors''')
+    conn.execute('''CREATE OR REPLACE VIEW ftshare_daily_qfq AS
+        SELECT d.ts_code, d.trade_date, d.open, d.high, d.low, d.close,
+               d.volume_lot, d.volume_share, d.amount_cny, d.turnover_rate,
+               d.ts_millis, d.ts_millis_open,
+               a.trade_date AS adjustment_trade_date, a.adj_factor, a.qfq_ratio,
+               d.open*a.qfq_ratio AS qfq_open, d.high*a.qfq_ratio AS qfq_high,
+               d.low*a.qfq_ratio AS qfq_low, d.close*a.qfq_ratio AS qfq_close,
+               d.amount_cny/nullif(d.volume_share,0)*a.qfq_ratio AS qfq_vwap,
+               d.close*a.qfq_ratio
+                 / nullif(lag(d.close*a.qfq_ratio) OVER (PARTITION BY d.ts_code ORDER BY d.trade_date),0) - 1 AS qfq_return
+        FROM ftshare_daily_bars d JOIN ftshare_adjust_ratio a USING (ts_code, trade_date)''')
+    conn.execute('''CREATE OR REPLACE VIEW ftshare_daily_hfq AS
+        SELECT d.*, f.ex_adj_factor,
+               d.open*f.ex_adj_factor AS hfq_open, d.high*f.ex_adj_factor AS hfq_high,
+               d.low*f.ex_adj_factor AS hfq_low, d.close*f.ex_adj_factor AS hfq_close
+        FROM ftshare_daily_bars d JOIN ftshare_adjust_factors f USING (ts_code, trade_date)''')
+    if conn.execute("SELECT count(*) FROM duckdb_views() WHERE view_name='daily_qfq'").fetchone()[0]:
+        # Full-market qfq is FTShare-factor derived; BaoStock stays available as a
+        # manual cross-validation dataset but is not preferred here.
+        conn.execute('''CREATE OR REPLACE VIEW market_daily_qfq AS
+            SELECT ts_code, trade_date, qfq_open, qfq_high, qfq_low, qfq_close, qfq_vwap,
+                   volume_share, amount_cny, 'legacy_minute' AS source FROM daily_qfq
+            UNION ALL
+            SELECT f.ts_code, f.trade_date, f.qfq_open, f.qfq_high, f.qfq_low, f.qfq_close, f.qfq_vwap,
+                   f.volume_share, f.amount_cny, 'ftshare' AS source
+            FROM ftshare_daily_qfq f
+            WHERE NOT EXISTS (SELECT 1 FROM daily_qfq h
+                              WHERE h.trade_date=f.trade_date AND h.ts_code=f.ts_code)
+        ''')
 
 
 def ingest(source: Path, paths: Paths) -> dict:
@@ -158,5 +200,82 @@ def ingest(source: Path, paths: Paths) -> dict:
         shutil.rmtree(stage,ignore_errors=True)
 
 
+def ingest_adjust(source: Path, paths: Paths) -> dict:
+    """Install one day's vendor adjustment factors beside the immutable bar partitions."""
+    day = date.fromisoformat(json.loads((source/'summary.json').read_text())['date'] if (source/'summary.json').exists() else source.name)
+    envelope = json.loads((source/'adjust_factors.json').read_text())
+    if envelope.get('code') != 200:
+        raise ValueError('Missing adjustment-factor evidence')
+    records = envelope['data']['records']
+    if len(records) != envelope['data']['total']:
+        raise ValueError('Incomplete adjustment-factor list')
+    factors: dict[str, tuple[float, float]] = {}
+    for r in records:
+        symbol, trade_date = r['symbol'], str(r['trade_date'])
+        adj, ex = float(r['adj_factor']), float(r['ex_adj_factor'])
+        if trade_date != day.strftime('%Y%m%d'):
+            raise ValueError(f'Adjustment factor trade_date {trade_date} does not match partition {day}')
+        if symbol in factors or not (math.isfinite(adj) and math.isfinite(ex)) or adj <= 0 or ex <= 0:
+            raise ValueError('Invalid or duplicate adjustment factor')
+        factors[symbol] = (adj, ex)
+    vendor = paths.lake/'canonical'/'ftshare'/f'trade_date={day}'
+    without_factor: list[str] = []
+    if (vendor/'daily.parquet').exists():
+        conn = duckdb.connect()
+        try:
+            conn.execute(f"CREATE VIEW bars AS SELECT ts_code FROM read_parquet('{sql_path(vendor/'daily.parquet')}')")
+            conn.execute('CREATE TABLE factor_symbols(ts_code VARCHAR)')
+            conn.executemany('INSERT INTO factor_symbols VALUES (?)', [(s,) for s in factors])
+            without_factor = [r[0] for r in conn.execute(
+                'SELECT ts_code FROM bars ANTI JOIN factor_symbols USING (ts_code) ORDER BY ts_code').fetchall()]
+        finally:
+            conn.close()
+        if len(without_factor) > len(factors) * 0.001:
+            raise ValueError(f'{day}: {len(without_factor)} bar symbols lack adjustment factors; not ingesting')
+    digest = sha256_file(source/'adjust_factors.json')
+    target = paths.lake/'canonical'/'ftshare_adjust'/f'trade_date={day}'
+    if target.exists():
+        old = json.loads((target/'manifest.json').read_text())
+        if old['input_sha256'] != digest:
+            raise FileExistsError(f'Different adjustment factors already installed: {target}')
+        with duckdb.connect(str(paths.catalog)) as cat:
+            register_views(cat, paths)
+        return {'status': 'already_ingested', 'path': str(target)}
+    paths.ensure_layout()
+    stage = paths.staging/f'ftshare-adjust-{day}-{os.getpid()}'
+    stage.mkdir(exist_ok=False)
+    conn = connect()
+    try:
+        conn.execute('CREATE TABLE factors(ts_code VARCHAR, trade_date DATE, adj_factor DOUBLE, ex_adj_factor DOUBLE)')
+        conn.executemany('INSERT INTO factors VALUES (?,?,?,?)', [(s, day, a, e) for s, (a, e) in factors.items()])
+        count, unique = conn.execute('SELECT count(*), count(DISTINCT ts_code) FROM factors').fetchone()
+        if count != unique:
+            raise ValueError('Duplicate adjustment-factor symbol')
+        conn.execute(f"COPY (SELECT * FROM factors ORDER BY ts_code) TO '{sql_path(stage/'adjust_factors.parquet')}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+        manifest = {'provider': 'ftshare', 'trade_date': str(day), 'ingested_at': utc_now(), 'input_sha256': digest,
+                    'source_directory': str(source.resolve()), 'symbols': len(factors),
+                    'bars_without_factor': without_factor,
+                    'anchor_note': 'qfq_ratio is derived at query time as adj_factor / max(adj_factor) per stock over stored dates; vendor factors are point-in-time per trade_date.'}
+        (stage/'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2)+'\n')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(stage, target)
+        try:
+            with duckdb.connect(str(paths.catalog)) as cat:
+                cat.execute('BEGIN')
+                register_views(cat, paths)
+                cat.execute('COMMIT')
+        except Exception:
+            os.rename(target, stage)
+            raise
+        return {'status': 'ingested', 'path': str(target), **manifest}
+    finally:
+        conn.close()
+        shutil.rmtree(stage, ignore_errors=True)
+
+
 def cmd_ingest_ftshare(args: argparse.Namespace) -> None:
-    print(json.dumps(ingest(Path(args.source_dir),Paths(Path(args.data_root))),ensure_ascii=False))
+    print(json.dumps(ingest(Path(args.source_dir), Paths(Path(args.data_root))), ensure_ascii=False))
+
+
+def cmd_ingest_ftshare_adjust(args: argparse.Namespace) -> None:
+    print(json.dumps(ingest_adjust(Path(args.source_dir), Paths(Path(args.data_root))), ensure_ascii=False))

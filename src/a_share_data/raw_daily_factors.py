@@ -72,15 +72,26 @@ def raw_factor_id(qfq_id: str) -> str:
 def build(
     catalog: Path,
     output_root: Path,
-    ids_file: Path,
+    ids_file: Path | None,
     start: str | None,
     end: str | None,
     index_codes: tuple[str, ...] = PRODUCTION_INDEXES,
     price_basis: str = "raw",
+    all_implemented: bool = False,
 ) -> dict[str, object]:
     if price_basis not in {"raw", "qfq"}:
         raise ValueError(f"unsupported price basis: {price_basis}")
-    ids = tuple(line.strip() for line in ids_file.read_text().splitlines() if line.strip() and not line.startswith("#"))
+    if all_implemented:
+        ids = tuple(
+            raw_factor_id(definition.factor_id)
+            for definition in factors.REGISTRY.values()
+            if definition.polars_status == "implemented"
+            and definition.factor_id in polars_factor_engine.BUILDERS
+        )
+    elif ids_file is not None:
+        ids = tuple(line.strip() for line in ids_file.read_text().splitlines() if line.strip() and not line.startswith("#"))
+    else:
+        raise ValueError("either ids_file or all_implemented must be specified")
     # Materialize the shared calendar panel once before evaluating formulas.
     # Besides avoiding 60 repeated DuckDB scans, this preserves the established
     # staged window semantics used by factors.py build-batch.
@@ -148,7 +159,9 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--catalog", type=Path, required=True)
     p.add_argument("--output-root", type=Path, required=True)
-    p.add_argument("--factor-ids-file", type=Path, required=True)
+    selection = p.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--factor-ids-file", type=Path)
+    selection.add_argument("--all-implemented", action="store_true")
     p.add_argument("--start")
     p.add_argument("--end")
     p.add_argument("--index-codes", default=",".join(PRODUCTION_INDEXES))
@@ -157,7 +170,7 @@ def main() -> None:
     index_codes = tuple(code.strip() for code in args.index_codes.split(",") if code.strip())
     if not index_codes:
         raise SystemExit("--index-codes must contain at least one code")
-    print(json.dumps(build(args.catalog, args.output_root, args.factor_ids_file, args.start, args.end, index_codes, args.price_basis), ensure_ascii=False))
+    print(json.dumps(build(args.catalog, args.output_root, args.factor_ids_file, args.start, args.end, index_codes, args.price_basis, args.all_implemented), ensure_ascii=False))
 
 
 if __name__ == "__main__":

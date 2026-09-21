@@ -1,0 +1,92 @@
+/**
+日朝没晨雾因子
+
+- 对每天第 6 到第 240 分钟的数据，对收益率做关于增量成交量及其一至五阶延迟增量成交量的最小二乘回归，日朝没晨雾因子为五阶增量成交量回归系数的 t 值的标准差
+
+DolphinDB server version:3.00.2.5 2025.05.26 LINUX x86_64
+DolphinDB server version:2.00.15 2025.01.20 LINUX x86_64(test)
+Storage engine: TSDB
+Last modification time: 2025.10.13
+*/
+
+//自定义因子计算函数
+def DawnFogVolPersist(minKTB){
+    /**@test 少量数据临时调试
+    minKTB = 
+        select SecurityID, date(DateTime) as TradeDate, time(DateTime) as TradeTime, LastPx, volume
+        from loadTable("dfs://stockMinKSH", "stockMinKSH")
+        where date(DateTime)=2021.01.04, SecurityID in `603189`000001 and LastPx>0
+    */
+    //计算收益率及各阶增量成交量
+    retTB = 
+        select 
+            SecurityID,
+            TradeDate,
+            TradeTime,
+            percentChange(LastPx) as ret,
+            deltas(volume) as volDiff,
+            move(deltas(volume), 1) as volDiff_1,
+            move(deltas(volume), 2) as volDiff_2,
+            move(deltas(volume), 3) as volDiff_3,
+            move(deltas(volume), 4) as volDiff_4,
+            move(deltas(volume), 5) as volDiff_5
+        from minKTB
+        context by SecurityID, TradeDate
+        having rank(TradeTime) between 5:239
+    //日朝没晨雾因子=五阶增量成交量回归系数的 t 值的标准差
+    res =
+        select
+            SecurityID,
+            TradeDate,
+            std(ols(ret, [volDiff,volDiff_1,volDiff_2,volDiff_3,volDiff_4,volDiff_5], mode=1)[`tstat][2:]) as Value,
+            "DawnFogVolPersist" as factorName,
+            now() as updateTime
+        from retTB
+        group by SecurityID, TradeDate
+    return res
+}
+
+//后台任务计算函数模版
+def factorjob(conf){
+    dataTB = loadTable(conf[`dataDB], conf[`dataTB])
+    days = conf[`startDay]..conf[`endDay]
+    startTime = 09:30:00.000
+    endTime = 15:00:00.000
+    //提取计算所需数据，sqlDS生成元代码
+    ds = sqlDS(<select SecurityID, date(DateTime) as TradeDate, time(DateTime) as TradeTime, LastPx, volume
+        from dataTB
+        where date(DateTime) in days and (time(DateTime) between startTime and endTime) and (SecurityID like "00%" or SecurityID like "30%" or SecurityID like "6%") and LastPx>0>)
+    //计算因子，mr函数将因子在不同节点并行计算，unionAll函数将不同节点的计算结果汇总
+    res = mr(ds, conf[`func]).unionAll()
+    //写入因子库，存储到磁盘做持久化
+    loadTable(conf[`factorDB], conf[`factorTB]).append!(select * from res)
+}
+
+//计算模版配置参数
+conf = {
+    func : DawnFogVolPersist,
+    funcsec : NULL,
+    factorname : "DawnFogVolPersist",
+    dataDB : "dfs://stockMinKSH",
+    dataTB : "stockMinKSH",
+    factorDB : "dfs://factor_day",
+    factorTB : "factor_day",
+    startDay : 2021.01.01,
+    endDay : 2021.01.31
+}
+
+//提交计算和存储因子的任务到服务器
+id = submitJob("factorjob", conf[`factorname], factorjob, conf)
+
+//查看任务完成情况
+getJobStatus(id)
+
+//3个月计算耗时
+(2025.07.03 23:22:24.168-2025.07.03 23:20:47.453)\1000 //96s 无缓存，全部从磁盘读取L2原始行情
+
+//因子数据查看
+data = select * from loadTable("dfs://factor_day","factor_day") where TradeDate=2021.01.04, SecurityID in `603189, factorname="DawnFogVolPersist"
+
+select count(*) from loadTable("dfs://factor_day","factor_day") where factorname="DawnFogVolPersist" group by TradeDate
+
+select (endTime-startTime)\1000 from getJobStatus(id)

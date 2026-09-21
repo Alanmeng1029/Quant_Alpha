@@ -1,0 +1,109 @@
+/**
+日度勇攀高峰因子
+
+- 更优波动率：对当前时刻及其前四分钟的高开低收的标准差占均值比值的平方
+- 收益波动比：收益率占更优波动率的比值
+- 波动率异常高时刻：更优波动率大于其日内均值+1 倍标准差的时刻
+- 日度勇攀高峰因子：当日波动率异常高时刻的收益波动比序列和更优波动率序列的协方差
+
+DolphinDB server version:3.00.2.5 2025.05.26 LINUX x86_64
+DolphinDB server version:2.00.15 2025.01.20 LINUX x86_64(test)
+Storage engine: TSDB
+Last modification time: 2025.10.14
+*/
+
+//自定义因子计算函数
+def peakClimbingCov(minKTB){
+    /**@test 少量数据临时调试
+    minKTB = 
+        select SecurityID, date(DateTime) as TradeDate, time(DateTime) as TradeTime, HighPx, OpenPx, LowPx, LastPx, volume
+        from loadTable("dfs://stockMinKSH", "stockMinKSH")
+        where date(DateTime)=2021.01.04, SecurityID in `603189`000001 and LastPx>0
+    */
+    //计算收益率及当前时刻及其前四分钟的高开低收汇总
+    retTB = 
+        select 
+            SecurityID,
+            TradeDate,
+            TradeTime,
+            LastPx,
+            percentChange(LastPx) as ret,
+            fixedLengthArrayVector(movingWindowData(HighPx, 5, true), movingWindowData(OpenPx, 5, true), movingWindowData(LowPx, 5, true), movingWindowData(LastPx, 5, true)) as last5Value
+        from minKTB
+        context by SecurityID, TradeDate
+    //计算更优波动率
+    adjVolatility = 
+        select 
+            SecurityID,
+            TradeDate,
+            TradeTime,
+            ret,
+            pow(rowStd(last5Value)\rowAvg(last5Value), 2) as adjVolatility
+        from retTB
+        context by SecurityID, TradeDate
+    //计算波动率异常值边界
+    threshold = 
+        select
+            SecurityID,
+            TradeDate,
+            avg(adjVolatility)+std(adjVolatility) as threshold
+        from adjVolatility
+        group by SecurityID, TradeDate
+    //日度勇攀高峰因子：当日波动率异常高时刻的收益波动比序列和更优波动率序列的协方差
+    res =
+        select
+            SecurityID,
+            TradeDate,
+            covar(ret\adjVolatility, adjVolatility) as Value,
+            "peakClimbingCov" as factorName,
+            now() as updateTime
+        from lj(adjVolatility, threshold, `SecurityID`TradeDate)
+        where adjVolatility>threshold
+        group by SecurityID, TradeDate
+    return res
+}
+
+//后台任务计算函数模版
+def factorjob(conf){
+    dataTB = loadTable(conf[`dataDB], conf[`dataTB])
+    days = conf[`startDay]..conf[`endDay]
+    startTime = 09:30:00.000
+    endTime = 14:57:00.000
+    //提取计算所需数据，sqlDS生成元代码
+    ds = sqlDS(<select SecurityID, date(DateTime) as TradeDate, time(DateTime) as TradeTime, HighPx, OpenPx, LowPx, LastPx, volume
+        from dataTB
+        where date(DateTime) in days and (time(DateTime) between startTime and endTime) and (SecurityID like "00%" or SecurityID like "30%" or SecurityID like "6%") and LastPx>0>)
+    //计算因子，mr函数将因子在不同节点并行计算，unionAll函数将不同节点的计算结果汇总
+    res = mr(ds, conf[`func]).unionAll()
+    //写入因子库，存储到磁盘做持久化
+    loadTable(conf[`factorDB], conf[`factorTB]).append!(select * from res)
+}
+
+//计算模版配置参数
+conf = {
+    func : peakClimbingCov,
+    funcsec : NULL,
+    factorname : "peakClimbingCov",
+    dataDB : "dfs://stockMinKSH",
+    dataTB : "stockMinKSH",
+    factorDB : "dfs://factor_day",
+    factorTB : "factor_day",
+    startDay : 2021.01.01,
+    endDay : 2021.01.31
+}
+
+//提交计算和存储因子的任务到服务器
+id = submitJob("factorjob", conf[`factorname], factorjob, conf)
+
+//查看任务完成情况
+getJobStatus(id)
+
+//3个月计算耗时
+(2025.07.03 23:22:24.168-2025.07.03 23:20:47.453)\1000 //96s 无缓存，全部从磁盘读取L2原始行情
+
+//因子数据查看
+data = select * from loadTable("dfs://factor_day","factor_day") where TradeDate=2021.01.04, SecurityID in `603189, factorname="peakClimbingCov"
+
+select count(*) from loadTable("dfs://factor_day","factor_day") where factorname="peakClimbingCov" group by TradeDate
+
+select (endTime-startTime)\1000 from getJobStatus(id)

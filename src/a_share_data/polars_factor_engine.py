@@ -169,9 +169,13 @@ def load_calendar_panel(
     fields = ("q.qfq_open, q.qfq_high, q.qfq_low, q.qfq_close, q.qfq_vwap" if price_basis == "qfq"
               else "q.open AS qfq_open, q.high AS qfq_high, q.low AS qfq_low, q.close AS qfq_close, q.amount_cny/nullif(q.volume_share,0) AS qfq_vwap")
     price_prefix = "q.qfq_" if price_basis == "qfq" else "q."
+    # Preserve the established QFQ calendar semantics: suspended sessions with
+    # zero volume remain observations in rolling price windows.  Raw factors
+    # use the stricter tradability input contract and exclude zero-volume bars.
+    volume_clause = "q.volume_share >= 0" if price_basis == "qfq" else "q.volume_share > 0"
     clauses = [
         f"{price_prefix}open > 0", f"{price_prefix}high > 0", f"{price_prefix}low > 0",
-        f"{price_prefix}close > 0", "q.volume_share > 0",
+        f"{price_prefix}close > 0", volume_clause,
     ]
     if end:
         clauses.append(f"q.trade_date <= DATE '{end}'")

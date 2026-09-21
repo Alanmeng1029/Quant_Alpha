@@ -125,7 +125,8 @@ struct BatchWideFactorEvalArgs {
 
 /// Compatibility spelling for the pre-cache process-per-factor runner.
 #[derive(Parser)]
-struct BatchEvalLegacyArgs {    #[arg(long)]
+struct BatchEvalLegacyArgs {
+    #[arg(long)]
     catalog: PathBuf,
     #[arg(long)]
     factor_root: PathBuf,
@@ -223,7 +224,12 @@ struct LabelSpec {
 fn label_specs(horizons: &[i32]) -> Vec<LabelSpec> {
     let mut specs = Vec::new();
     for horizon in horizons {
-        for label in ["close_to_close", "open_to_open", "vwap_to_vwap", "twap_to_twap"] {
+        for label in [
+            "close_to_close",
+            "open_to_open",
+            "vwap_to_vwap",
+            "twap_to_twap",
+        ] {
             let prefix = format!("{label}_h{horizon}");
             specs.push(LabelSpec {
                 label,
@@ -606,7 +612,11 @@ fn build_label_cache(
         joins.push(format!("LEFT JOIN market_calendar exit_calendar_{horizon} ON exit_calendar_{horizon}.day_index = signal_calendar.day_index + 1 + {horizon}"));
         joins.push(format!("LEFT JOIN daily_qfq exit_day_{horizon} ON exit_day_{horizon}.ts_code = base.ts_code AND exit_day_{horizon}.trade_date = exit_calendar_{horizon}.trade_date"));
         columns.push(format!("CASE WHEN close_target_{horizon}.qfq_close > 0 THEN close_target_{horizon}.qfq_close / base.qfq_close - 1 END AS close_to_close_h{horizon}_raw"));
-        for (label, price) in [("open_to_open", "qfq_open"), ("vwap_to_vwap", "qfq_vwap"), ("twap_to_twap", "qfq_twap")] {
+        for (label, price) in [
+            ("open_to_open", "qfq_open"),
+            ("vwap_to_vwap", "qfq_vwap"),
+            ("twap_to_twap", "qfq_twap"),
+        ] {
             columns.push(format!("CASE WHEN entry_day.{price} > 0 AND exit_day_{horizon}.{price} > 0 AND entry_day.observation_status = 'complete_trading' AND exit_day_{horizon}.observation_status = 'complete_trading' AND entry_day.amount_cny > 0 AND exit_day_{horizon}.amount_cny > 0 THEN exit_day_{horizon}.{price} / entry_day.{price} - 1 END AS {label}_h{horizon}_raw"));
         }
     }
@@ -638,7 +648,11 @@ fn build_label_cache(
         benchmark_joins.push(format!("LEFT JOIN index_daily exit_index_{horizon} ON exit_index_{horizon}.index_code = '000905.SH' AND exit_index_{horizon}.trade_date = exit_calendar_{horizon}.trade_date"));
         benchmark_columns.push(format!("CASE WHEN start_index.close > 0 AND close_end_{horizon}.close > 0 THEN close_end_{horizon}.close / start_index.close - 1 END AS close_to_close_h{horizon}_csi500"));
         for label in ["open_to_open", "vwap_to_vwap", "twap_to_twap"] {
-            let price = if label == "open_to_open" { "open" } else { "close" };
+            let price = if label == "open_to_open" {
+                "open"
+            } else {
+                "close"
+            };
             benchmark_columns.push(format!("CASE WHEN entry_index.{price} > 0 AND exit_index_{horizon}.{price} > 0 THEN exit_index_{horizon}.{price} / entry_index.{price} - 1 END AS {label}_h{horizon}_csi500"));
         }
     }
@@ -805,10 +819,7 @@ fn long_cohort_sql(factor: &Path) -> Result<String> {
 
 /// Factor columns of a wide dataset (everything except keys/partition cols).
 fn discover_wide_columns(conn: &Connection, dataset: &Path) -> Result<Vec<String>> {
-    let glob = dataset
-        .canonicalize()?
-        .join("**")
-        .join("*.parquet");
+    let glob = dataset.canonicalize()?.join("**").join("*.parquet");
     let glob = quote_sql(&glob.to_string_lossy());
     let mut statement = conn.prepare(&format!(
         "DESCRIBE SELECT * FROM read_parquet('{glob}', hive_partitioning = true)"
@@ -823,16 +834,16 @@ fn discover_wide_columns(conn: &Connection, dataset: &Path) -> Result<Vec<String
     }
     columns.sort();
     if columns.is_empty() {
-        bail!("No factor columns found in wide dataset {}", dataset.display());
+        bail!(
+            "No factor columns found in wide dataset {}",
+            dataset.display()
+        );
     }
     Ok(columns)
 }
 
 fn wide_cohort_sql(dataset: &Path, column: &str) -> Result<String> {
-    let glob = dataset
-        .canonicalize()?
-        .join("**")
-        .join("*.parquet");
+    let glob = dataset.canonicalize()?.join("**").join("*.parquet");
     let glob = quote_sql(&glob.to_string_lossy());
     let column = column.replace('"', "\"\"");
     Ok(format!(
@@ -1528,11 +1539,7 @@ fn run_batch_wide_factor_eval(args: BatchWideFactorEvalArgs) -> Result<PathBuf> 
         .unwrap_or_else(|| chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string());
     let batch_root = args.output.join(&batch_id);
     fs::create_dir_all(&batch_root)?;
-    if !args
-        .factor_dataset
-        .join("manifest.json")
-        .exists()
-    {
+    if !args.factor_dataset.join("manifest.json").exists() {
         bail!(
             "Wide dataset manifest missing under {}",
             args.factor_dataset.display()
@@ -1575,7 +1582,9 @@ fn run_batch_wide_factor_eval(args: BatchWideFactorEvalArgs) -> Result<PathBuf> 
         .filter(|task| requested_tasks.is_empty() || requested_tasks.contains(task))
         .count();
     if !requested_tasks.is_empty() && task_count != requested_tasks.len() {
-        bail!("At least one --tasks entry did not match a wide factor column and selected universe");
+        bail!(
+            "At least one --tasks entry did not match a wide factor column and selected universe"
+        );
     }
     write_json_atomic(
         &batch_root.join("batch_manifest.json"),
@@ -1607,7 +1616,11 @@ fn run_batch_wide_factor_eval(args: BatchWideFactorEvalArgs) -> Result<PathBuf> 
             DuckDbConfig::default().access_mode(AccessMode::ReadOnly)?,
         )
         .context("open DuckDB catalog read-only")?;
-        set_duckdb_options(&conn, &config, &batch_root.join("_duckdb_tmp").join(universe))?;
+        set_duckdb_options(
+            &conn,
+            &config,
+            &batch_root.join("_duckdb_tmp").join(universe),
+        )?;
         let cache = ensure_label_cache(
             &conn,
             &batch_root,
@@ -1688,7 +1701,10 @@ fn run_batch_wide_factor_eval(args: BatchWideFactorEvalArgs) -> Result<PathBuf> 
                 Ok(()) => {
                     if output.exists() {
                         fs::remove_dir_all(&output).with_context(|| {
-                            format!("replace incomplete or stale task output {}", output.display())
+                            format!(
+                                "replace incomplete or stale task output {}",
+                                output.display()
+                            )
                         })?;
                     }
                     fs::create_dir_all(output.parent().unwrap())?;

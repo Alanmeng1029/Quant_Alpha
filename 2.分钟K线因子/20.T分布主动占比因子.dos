@@ -1,0 +1,87 @@
+/**
+T分布主动占比因子
+
+- T分布主动买入金额：每分钟成交额与对应分钟 t 分布的乘积，其中参数分别为收益率除以收益率标准差和自由度
+- T分布主动占比因子：T分布主动买入金额除以当日总成交额
+
+DolphinDB server version:3.00.2.5 2025.05.26 LINUX x86_64
+DolphinDB server version:2.00.15 2025.01.20 LINUX x86_64(test)
+Storage engine: TSDB
+Last modification time: 2025.10.13
+*/
+
+//自定义因子计算函数
+def propTDis(minKTB){
+    /**@test 少量数据临时调试
+    minKTB = 
+        select SecurityID, date(DateTime) as TradeDate, time(DateTime) as TradeTime, LastPx, Amount
+        from loadTable("dfs://stockMinKSH", "stockMinKSH")
+        where date(DateTime)=2021.01.04, SecurityID in `603189`000001 and LastPx>0
+    */
+    //计算收益率及收益率标准差
+    retTB = 
+        select 
+            SecurityID,
+            TradeDate,
+            percentChange(LastPx) as ret,
+            std(percentChange(LastPx)) as stdRet,
+            Amount
+        from minKTB
+        context by SecurityID, TradeDate
+    //T分布主动占比因子=每分钟成交额与对应分钟 t 分布的乘积/当天总成交额
+    res =
+        select
+            SecurityID,
+            TradeDate,
+            sum(Amount * cdfStudent(240, ret\stdRet))\sum(Amount) as Value,
+            "propTDis" as factorName,
+            now() as updateTime
+        from retTB
+        group by SecurityID, TradeDate
+    return res
+}
+
+//后台任务计算函数模版
+def factorjob(conf){
+    dataTB = loadTable(conf[`dataDB], conf[`dataTB])
+    days = conf[`startDay]..conf[`endDay]
+    startTime = 09:30:00.000
+    endTime = 14:57:00.000
+    //提取计算所需数据，sqlDS生成元代码
+    ds = sqlDS(<select SecurityID, date(DateTime) as TradeDate, time(DateTime) as TradeTime, LastPx, Amount
+        from dataTB
+        where date(DateTime) in days and (time(DateTime) between startTime and endTime) and (SecurityID like "00%" or SecurityID like "30%" or SecurityID like "6%") and LastPx>0>)
+    //计算因子，mr函数将因子在不同节点并行计算，unionAll函数将不同节点的计算结果汇总
+    res = mr(ds, conf[`func]).unionAll()
+    //写入因子库，存储到磁盘做持久化
+    loadTable(conf[`factorDB], conf[`factorTB]).append!(select * from res)
+}
+
+//计算模版配置参数
+conf = {
+    func : propTDis,
+    funcsec : NULL,
+    factorname : "propTDis",
+    dataDB : "dfs://stockMinKSH",
+    dataTB : "stockMinKSH",
+    factorDB : "dfs://factor_day",
+    factorTB : "factor_day",
+    startDay : 2021.01.01,
+    endDay : 2021.01.31
+}
+
+//提交计算和存储因子的任务到服务器
+id = submitJob("factorjob", conf[`factorname], factorjob, conf)
+
+//查看任务完成情况
+getJobStatus(id)
+
+//3个月计算耗时
+(2025.07.03 23:22:24.168-2025.07.03 23:20:47.453)\1000 //96s 无缓存，全部从磁盘读取L2原始行情
+
+//因子数据查看
+data = select * from loadTable("dfs://factor_day","factor_day") where TradeDate=2021.01.04, SecurityID in `603189, factorname="propTDis"
+
+select count(*) from loadTable("dfs://factor_day","factor_day") where factorname="propTDis" group by TradeDate
+
+select (endTime-startTime)\1000 from getJobStatus(id)

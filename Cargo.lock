@@ -1430,6 +1430,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "quant-sequence-cache"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow 59.3.0",
+ "clap",
+ "parquet",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"

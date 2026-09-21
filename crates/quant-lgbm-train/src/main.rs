@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use chrono::{Datelike, NaiveDate};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use duckdb::{AccessMode, Config, Connection};
 use serde::Serialize;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
@@ -10,12 +10,14 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 
 const FLOAT32: c_int = 0;
+const INT32: c_int = 2;
 const PREDICT_NORMAL: c_int = 0;
 const SEED: u64 = 20_260_908;
 const TRAIN_DAYS: usize = 756;
 const HORIZONS: [usize; 3] = [1, 5, 10];
 // A signal formed on T enters at T+1. H10 matures at the T+11 open.
 const LABEL_LAG: usize = 11;
+const RANK_LEVELS: usize = 31;
 
 type DatasetHandle = *mut c_void;
 type BoosterHandle = *mut c_void;
@@ -89,6 +91,10 @@ struct Args {
     output: PathBuf,
     #[arg(long)]
     index_code: String,
+    /// Index used to form excess-return labels.  This is independent from the
+    /// training universe so CSI500 and CSI1000 sleeves can be trained fairly.
+    #[arg(long, default_value = "000905.SH")]
+    benchmark_index_code: String,
     /// Reproduce the legacy QFQ research universe from index_trading_universe.
     /// The default uses the raw OHLCV completeness checks required by the new baseline.
     #[arg(long, default_value_t = false)]
@@ -101,6 +107,14 @@ struct Args {
     memory_limit_mb: usize,
     #[arg(long, default_value_t = 8)]
     threads: usize,
+    #[arg(long, value_enum, default_value_t = TrainingObjective::Regression)]
+    objective: TrainingObjective,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, ValueEnum, PartialEq, Eq)]
+enum TrainingObjective {
+    Regression,
+    Lambdarank,
 }
 
 #[derive(Default)]
@@ -131,6 +145,7 @@ struct DayRow {
 struct Matrix {
     x: Vec<f32>,
     y: Vec<f32>,
+    groups: Vec<i32>,
     rows: usize,
 }
 
@@ -311,6 +326,17 @@ fn load_panel(args: &Args, factors: &[String]) -> Result<Panel> {
     {
         bail!("invalid --index-code list: {}", args.index_code);
     }
+    if args.benchmark_index_code.is_empty()
+        || !args
+            .benchmark_index_code
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.' || byte.is_ascii_uppercase())
+    {
+        bail!(
+            "invalid --benchmark-index-code: {}",
+            args.benchmark_index_code
+        );
+    }
     let index_predicate = format!(
         "c.index_code IN ({})",
         index_codes
@@ -362,11 +388,12 @@ fn load_panel(args: &Args, factors: &[String]) -> Result<Panel> {
         LEFT JOIN daily_qfq d2 ON d2.ts_code=f.ts_code AND d2.trade_date=c2.trade_date
         LEFT JOIN daily_qfq d6 ON d6.ts_code=f.ts_code AND d6.trade_date=c6.trade_date
         LEFT JOIN daily_qfq d11 ON d11.ts_code=f.ts_code AND d11.trade_date=c11.trade_date
-        LEFT JOIN index_daily i1 ON i1.index_code='000905.SH' AND i1.trade_date=ce.trade_date
-        LEFT JOIN index_daily i2 ON i2.index_code='000905.SH' AND i2.trade_date=c2.trade_date
-        LEFT JOIN index_daily i6 ON i6.index_code='000905.SH' AND i6.trade_date=c6.trade_date
-        LEFT JOIN index_daily i11 ON i11.index_code='000905.SH' AND i11.trade_date=c11.trade_date
+        LEFT JOIN index_daily i1 ON i1.index_code='{benchmark}' AND i1.trade_date=ce.trade_date
+        LEFT JOIN index_daily i2 ON i2.index_code='{benchmark}' AND i2.trade_date=c2.trade_date
+        LEFT JOIN index_daily i6 ON i6.index_code='{benchmark}' AND i6.trade_date=c6.trade_date
+        LEFT JOIN index_daily i11 ON i11.index_code='{benchmark}' AND i11.trade_date=c11.trade_date
         ORDER BY f.trade_date,f.ts_code"#,
+        benchmark = args.benchmark_index_code,
     );
     let mut statement = conn.prepare(&query)?;
     let factor_count = factors.len();
@@ -420,8 +447,8 @@ fn extract_labeled(
     end: usize,
     horizon: usize,
     winsor: bool,
+    objective: TrainingObjective,
 ) -> Matrix {
-    let (row_begin, row_end) = date_row_bounds(panel, begin, end);
     let labels = match (horizon, winsor) {
         (1, false) => &panel.raw_h1,
         (1, true) => &panel.win_h1,
@@ -433,18 +460,44 @@ fn extract_labeled(
     };
     let mut x = Vec::new();
     let mut y = Vec::new();
-    for row in row_begin..row_end {
-        if labels[row].is_finite() {
+    let mut groups = Vec::new();
+    for day in begin..end {
+        let (row_begin, row_end) = panel.ranges[day];
+        let finite_rows = (row_begin..row_end)
+            .filter(|row| labels[*row].is_finite())
+            .collect::<Vec<_>>();
+        if finite_rows.is_empty() {
+            continue;
+        }
+        let relevance = if objective == TrainingObjective::Lambdarank {
+            let mut ordered = finite_rows.clone();
+            ordered.sort_by(|left, right| labels[*left].total_cmp(&labels[*right]));
+            let mut grades = std::collections::HashMap::with_capacity(ordered.len());
+            for (rank, row) in ordered.into_iter().enumerate() {
+                let grade = rank * RANK_LEVELS / finite_rows.len();
+                grades.insert(row, grade.min(RANK_LEVELS - 1) as f32);
+            }
+            Some(grades)
+        } else {
+            None
+        };
+        for row in finite_rows.iter().copied() {
             x.extend_from_slice(
                 &panel.x[row * panel.feature_count..(row + 1) * panel.feature_count],
             );
-            y.push(labels[row]);
+            y.push(
+                relevance
+                    .as_ref()
+                    .map_or(labels[row], |grades| grades[&row]),
+            );
         }
+        groups.push(i32::try_from(finite_rows.len()).expect("daily ranking group exceeds i32"));
     }
     Matrix {
         rows: y.len(),
         x,
         y,
+        groups,
     }
 }
 
@@ -482,29 +535,57 @@ fn dataset(matrix: &Matrix, feature_count: usize, reference: DatasetHandle) -> R
             FLOAT32,
         )
     })?;
+    if !matrix.groups.is_empty() {
+        let group = CString::new("group")?;
+        lgb_check(unsafe {
+            LGBM_DatasetSetField(
+                handle,
+                group.as_ptr(),
+                matrix.groups.as_ptr().cast(),
+                i32::try_from(matrix.groups.len())?,
+                INT32,
+            )
+        })?;
+    }
     Ok(Dataset(handle))
 }
 
-fn params(threads: usize) -> Result<CString> {
+fn params(threads: usize, objective: TrainingObjective) -> Result<CString> {
+    let objective_parameters = match objective {
+        TrainingObjective::Regression => "objective=regression metric=l2",
+        TrainingObjective::Lambdarank => {
+            "objective=lambdarank metric=ndcg ndcg_eval_at=100 lambdarank_truncation_level=100"
+        }
+    };
     Ok(CString::new(format!(
-        "objective=regression metric=l2 learning_rate=0.03 bagging_fraction=0.8 bagging_freq=1 feature_pre_filter=false verbosity=-1 seed={SEED} feature_fraction_seed={SEED} bagging_seed={SEED} data_random_seed={SEED} deterministic=true force_row_wise=true num_threads={} num_leaves=31 min_data_in_leaf=20 feature_fraction=1.0 lambda_l2=0.0",
+        "{objective_parameters} learning_rate=0.03 bagging_fraction=0.8 bagging_freq=1 feature_pre_filter=false verbosity=-1 seed={SEED} feature_fraction_seed={SEED} bagging_seed={SEED} data_random_seed={SEED} deterministic=true force_row_wise=true num_threads={} num_leaves=31 min_data_in_leaf=20 feature_fraction=1.0 lambda_l2=0.0",
         threads.max(1)
     ))?)
 }
 
-fn new_booster(train: &Dataset, threads: usize) -> Result<Booster> {
+fn new_booster(train: &Dataset, threads: usize, objective: TrainingObjective) -> Result<Booster> {
     let mut handle = ptr::null_mut();
-    let parameters = params(threads)?;
+    let parameters = params(threads, objective)?;
     lgb_check(unsafe { LGBM_BoosterCreate(train.0, parameters.as_ptr(), &mut handle) })?;
     Ok(Booster(handle))
 }
 
-fn choose_rounds(train: &Matrix, valid: &Matrix, p: usize, threads: usize) -> Result<usize> {
+fn choose_rounds(
+    train: &Matrix,
+    valid: &Matrix,
+    p: usize,
+    threads: usize,
+    objective: TrainingObjective,
+) -> Result<usize> {
     let train_data = dataset(train, p, ptr::null_mut())?;
     let valid_data = dataset(valid, p, train_data.0)?;
-    let booster = new_booster(&train_data, threads)?;
+    let booster = new_booster(&train_data, threads, objective)?;
     lgb_check(unsafe { LGBM_BoosterAddValidData(booster.0, valid_data.0) })?;
-    let mut best = f64::INFINITY;
+    let mut best = if objective == TrainingObjective::Lambdarank {
+        f64::NEG_INFINITY
+    } else {
+        f64::INFINITY
+    };
     let mut best_iteration = 1;
     let mut stale = 0;
     for iteration in 1..=2000 {
@@ -513,7 +594,12 @@ fn choose_rounds(train: &Matrix, valid: &Matrix, p: usize, threads: usize) -> Re
         let mut length = 0;
         let mut score = 0.0;
         lgb_check(unsafe { LGBM_BoosterGetEval(booster.0, 1, &mut length, &mut score) })?;
-        if score < best {
+        let improved = if objective == TrainingObjective::Lambdarank {
+            score > best
+        } else {
+            score < best
+        };
+        if improved {
             best = score;
             best_iteration = iteration;
             stale = 0;
@@ -534,10 +620,11 @@ fn fit_predict_save(
     p: usize,
     rounds: usize,
     threads: usize,
+    objective: TrainingObjective,
     model_path: &Path,
 ) -> Result<Vec<f64>> {
     let train_data = dataset(train, p, ptr::null_mut())?;
-    let booster = new_booster(&train_data, threads)?;
+    let booster = new_booster(&train_data, threads, objective)?;
     for _ in 0..rounds {
         let mut finished = 0;
         lgb_check(unsafe { LGBM_BoosterUpdateOneIter(booster.0, &mut finished) })?;
@@ -694,13 +781,40 @@ fn main() -> Result<()> {
         let mut rounds_record = Vec::new();
         let mut training_rows = Vec::new();
         for horizon in HORIZONS {
-            let early_train = extract_labeled(&panel, train_begin, early_end, horizon, true);
-            let validation = extract_labeled(&panel, valid_begin, train_end, horizon, false);
-            let rounds =
-                choose_rounds(&early_train, &validation, panel.feature_count, args.threads)?;
-            let final_train = extract_labeled(&panel, train_begin, train_end, horizon, true);
+            let early_train = extract_labeled(
+                &panel,
+                train_begin,
+                early_end,
+                horizon,
+                true,
+                args.objective,
+            );
+            let validation = extract_labeled(
+                &panel,
+                valid_begin,
+                train_end,
+                horizon,
+                false,
+                args.objective,
+            );
+            let rounds = choose_rounds(
+                &early_train,
+                &validation,
+                panel.feature_count,
+                args.threads,
+                args.objective,
+            )?;
+            let final_train = extract_labeled(
+                &panel,
+                train_begin,
+                train_end,
+                horizon,
+                true,
+                args.objective,
+            );
             let model_path = quarter_dir.join(format!(
-                "raw105_{}_h{horizon}.txt",
+                "{:?}_{}_h{horizon}.txt",
+                args.objective,
                 args.index_code.replace('.', "_")
             ));
             let prediction = fit_predict_save(
@@ -710,6 +824,7 @@ fn main() -> Result<()> {
                 panel.feature_count,
                 rounds,
                 args.threads,
+                args.objective,
                 &model_path,
             )?;
             outputs.push(prediction);
@@ -774,7 +889,10 @@ fn main() -> Result<()> {
         args.output.join("manifest.json"),
         serde_json::to_string_pretty(&serde_json::json!({
             "engine": "quant-lgbm-train-rust-v1",
+            "objective": args.objective,
+            "ranking_relevance_levels": if args.objective == TrainingObjective::Lambdarank { Some(RANK_LEVELS) } else { None },
             "index_code": args.index_code,
+            "benchmark_index_code": args.benchmark_index_code,
             "legacy_qfq_universe": args.legacy_qfq_universe,
             "factor_count": factors.len(),
             "training_days": TRAIN_DAYS,

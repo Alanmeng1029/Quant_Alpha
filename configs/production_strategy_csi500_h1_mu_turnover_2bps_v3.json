@@ -1,6 +1,6 @@
 {
   "strategy_id": "csi500_h1_mu_turnover_2bps_v3",
-  "status": "active",
+  "status": "superseded",
   "model_factor_set": "o2o_raw_daily60_minute45_dos20_v1",
   "prediction_artifact": "results/predict/research-oos-raw-daily60-minute45-dos20-csi300-csi500-h1-h5-h10-v1/predictions.parquet",
   "model": {

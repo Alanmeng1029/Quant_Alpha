@@ -1,17 +1,16 @@
 //! OHLCV-only candidate factor registry and causal daily producer.
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    daily, loader,
+    BuildArgs, daily, loader,
     manifest::{self, DayStatus, Manifest},
     pipeline,
     schema::{FactorFormula, SESSION_BARS},
     writer::{self, DynamicWideRow},
-    BuildArgs,
 };
 
 pub const N: usize = 45;
@@ -79,11 +78,7 @@ struct State {
 }
 
 fn finite(x: f64) -> Option<f64> {
-    if x.is_finite() {
-        Some(x)
-    } else {
-        None
-    }
+    if x.is_finite() { Some(x) } else { None }
 }
 fn pearson(v: &[(f64, f64)]) -> Option<f64> {
     if v.len() < 3 {
@@ -379,11 +374,7 @@ fn hist_z(h: &VecDeque<Raw>, slot: usize, current: Option<f64>) -> Option<f64> {
     }
     let m = v.iter().sum::<f64>() / v.len() as f64;
     let sd = (v.iter().map(|z| (z - m).powi(2)).sum::<f64>() / (v.len() - 1) as f64).sqrt();
-    if sd > EPS {
-        finite((x - m) / sd)
-    } else {
-        None
-    }
+    if sd > EPS { finite((x - m) / sd) } else { None }
 }
 fn finalize(mut raw: Raw, h: &VecDeque<Raw>) -> [Option<f64>; N] {
     raw.values[36] = hist_z(h, 33, raw.values[33]);

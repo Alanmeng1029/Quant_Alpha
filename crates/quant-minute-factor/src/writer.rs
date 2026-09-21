@@ -1,5 +1,5 @@
 //! Wide-format daily parquet writer with output validation and atomic moves.
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use arrow::array::{Date32Array, Float64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use chrono::NaiveDate;
@@ -206,11 +206,13 @@ mod tests {
         ];
         let path = write_day(temp.path(), "2024-01-02", &rows).unwrap();
         assert!(path.is_file());
-        assert!(!temp
-            .path()
-            .join("_staging")
-            .join("2024-01-02.parquet")
-            .exists());
+        assert!(
+            !temp
+                .path()
+                .join("_staging")
+                .join("2024-01-02.parquet")
+                .exists()
+        );
 
         rows[1].values[0] = Some(f64::NAN);
         assert!(write_day(temp.path(), "2024-01-03", &rows).is_err());

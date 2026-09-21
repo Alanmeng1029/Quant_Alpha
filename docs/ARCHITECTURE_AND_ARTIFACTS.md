@@ -17,7 +17,7 @@ Data → Factor research / production → Model / prediction → Portfolio polic
 | 数据 | 2018-01-02 至 2026-08-28 的本地分钟湖与聚合日频 | `DATA_STATUS.md` |
 | 因子 | `o2o_raw_daily60_minute45_dos20_v1`，125 因子，状态 `active` | `configs/formal_factor_sets/o2o_raw_daily60_minute45_dos20_v1.json` |
 | 模型 | 默认 LightGBM 回归 H1，季度滚动样本外 | `results/predict/research-oos-raw-daily60-minute45-dos20-csi300-csi500-h1-h5-h10-v1/` |
-| 组合 | 历史 CSI500 内，`mu - turnover cost` optimizer；98%投资、单票上限1%、无风险项 | `configs/production_strategy_csi500_h1_mu_turnover_2bps_v3.json` |
+| 组合 | 历史 CSI500 内，H1/H5 五期滚动 optimizer；80%单票1%核心与20%单票5%增强目标净额合并，无风险项 | `configs/production_strategy_csi500_h1h5_blend_80_20_2bps_v5.json` |
 | 回测 | 2021-04-02 至 2026-08-27，已计买卖费用 | `docs/PRODUCTION_BACKTEST.md` |
 
 旧105因子和98因子版本均已标记为 `superseded`。它们仍是有效的历史基线，但不应在新文档中称为“当前正式版本”。
@@ -87,15 +87,16 @@ Python/Polars 和 Rust 引擎在完整历史截面计算候选因子；批量评
 
 ### 正式规则
 
-当前组合使用精确可分的无风险项 optimizer：保留原仓位的边际价值为 `mu + sell_cost`，新增仓位的边际价值为 `mu - buy_cost`，据此分配目标权重；回测仍从真实成交后的现金和持仓继续下一日。
+当前组合分别以1%和5%单票上限运行同一个五期滚动线性 optimizer，再按80%/20%资本权重合并目标、对重合股票净额化并统一执行。H1用于第1期，`(H5-H1)/4`用于第2至5期，每期均计买卖成本；每天只执行规划的第一期，次日用新预测重新求解。回测从真实成交后的现金和持仓继续下一日。
 
 | 参数 | 值 |
 | --- | ---: |
 | 选股股票池 | 信号日历史 CSI500 成分 |
 | 目标投资权重 | 98% |
-| 单票上限 | 1% |
-| 目标持股数 | 通常98只 |
-| 信号 | H1-only |
+| 袖套内单票上限 | 核心1%；增强5% |
+| 合并后单票上限 | 1.8% |
+| 目标持股数 | 平均106.46只；有效持股数100.09只 |
+| 信号 | H1/H5 增量期限结构 |
 | 风险项 | 无 |
 | 换手硬限制 | 无；通过目标函数中的成本惩罚控制 |
 | 整手 | 100 股 |
@@ -103,7 +104,7 @@ Python/Polars 和 Rust 引擎在完整历史截面计算候选因子；批量评
 
 回测按 T+1 开盘成交并逐日记录订单、未成交原因、成交、现金、复权等价股数、费用和 NAV。独立零费率账户只用于诊断成本拖累，不能与含费账户拼接。
 
-正式结果为累计净收益147.46%、年化19.03%、最大回撤-28.07%、信息比率1.293。完整说明见 [`PRODUCTION_BACKTEST.md`](PRODUCTION_BACKTEST.md)。
+正式结果为累计净收益177.94%、年化21.71%、最大回撤-27.20%、信息比率1.466。完整说明见 [`PRODUCTION_BACKTEST.md`](PRODUCTION_BACKTEST.md)。
 
 ## 模块接口
 

@@ -6,31 +6,30 @@
 
 ## 当前正式研究版本
 
-截至 2026-09-16，唯一标记为 `active` 的正式因子集是 [`o2o_daily60_minute45_v2`](configs/formal_factor_sets/o2o_daily60_minute45_v2.json)：
+截至 2026-09-21，当前正式因子集是 [`o2o_raw_daily60_minute45_dos20_v1`](configs/formal_factor_sets/o2o_raw_daily60_minute45_dos20_v1.json)：
 
-- 60 个日频因子；
-- 28 个分钟 OHLCV v1 因子；
-- 10 个 Core24 分钟因子；
-- 7 个分钟 OHLCV v3 因子；
+- 60 个 raw 日频因子；
+- 45 个既有分钟因子；
+- 20 个 DolphinDB 复现分钟因子；
 - 默认 LightGBM，分别预测 H1/H5 开盘到开盘的相对 CSI500 超额收益；
-- 历史中证500成分内选股，`limited_replacement_v2`：Top100、退出阈值 Top120、每日最多替换 3 只、100 股整手、H1/H5 各 50%。
+- 历史中证500成分内运行五期成本感知 optimizer；80%单票1%核心袖套与20%单票5%增强袖套先合并目标、再净额执行。
 
-旧的 98 因子集已标记为 `superseded`，保留用于复现和版本比较，不再代表当前正式版本。
+旧因子集和旧执行配置保留用于复现和版本比较，不再代表当前正式版本。
 
 ## 正式回测快照
 
-样本外区间为 2021-04-02 至 2026-08-27，共 1,311 个持有期；买入成本 2.1bp、卖出成本 7.1bp。
+样本外区间为 2021-04-02 至 2026-08-27，共 1,311 个持有期；买入、卖出成本各2bp。
 
 | 指标 | 正式策略 | CSI500 |
 | --- | ---: | ---: |
-| 累计收益 | 106.14% | 25.69% |
-| 年化收益 | 14.92% | 4.49% |
-| 最大回撤 | -23.36% | — |
-| 信息比率 | 0.974 | — |
-| 平均单边买入换手 | 2.98% / 日 | — |
-| 平均持股数 | 99.85 | — |
+| 累计收益 | 177.94% | 25.69% |
+| 年化收益 | 21.71% | 4.49% |
+| 最大回撤 | -27.20% | — |
+| 信息比率 / 超额 Sharpe | 1.466 | — |
+| 平均单边买入换手 | 43.14% / 日 | — |
+| 平均持股数 | 106.69 | — |
 
-完整指标、年度拆分和生成方式见 [当前生产版本回测](docs/PRODUCTION_BACKTEST.md)；远端可直接打开 [标准 HTML 报告](docs/reports/csi500_top100_swap3/report.html)。上述结果是历史研究模拟，不代表未来收益。
+完整指标、年度拆分和生成方式见 [当前生产版本回测](docs/PRODUCTION_BACKTEST.md)。大体积标准报告和逐日账本保留在本地 `results/`；上述结果是历史研究模拟，不代表未来收益。
 
 ## 系统边界
 
@@ -41,9 +40,9 @@ Data lake / DuckDB catalog
     ↓
 Factor research → approved factor set
     ↓
-Rolling OOS LightGBM predictions
+Rolling OOS LightGBM H1/H5 predictions
     ↓
-Limited-replacement portfolio policy
+Five-period 1% / 5% sleeves → 80% / 20% netted target blend
     ↓
 Charged backtest + audit artifacts
 ```
@@ -105,6 +104,26 @@ PYTHONPATH=src python scripts/run_universe_size_study.py
 ```
 
 第一条命令使用固定的 105 因子配置重新训练季度滚动 LightGBM；第二条命令按历史中证500成分过滤预测并运行 Top100/换仓3正式组合。两者依赖本机数据湖和特征缓存，运行前应核对配置中的绝对路径。
+
+### 4. Rust 缓存与 MPS LSTM 研究
+
+LSTM 使用过去 20 个连续交易日的 105 因子序列。Python 负责沿用既有截面标准化和标签口径，`quant-sequence-cache` 将面板转换为紧凑只读 mmap；PyTorch 在独立进程中通过 MPS 训练，禁止静默回退 CPU。
+
+```bash
+# 只生产并校验紧凑缓存
+PYTHONPATH=src python -m a_share_data.predict sequence-oos \
+  --config configs/prediction_sequence_lstm_105_v1.json --prepare-only
+
+# 一个季度、两轮训练的资源与正确性试跑
+PYTHONPATH=src python -m a_share_data.predict sequence-oos \
+  --config configs/prediction_sequence_lstm_105_v1.json --pilot
+
+# 完整季度滚动 OOS、共同样本 LightGBM 对照和正式 Top100/换仓3回测
+PYTHONPATH=src python -m a_share_data.predict sequence-oos \
+  --config configs/prediction_sequence_lstm_105_v1.json
+```
+
+每个季度先用 687 日拟合、6 日隔离、63 日验证选 epoch，再以该 epoch 数在完整 756 日窗口重新训练。缓存位于配置输出目录的 `sequence_cache/`，试跑与正式结果分别位于 `pilot/` 和 `full/`；模型、窗口审计、预测、CSV 指标和图表都保存在对应目录。
 
 ## 仓库地图
 

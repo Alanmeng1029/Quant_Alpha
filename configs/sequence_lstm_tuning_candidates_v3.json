@@ -1,0 +1,7 @@
+[
+  {"name": "wide_low_lr", "hidden": [128, 64], "dropout": 0.0, "weight_decay": 0.0, "learning_rate": 0.00002},
+  {"name": "dropout_01", "hidden": [128, 64], "dropout": 0.1, "weight_decay": 0.0001, "learning_rate": 0.00002},
+  {"name": "output_residual", "hidden": [128, 64], "dropout": 0.1, "weight_decay": 0.0001, "learning_rate": 0.00002, "output_residual": true},
+  {"name": "recurrent_residual", "hidden": [128, 64], "dropout": 0.1, "weight_decay": 0.0001, "learning_rate": 0.00002, "recurrent_residual": true},
+  {"name": "both_residuals", "hidden": [128, 64], "dropout": 0.1, "weight_decay": 0.0001, "learning_rate": 0.00002, "recurrent_residual": true, "output_residual": true}
+]

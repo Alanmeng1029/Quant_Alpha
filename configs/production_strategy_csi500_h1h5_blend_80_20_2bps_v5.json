@@ -1,0 +1,72 @@
+{
+  "strategy_id": "csi500_h1h5_five_period_blend_80_20_2bps_v5",
+  "status": "active",
+  "model_factor_set": "o2o_raw_daily60_minute45_dos20_v1",
+  "prediction_artifact": "results/predict/research-oos-raw-daily60-minute45-dos20-csi300-csi500-h1-h5-h10-v1/predictions.parquet",
+  "model": {
+    "algorithm": "default_lgbm_regression",
+    "training_universe": "CSI300_union_CSI500",
+    "refit_frequency": "quarterly_rolling_oos",
+    "production_signals": ["H1", "H5"]
+  },
+  "universe": {
+    "index_code": "000905.SH",
+    "membership_timing": "signal_date",
+    "membership_source": "index_trading_universe"
+  },
+  "portfolio": {
+    "strategy": "netted_target_weight_blend_v1",
+    "objective": "blend two no-risk five-period mu-minus-turnover target ledgers before execution",
+    "forecast_curve": {
+      "period_1": "raw_h1",
+      "periods_2_to_5": "(raw_h5-raw_h1)/4"
+    },
+    "execution_policy": "solve both sleeves daily, blend target weights, net overlapping names, execute once",
+    "risk_term": null,
+    "invested_weight": 0.98,
+    "sleeves": [
+      {
+        "name": "diversified_core",
+        "capital_weight": 0.8,
+        "max_weight_within_sleeve": 0.01
+      },
+      {
+        "name": "concentrated_alpha",
+        "capital_weight": 0.2,
+        "max_weight_within_sleeve": 0.05
+      }
+    ],
+    "combined_max_weight": 0.018,
+    "expected_target_holdings": 106.46,
+    "expected_effective_holdings": 100.09,
+    "lot_size": 100,
+    "initial_capital": 10000000.0
+  },
+  "costs": {"buy_bps": 2.0, "sell_bps": 2.0},
+  "evidence": {
+    "full_report": "results/predict/no-risk-multiperiod-blend-80pct-max1-20pct-max5/backtest/report/report.html",
+    "evaluation_window": "2021-04-02_to_2026-08-27",
+    "holding_periods": 1311,
+    "net_total_return": 1.7793993500365435,
+    "annualized_return": 0.21712759705242846,
+    "annualized_volatility": 0.22534984955642207,
+    "net_sharpe": 0.9635133880933213,
+    "information_ratio": 1.4657764615143385,
+    "max_drawdown": -0.2719842715040497,
+    "average_buy_turnover": 0.43138734579780624,
+    "average_sell_turnover": 0.43083707826471657,
+    "average_holding_count": 106.68954996186118,
+    "csi500_total_return": 0.25692677691883214
+  },
+  "reproduction": {
+    "optimizer": "scripts/optimize_multiperiod_mu_turnover.py",
+    "blend": "scripts/blend_target_weights.py",
+    "backtest": "python -m a_share_data.predict backtest-portfolio",
+    "report": "python -m a_share_data.predict render-backtest-report"
+  },
+  "approval": {
+    "approved_by": "Alanmxy",
+    "approved_on": "2026-09-21",
+    "approval_note": "Promoted after the netted 80% max-1% and 20% max-5% blend achieved the highest full-window excess Sharpe among the tested production candidates while preserving the diversified sleeve's drawdown profile."
+  }
+}

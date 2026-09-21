@@ -28,6 +28,9 @@ class FactorTest(unittest.TestCase):
                 {"trade_date": day, "ts_code": "000002.SZ", "qfq_close": float(index + 20)}
                 for index, day in enumerate(days) if index != 2
             ]
+            members = root / "lake" / "derived" / "factor_research" / "csi300_csi500_daily_members.parquet"
+            members.parent.mkdir(parents=True)
+            pl.DataFrame(prices).select("trade_date", "ts_code").write_parquet(members)
             con = duckdb.connect(str(catalog))
             try:
                 con.register("prices", pl.DataFrame(prices).to_arrow())

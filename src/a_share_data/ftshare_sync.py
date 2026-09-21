@@ -18,7 +18,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 import duckdb
 from .cli import Paths, sha256_file
-from .ftshare import ingest, register_views
+from .ftshare import ingest, ingest_adjust, register_views
 
 TZ=ZoneInfo('Asia/Shanghai')
 BASE='https://market.ft.tech/gateway'
@@ -180,28 +180,32 @@ def run(args):
         if end>completed_day():raise ValueError('Refusing a date before the end-of-day publication cutoff (18:00 Shanghai)')
         days=trade_days(paths.root/'交易日历.csv',start,end)
         vendor_root=paths.lake/'canonical'/'ftshare'
+        adjust_root=paths.lake/'canonical'/'ftshare_adjust'
         existing={date.fromisoformat(p.parent.name.split('=')[1]) for p in vendor_root.glob('trade_date=*/manifest.json')}
         pending=[d for d in days if d not in existing]
-        state={'started_at':datetime.now(TZ).isoformat(),'start':str(start),'end':str(end),'baseline_end':str(baseline),'expected_trade_dates':[str(d) for d in days],'pending_dates':[str(d) for d in pending],'completed':[],'status':'running','calendar_sha256':sha256_file(paths.root/'交易日历.csv')}
+        missing_adjust=[d for d in days if d in existing and not (adjust_root/f'trade_date={d}'/'manifest.json').exists()]
+        state={'started_at':datetime.now(TZ).isoformat(),'start':str(start),'end':str(end),'baseline_end':str(baseline),'expected_trade_dates':[str(d) for d in days],'pending_dates':[str(d) for d in pending],'pending_adjust_dates':[str(d) for d in missing_adjust],'completed':[],'status':'running','calendar_sha256':sha256_file(paths.root/'交易日历.csv')}
         save(output/'sync_status.json',state);print(json.dumps(state,ensure_ascii=False),flush=True)
         if args.plan:
             state['status']='planned';save(output/'sync_status.json',state);return state
-        if not pending:
+        if not pending and not missing_adjust:
             with duckdb.connect(str(paths.catalog)) as c:register_views(c,paths)
             state.update(status='up_to_date',finished_at=datetime.now(TZ).isoformat());save(output/'sync_status.json',state);return state
         credentials=json.loads((root/'api_credentials.local.json').read_text())
         client=Client(credentials['api_key'],args.rate)
         client.range_start=start;client.range_end=end
-        descriptions=client.pages('/api/v1/market/data/stock-description',{},200)
-        client.listing_dates={r['symbol']:{'listing_date':r.get('listing_date'),'name':r.get('name'),'status':r.get('status')} for r in descriptions}
-        save(output/'listing_dates.json',client.listing_dates)
-        save(output/'listing_dates.meta.json',{'retrieved_at':datetime.now(TZ).isoformat(),'source':BASE+'/api/v1/market/data/stock-description'})
-        listed=client.pages('/api/v1/market/data/stock-list',{},500)
-        mapping={r['stock_code']:r['stock_name'] for r in listed if ashare(r['stock_code'])}
-        for symbol,name in historical:
-            if ashare(symbol):mapping.setdefault(symbol,name or symbol)
-        universe={'retrieved_at':datetime.now(TZ).isoformat(),'selection':'current FTShare A shares union last legacy observed universe; no historical membership assertion',
-                  'stocks':[{'stock_code':s,'stock_name':mapping[s]} for s in sorted(mapping)],'selected_total':len(mapping)}
+        universe=None
+        if pending:
+            descriptions=client.pages('/api/v1/market/data/stock-description',{},200)
+            client.listing_dates={r['symbol']:{'listing_date':r.get('listing_date'),'name':r.get('name'),'status':r.get('status')} for r in descriptions}
+            save(output/'listing_dates.json',client.listing_dates)
+            save(output/'listing_dates.meta.json',{'retrieved_at':datetime.now(TZ).isoformat(),'source':BASE+'/api/v1/market/data/stock-description'})
+            listed=client.pages('/api/v1/market/data/stock-list',{},500)
+            mapping={r['stock_code']:r['stock_name'] for r in listed if ashare(r['stock_code'])}
+            for symbol,name in historical:
+                if ashare(symbol):mapping.setdefault(symbol,name or symbol)
+            universe={'retrieved_at':datetime.now(TZ).isoformat(),'selection':'current FTShare A shares union last legacy observed universe; no historical membership assertion',
+                      'stocks':[{'stock_code':s,'stock_name':mapping[s]} for s in sorted(mapping)],'selected_total':len(mapping)}
         for day in pending:
             try:
                 out=output/str(day)
@@ -213,6 +217,23 @@ def run(args):
                 print('INGESTED',day,flush=True)
             except Exception as e:
                 state.update(status='failed',failed_date=str(day),error=str(e).replace(client.key,'[REDACTED]'),requests=client.requests)
+                save(output/'sync_status.json',state);raise
+        # Adjustment factors for every installed date that lacks them: both the
+        # freshly ingested days above and historical partitions installed earlier.
+        adjust_days=[d for d in days if (vendor_root/f'trade_date={d}'/'manifest.json').exists()
+                     and not (adjust_root/f'trade_date={d}'/'manifest.json').exists()]
+        for day in adjust_days:
+            try:
+                out=output/str(day)
+                if not (out/'adjust_factors.json').exists():
+                    factors=client.pages('/api/v1/market/data/stock-adjust-factor',{'trade_date':day.strftime('%Y%m%d')},200)
+                    save(out/'adjust_factors.json',{'code':200,'data':{'records':factors,'total':len(factors),'pages':1}})
+                installed=ingest_adjust(out,paths)
+                state['completed'].append({'date':str(day),'status':'adjust_'+installed['status'],'factor_symbols':installed.get('symbols')})
+                state['pending_adjust_dates'].remove(str(day));save(output/'sync_status.json',state)
+                print('ADJUST-INGESTED',day,flush=True)
+            except Exception as e:
+                state.update(status='failed',failed_date=str(day),error='adjust: '+str(e).replace(client.key,'[REDACTED]'),requests=client.requests)
                 save(output/'sync_status.json',state);raise
         from .ftshare_audit import audit
         checked=audit(root,state['expected_trade_dates'])

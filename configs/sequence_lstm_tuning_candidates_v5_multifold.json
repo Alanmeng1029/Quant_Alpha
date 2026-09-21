@@ -1,0 +1,6 @@
+[
+  {"name": "plain_lr2e-5", "hidden": [128, 64], "dropout": 0.10, "weight_decay": 0.0001, "learning_rate": 0.00002},
+  {"name": "both_residual_lr2e-5", "hidden": [128, 64], "dropout": 0.10, "weight_decay": 0.0001, "learning_rate": 0.00002, "recurrent_residual": true, "output_residual": true, "zero_init_output_residual": true},
+  {"name": "both_residual_lr3e-5", "hidden": [128, 64], "dropout": 0.10, "weight_decay": 0.0001, "learning_rate": 0.00003, "recurrent_residual": true, "output_residual": true, "zero_init_output_residual": true},
+  {"name": "both_residual_lr5e-5", "hidden": [128, 64], "dropout": 0.10, "weight_decay": 0.0001, "learning_rate": 0.00005, "recurrent_residual": true, "output_residual": true, "zero_init_output_residual": true}
+]

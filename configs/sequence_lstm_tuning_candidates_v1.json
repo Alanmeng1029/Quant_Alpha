@@ -1,0 +1,8 @@
+[
+  {"name": "wide_lr3e-4", "hidden": [128, 64], "dropout": 0.0, "weight_decay": 0.0, "learning_rate": 0.0003},
+  {"name": "wide_lr1e-4", "hidden": [128, 64], "dropout": 0.0, "weight_decay": 0.0, "learning_rate": 0.0001},
+  {"name": "wide_lr3e-5", "hidden": [128, 64], "dropout": 0.0, "weight_decay": 0.0, "learning_rate": 0.00003},
+  {"name": "small_lr3e-4", "hidden": [64, 32], "dropout": 0.0, "weight_decay": 0.0, "learning_rate": 0.0003},
+  {"name": "small_regularized", "hidden": [64, 32], "dropout": 0.2, "weight_decay": 0.0001, "learning_rate": 0.0003},
+  {"name": "single_lr3e-4", "hidden": [64], "dropout": 0.0, "weight_decay": 0.0001, "learning_rate": 0.0003}
+]
