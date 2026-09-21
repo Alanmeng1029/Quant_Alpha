@@ -1278,8 +1278,6 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "osqp"
 version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02dc0ca4067340d5e15e26c181e43a87fc0df9f201355e7fba314576d39d6e57"
 dependencies = [
  "osqp-sys",
 ]
