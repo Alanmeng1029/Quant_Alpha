@@ -67,3 +67,27 @@ def test_sequence_cache_rejects_truncated_binary(tmp_path: Path) -> None:
     (root / "values.f32").write_bytes(b"")
     with pytest.raises(ValueError, match="wrong size"):
         SequenceCache(root)
+
+
+def test_sequence_window_lag_preserves_legacy_and_aligns_new_baseline() -> None:
+    from a_share_data.sequence_oos import _sequence_windows
+    from a_share_data.research_oos import quarter_windows
+    dates = [str(date(2018, 1, 1) + timedelta(days=n)) for n in range(1500)]
+    config = {"oos_start": "2021-04-01", "oos_end": "2021-06-30"}
+    original = quarter_windows(dates, config["oos_start"], config["oos_end"])
+    legacy = _sequence_windows(dates, config)
+    assert legacy[0]["train_dates"] == original[0][1]
+    aligned = _sequence_windows(dates, {**config, "training_label_lag": 11})
+    assert len(aligned[0]["train_dates"]) == 756
+    assert dates.index(aligned[0]["train_dates"][-1]) == dates.index(legacy[0]["train_dates"][-1]) - 5
+    assert aligned[0]["test_dates"] == legacy[0]["test_dates"]
+    with pytest.raises(ValueError, match="maturity"):
+        _sequence_windows(dates, {**config, "training_label_lag": 5})
+
+
+def test_sequence_fingerprint_separates_label_universes(tmp_path: Path) -> None:
+    from a_share_data.sequence_oos import _fingerprint
+    config = {"sequence_length": 20}
+    a = _fingerprint(config, {}, [], ("f1",), [date(2025, 1, 1)])
+    b = _fingerprint({**config, "raw_eligible_universe": True}, {}, [], ("f1",), [date(2025, 1, 1)])
+    assert a != b

@@ -230,7 +230,10 @@ def run(args):
                     save(out/'adjust_factors.json',{'code':200,'data':{'records':factors,'total':len(factors),'pages':1}})
                 installed=ingest_adjust(out,paths)
                 state['completed'].append({'date':str(day),'status':'adjust_'+installed['status'],'factor_symbols':installed.get('symbols')})
-                state['pending_adjust_dates'].remove(str(day));save(output/'sync_status.json',state)
+                # Freshly ingested dates were never listed in pending_adjust_dates,
+                # which only holds dates that were missing factors at run start.
+                if str(day) in state['pending_adjust_dates']:state['pending_adjust_dates'].remove(str(day))
+                save(output/'sync_status.json',state)
                 print('ADJUST-INGESTED',day,flush=True)
             except Exception as e:
                 state.update(status='failed',failed_date=str(day),error='adjust: '+str(e).replace(client.key,'[REDACTED]'),requests=client.requests)

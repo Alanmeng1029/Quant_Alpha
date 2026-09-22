@@ -108,6 +108,10 @@ def main() -> None:
             & (pl.col("raw_h10").is_finite() if args.term_structure == "h1h5h10" else pl.lit(True))
         )
     )
+    # H1/H5 models (including the two-head LSTM) do not predict H10. This
+    # placeholder is internal and unused by the five-period forecast curve.
+    if args.term_structure == "h1h5" and "raw_h10" not in source.columns:
+        source = source.with_columns(pl.lit(0.0).alias("raw_h10"))
     partitions = source.partition_by("trade_date", as_dict=True, maintain_order=True)
     previous: dict[str, float] = {}
     rows: list[dict[str, object]] = []

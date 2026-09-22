@@ -103,6 +103,14 @@ struct Args {
     oos_start: String,
     #[arg(long, default_value = "2026-08-28")]
     oos_end: String,
+    /// Number of calendar months covered by each fitted model.  The production
+    /// baseline uses three; set to one for monthly rolling refits.
+    #[arg(long, default_value_t = 3)]
+    refit_months: usize,
+    /// Exponential sample-weight half-life in trading days.  Omit for the
+    /// equal-weight production baseline.
+    #[arg(long)]
+    time_decay_half_life_days: Option<f64>,
     #[arg(long, default_value_t = 2048)]
     memory_limit_mb: usize,
     #[arg(long, default_value_t = 8)]
@@ -145,6 +153,7 @@ struct DayRow {
 struct Matrix {
     x: Vec<f32>,
     y: Vec<f32>,
+    weights: Vec<f32>,
     groups: Vec<i32>,
     rows: usize,
 }
@@ -448,6 +457,7 @@ fn extract_labeled(
     horizon: usize,
     winsor: bool,
     objective: TrainingObjective,
+    time_decay_half_life_days: Option<f64>,
 ) -> Matrix {
     let labels = match (horizon, winsor) {
         (1, false) => &panel.raw_h1,
@@ -460,6 +470,7 @@ fn extract_labeled(
     };
     let mut x = Vec::new();
     let mut y = Vec::new();
+    let mut weights = Vec::new();
     let mut groups = Vec::new();
     for day in begin..end {
         let (row_begin, row_end) = panel.ranges[day];
@@ -490,13 +501,25 @@ fn extract_labeled(
                     .as_ref()
                     .map_or(labels[row], |grades| grades[&row]),
             );
+            if let Some(half_life) = time_decay_half_life_days {
+                let age = (end - 1 - day) as f64;
+                weights.push(2.0_f64.powf(-age / half_life) as f32);
+            }
         }
         groups.push(i32::try_from(finite_rows.len()).expect("daily ranking group exceeds i32"));
+    }
+    if !weights.is_empty() {
+        let mean =
+            weights.iter().map(|value| f64::from(*value)).sum::<f64>() / weights.len() as f64;
+        for weight in &mut weights {
+            *weight = (f64::from(*weight) / mean) as f32;
+        }
     }
     Matrix {
         rows: y.len(),
         x,
         y,
+        weights,
         groups,
     }
 }
@@ -535,6 +558,18 @@ fn dataset(matrix: &Matrix, feature_count: usize, reference: DatasetHandle) -> R
             FLOAT32,
         )
     })?;
+    if !matrix.weights.is_empty() {
+        let weight = CString::new("weight")?;
+        lgb_check(unsafe {
+            LGBM_DatasetSetField(
+                handle,
+                weight.as_ptr(),
+                matrix.weights.as_ptr().cast(),
+                i32::try_from(matrix.weights.len())?,
+                FLOAT32,
+            )
+        })?;
+    }
     if !matrix.groups.is_empty() {
         let group = CString::new("group")?;
         lgb_check(unsafe {
@@ -666,7 +701,16 @@ fn month_id(value: &str) -> Result<i32> {
     Ok(date.year() * 12 + i32::try_from(date.month0())?)
 }
 
-fn windows(panel: &Panel, start: &str, end: &str) -> Result<Vec<(usize, usize)>> {
+fn windows(
+    panel: &Panel,
+    start: &str,
+    end: &str,
+    refit_months: usize,
+) -> Result<Vec<(usize, usize)>> {
+    if refit_months == 0 {
+        bail!("--refit-months must be positive")
+    }
+    let refit_months = i32::try_from(refit_months)?;
     let start_month = month_id(start)?;
     let mut out = Vec::new();
     for index in 0..panel.dates.len() {
@@ -675,10 +719,10 @@ fn windows(panel: &Panel, start: &str, end: &str) -> Result<Vec<(usize, usize)>>
             continue;
         }
         let first_in_month = index == 0 || panel.dates[index - 1][..7] != date[..7];
-        if !first_in_month || (month_id(date)? - start_month) % 3 != 0 {
+        if !first_in_month || (month_id(date)? - start_month) % refit_months != 0 {
             continue;
         }
-        let end_month = month_id(date)? + 3;
+        let end_month = month_id(date)? + refit_months;
         let mut finish = index;
         while finish < panel.dates.len()
             && panel.dates[finish].as_str() <= end
@@ -723,6 +767,12 @@ fn zscore(values: &[f64]) -> Vec<f64> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if args
+        .time_decay_half_life_days
+        .is_some_and(|half_life| !half_life.is_finite() || half_life <= 0.0)
+    {
+        bail!("--time-decay-half-life-days must be finite and positive")
+    }
     let index_codes = args
         .index_code
         .split(',')
@@ -754,7 +804,7 @@ fn main() -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
     let panel = load_panel(&args, &factors)?;
-    let rolling = windows(&panel, &args.oos_start, &args.oos_end)?;
+    let rolling = windows(&panel, &args.oos_start, &args.oos_end, args.refit_months)?;
     if rolling.is_empty() {
         bail!("no rolling windows")
     }
@@ -788,6 +838,7 @@ fn main() -> Result<()> {
                 horizon,
                 true,
                 args.objective,
+                args.time_decay_half_life_days,
             );
             let validation = extract_labeled(
                 &panel,
@@ -796,6 +847,7 @@ fn main() -> Result<()> {
                 horizon,
                 false,
                 args.objective,
+                None,
             );
             let rounds = choose_rounds(
                 &early_train,
@@ -811,6 +863,7 @@ fn main() -> Result<()> {
                 horizon,
                 true,
                 args.objective,
+                args.time_decay_half_life_days,
             );
             let model_path = quarter_dir.join(format!(
                 "{:?}_{}_h{horizon}.txt",
@@ -896,6 +949,8 @@ fn main() -> Result<()> {
             "legacy_qfq_universe": args.legacy_qfq_universe,
             "factor_count": factors.len(),
             "training_days": TRAIN_DAYS,
+            "refit_months": args.refit_months,
+            "time_decay_half_life_days": args.time_decay_half_life_days,
             "label_lag": LABEL_LAG,
             "horizons": HORIZONS,
             "oos_start": args.oos_start,
@@ -936,5 +991,62 @@ mod tests {
         let z = zscore(&[1.0, 2.0, 3.0]);
         assert!(z[0] < 0.0 && z[2] > 0.0);
         assert!(z.iter().sum::<f64>().abs() < 1e-12);
+    }
+
+    #[test]
+    fn refit_months_controls_window_frequency_and_span() -> Result<()> {
+        let origin = NaiveDate::from_ymd_opt(2018, 1, 1).unwrap();
+        let dates = (0..1_500)
+            .map(|offset| {
+                (origin + chrono::Duration::days(offset))
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        let panel = Panel {
+            dates,
+            ..Panel::default()
+        };
+
+        let monthly = windows(&panel, "2021-01-01", "2021-06-30", 1)?;
+        let quarterly = windows(&panel, "2021-01-01", "2021-06-30", 3)?;
+
+        assert_eq!(monthly.len(), 6);
+        assert_eq!(quarterly.len(), 2);
+        assert_eq!(monthly[0].1 - monthly[0].0, 31);
+        assert_eq!(quarterly[0].1 - quarterly[0].0, 90);
+        assert!(windows(&panel, "2021-01-01", "2021-06-30", 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn time_decay_weights_recent_dates_more_heavily_and_normalizes() {
+        let panel = Panel {
+            feature_count: 1,
+            dates: vec![
+                "2021-01-01".into(),
+                "2021-01-02".into(),
+                "2021-01-03".into(),
+            ],
+            ranges: vec![(0, 1), (1, 2), (2, 3)],
+            x: vec![0.0, 0.0, 0.0],
+            raw_h1: vec![0.0, 0.0, 0.0],
+            win_h1: vec![0.0, 0.0, 0.0],
+            ..Panel::default()
+        };
+
+        let matrix = extract_labeled(
+            &panel,
+            0,
+            3,
+            1,
+            true,
+            TrainingObjective::Regression,
+            Some(2.0),
+        );
+
+        assert_eq!(matrix.weights.len(), 3);
+        assert!((matrix.weights.iter().sum::<f32>() / 3.0 - 1.0).abs() < 1e-6);
+        assert!((matrix.weights[2] / matrix.weights[0] - 2.0).abs() < 1e-6);
     }
 }

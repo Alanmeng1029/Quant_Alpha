@@ -1,0 +1,33 @@
+{
+  "catalog": "/Users/alanmxy/Documents/Quant_Alpha/A_stock_database/lake/catalog/a_share.duckdb",
+  "feature_root": "/Users/alanmxy/Documents/Quant_Alpha/A_stock_database/lake/derived/predict_features_o2o_raw_daily60_minute45_dos20_csi300_csi500_v1",
+  "formal_factor_set": "/Users/alanmxy/Documents/Quant_Alpha/configs/formal_factor_sets/o2o_raw_daily60_minute45_dos20_v1.json",
+  "baseline_predictions": "/Users/alanmxy/Documents/Quant_Alpha/results/predict/research-oos-raw-daily60-minute45-dos20-csi300-csi500-h1-h5-h10-v1/predictions.parquet",
+  "strategy_config": "/Users/alanmxy/Documents/Quant_Alpha/configs/production_strategy_csi500_top100_v1.json",
+  "output": "/Users/alanmxy/Documents/Quant_Alpha/results/predict/sequence-lstm-residual-raw125-v1",
+  "trainer_python": "/Users/alanmxy/大学/大学/研二上/论文/论文candidate/.venv-research/bin/python",
+  "oos_start": "2021-04-01",
+  "oos_end": "2026-08-28",
+  "sequence_length": 20,
+  "hidden_sizes": [
+    128,
+    64
+  ],
+  "recurrent_residual": true,
+  "output_residual": true,
+  "zero_init_output_residual": true,
+  "dropout": 0.1,
+  "weight_decay": 0.0001,
+  "batch_size": 512,
+  "max_epochs": 30,
+  "patience": 4,
+  "learning_rate": 3e-05,
+  "seed": 20260908,
+  "model_tag": "125",
+  "training_label_lag": 11,
+  "raw_eligible_universe": true,
+  "universe_index_codes": [
+    "000300.SH",
+    "000905.SH"
+  ]
+}

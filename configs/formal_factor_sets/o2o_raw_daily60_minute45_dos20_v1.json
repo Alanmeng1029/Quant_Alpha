@@ -14,9 +14,9 @@
     "factor_ids_file": "configs/candidate_factors_daily_o2o_candidate60_raw_v1.txt"
   },
   "minute_components": [
-    {"count": 28, "dataset": "A_stock_database/lake/derived/minute_factors/ohlcv_candidates_v1_raw_csi300_csi500_csi1000_v2"},
-    {"count": 10, "dataset": "A_stock_database/lake/derived/minute_factors/core24_raw_csi300_csi500_csi1000_v2"},
-    {"count": 7, "dataset": "A_stock_database/lake/derived/minute_factors/ohlcv_candidates_v3_raw_csi300_csi500_csi1000_v2"},
+    {"count": 28, "factor_ids_file": "configs/candidate_factors_minute_ohlcv_open_to_open_abs_icir_gt2_h1_or_h5.txt", "dataset": "A_stock_database/lake/derived/minute_factors/ohlcv_candidates_v1_raw_csi300_csi500_csi1000_v2"},
+    {"count": 10, "factor_ids_file": "configs/candidate_factors_minute_core24_o2o_selected10.txt", "dataset": "A_stock_database/lake/derived/minute_factors/core24_raw_csi300_csi500_csi1000_v2"},
+    {"count": 7, "factor_ids_file": "configs/candidate_factors_minute_ohlcv_v3_o2o_abs_annual_icir_gt2_h1_or_h5.txt", "dataset": "A_stock_database/lake/derived/minute_factors/ohlcv_candidates_v3_raw_csi300_csi500_csi1000_v2"},
     {"count": 20, "factor_ids_file": "configs/candidate_factors_minute_dos_v1_selected20.txt", "dataset": "A_stock_database/lake/derived/minute_factors/dos_minute_v1_raw_csi300_csi500_v1"}
   ],
   "active_feature_cache": "A_stock_database/lake/derived/predict_features_o2o_raw_daily60_minute45_dos20_csi300_csi500_v1",

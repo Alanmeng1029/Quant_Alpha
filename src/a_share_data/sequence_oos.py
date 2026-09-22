@@ -28,6 +28,25 @@ from a_share_data.sequence_data import SequenceCache
 PREPROCESSING_VERSION = "daily_cross_section_p01_p99_zscore_v1"
 
 
+def _label_options(config: dict[str, Any]) -> dict[str, Any]:
+    return {"universe_index_codes": tuple(config.get("universe_index_codes", ("000300.SH", "000905.SH"))),
+            "raw_eligible_universe": bool(config.get("raw_eligible_universe", False))}
+
+
+def _sequence_windows(dates: list[str], config: dict[str, Any]) -> list[dict[str, Any]]:
+    lag = int(config.get("training_label_lag", 6))
+    if lag < 6:
+        raise ValueError("training_label_lag must cover the H5 label's six-day maturity")
+    positions = {day: index for index, day in enumerate(dates)}
+    result = []
+    for signal, _, test in quarter_windows(dates, config["oos_start"], config["oos_end"]):
+        end = positions[signal] - lag
+        if end < 756:
+            continue
+        result.append({"signal": signal, "train_dates": dates[end-756:end], "test_dates": test})
+    return result
+
+
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -45,6 +64,10 @@ def _fingerprint(config: dict[str, Any], feature_manifest: dict[str, Any], files
         "sequence_length": int(config["sequence_length"]),
         "preprocessing": PREPROCESSING_VERSION,
     }
+    # Keep the old 105-factor cache identity unchanged; new label policies must
+    # never silently reuse a cache prepared under another eligibility rule.
+    if "raw_eligible_universe" in config or "universe_index_codes" in config:
+        payload["label_options"] = _label_options(config)
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
@@ -89,7 +112,7 @@ def _build_cache(config: dict[str, Any], root: Path) -> tuple[Path, dict[str, An
         features = pl.concat([pl.read_parquet(path) for path in files]).with_columns(
             pl.col("trade_date").cast(pl.Date)).filter(
             ~pl.col("ts_code").is_in(INFEASIBLE_EXECUTION_CODES))
-        labels = build_labels(catalog)
+        labels = build_labels(catalog, **_label_options(config))
         day_map = pl.DataFrame({"trade_date": calendar}).with_row_index("day_index")
         panel = standardize_features(features, factor_ids).join(
             labels.select("trade_date", "ts_code", "excess_h1", "excess_h5"),
@@ -199,8 +222,9 @@ def run_sequence_oos(config_path: Path, *, pilot: bool = False, max_windows: int
     run_root = root / ("pilot" if pilot else "full")
     run_root.mkdir(parents=True, exist_ok=True)
     dates = [str(day) for day in _calendar(Path(config["catalog"]))]
-    windows = [{"signal": signal, "train_dates": train, "test_dates": test}
-               for signal, train, test in quarter_windows(dates, config["oos_start"], config["oos_end"])]
+    windows = _sequence_windows(dates, config)
+    model_tag = str(config.get("model_tag", cache_manifest["factor_count"]))
+    lstm_name, baseline_name = f"lstm{model_tag}", f"lgbm_default{model_tag}_common"
     windows_path = run_root / "windows.json"; _write_json(windows_path, windows)
     effective_windows = 1 if pilot else max_windows
     effective_epochs = 2 if pilot else int(config.get("max_epochs", 100))
@@ -234,21 +258,26 @@ def run_sequence_oos(config_path: Path, *, pilot: bool = False, max_windows: int
     execution = _execution_calendar(Path(config["catalog"]), raw["trade_date"].unique().sort().to_list())
     lstm = daily_normalize(raw, "raw_h1", "raw_h5").join(execution, on="trade_date", how="left").drop_nulls("execution_date")
     prediction_root = run_root / "predictions"; prediction_root.mkdir(exist_ok=True)
-    lstm_path = prediction_root / "lstm105.parquet"; lstm.write_parquet(lstm_path, compression="zstd")
+    lstm_path = prediction_root / f"{lstm_name}.parquet"; lstm.write_parquet(lstm_path, compression="zstd")
     baseline_full = pl.read_parquet(Path(config["baseline_predictions"])).with_columns(
         pl.col("trade_date").cast(pl.Date), pl.col("execution_date").cast(pl.Date))
     common_keys = lstm.select("trade_date", "ts_code")
     baseline = baseline_full.join(common_keys, on=["trade_date", "ts_code"], how="semi")
-    baseline_path = prediction_root / "lgbm_default105_common.parquet"
+    if baseline.height != lstm.height:
+        raise ValueError("baseline does not cover every sequence prediction key; compare on identical keys")
+    baseline_path = prediction_root / f"{baseline_name}.parquet"
     baseline.write_parquet(baseline_path, compression="zstd")
-    labels = build_labels(Path(config["catalog"])).select("trade_date", "ts_code", "excess_h1", "excess_h5")
+    labels = build_labels(Path(config["catalog"]), **_label_options(config)).select("trade_date", "ts_code", "excess_h1", "excess_h5")
     lstm_measured = lstm.join(labels, on=["trade_date", "ts_code"], how="left")
     baseline_measured = baseline.join(labels, on=["trade_date", "ts_code"], how="left")
     report = {"fingerprint": cache_manifest["fingerprint"], "pilot": pilot,
+              "factor_count": cache_manifest["factor_count"],
+              "training_label_lag": int(config.get("training_label_lag", 6)),
+              "label_options": _label_options(config),
               "execution_filter": {"last_observed_day": str(last_observed_day),
                                    "excluded_rows_without_next_trading_day": non_executable_rows},
               "coverage": coverage, "models": {}, "top100": _top_overlap(lstm, baseline)}
-    for name, measured in (("lstm105", lstm_measured), ("lgbm_default105_common", baseline_measured)):
+    for name, measured in ((lstm_name, lstm_measured), (baseline_name, baseline_measured)):
         report["models"][name] = {"h1": _metrics(measured, "raw_h1", "excess_h1"),
                                   "h5": _metrics(measured, "raw_h5", "excess_h5"),
                                   "period_metrics": _period_metrics(measured, "raw_h1", "raw_h5"),
@@ -266,7 +295,7 @@ def run_sequence_oos(config_path: Path, *, pilot: bool = False, max_windows: int
         policy = {key: value for key, value in {**strategy["portfolio"], **strategy["costs"]}.items()
                   if key != "strategy"}
         csi_paths = {}
-        for name, frame in (("lstm105", lstm), ("lgbm_default105_common", baseline)):
+        for name, frame in ((lstm_name, lstm), (baseline_name, baseline)):
             path = prediction_root / f"{name}_csi500.parquet"
             _csi500(Path(config["catalog"]), frame).write_parquet(path, compression="zstd")
             csi_paths[name] = path
