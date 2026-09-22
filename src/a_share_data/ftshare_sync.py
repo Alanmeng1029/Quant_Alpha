@@ -177,7 +177,8 @@ def run(args):
             historical=c.execute('SELECT ts_code,name FROM instruments WHERE last_observed_date >= ?', [baseline]).fetchall()
         start=date.fromisoformat(args.start) if args.start else baseline+timedelta(days=1)
         end=date.fromisoformat(args.end) if args.end else completed_day()
-        if end>completed_day():raise ValueError('Refusing a date before the end-of-day publication cutoff (18:00 Shanghai)')
+        if end>completed_day() and not args.allow_before_cutoff:
+            raise ValueError('Refusing a date before the end-of-day publication cutoff (18:00 Shanghai)')
         days=trade_days(paths.root/'交易日历.csv',start,end)
         vendor_root=paths.lake/'canonical'/'ftshare'
         adjust_root=paths.lake/'canonical'/'ftshare_adjust'
@@ -253,6 +254,11 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--project-root',default=str(Path(__file__).resolve().parents[2]))
     p.add_argument('--start');p.add_argument('--end');p.add_argument('--plan',action='store_true')
+    p.add_argument(
+        '--allow-before-cutoff',
+        action='store_true',
+        help='Explicitly allow downloading the requested current trade date before 18:00 Shanghai; all coverage checks still apply',
+    )
     p.add_argument('--workers',type=int,default=4);p.add_argument('--rate',type=float,default=10)
     args=p.parse_args()
     if not 1<=args.workers<=8 or not 0<args.rate<=20:p.error('workers must be 1..8 and rate 0..20')

@@ -57,6 +57,9 @@ struct Args {
     model_root: Option<PathBuf>,
     #[arg(long, default_value = "raw105_000300_SH,000905_SH_h1.txt")]
     model_name: String,
+    /// Forecast horizon written to raw_hN and pred_hN columns.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=10))]
+    horizon: u8,
     #[arg(long)]
     output: PathBuf,
 }
@@ -289,7 +292,9 @@ fn main() -> Result<()> {
         })
         .collect::<Vec<_>>()
         .join(",");
-    conn.execute_batch(&format!("COPY (SELECT trade_date::DATE trade_date,ts_code,raw_h1,pred_h1 FROM (VALUES {values}) v(trade_date,ts_code,raw_h1,pred_h1) ORDER BY ts_code) TO '{}' (FORMAT PARQUET,COMPRESSION ZSTD)", quote(&temp)))?;
+    let raw_column = format!("raw_h{}", args.horizon);
+    let normalized_column = format!("pred_h{}", args.horizon);
+    conn.execute_batch(&format!("COPY (SELECT trade_date::DATE trade_date,ts_code,{raw_column}::DOUBLE {raw_column},{normalized_column}::DOUBLE {normalized_column} FROM (VALUES {values}) v(trade_date,ts_code,{raw_column},{normalized_column}) ORDER BY ts_code) TO '{}' (FORMAT PARQUET,COMPRESSION ZSTD)", quote(&temp)))?;
     if args.output.exists() {
         fs::remove_file(&args.output)?;
     }

@@ -27,6 +27,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sell-bps", type=float, default=2.0)
     parser.add_argument("--max-weight", type=float, default=0.01)
     parser.add_argument("--invested-weight", type=float, default=0.98)
+    parser.add_argument(
+        "--previous-positions",
+        type=Path,
+        help="Optional prior target/executed weights for the first signal date",
+    )
     parser.add_argument("--term-structure", choices=("h1h5", "h1h5h10"), default="h1h5")
     parser.add_argument("--max-days", type=int)
     return parser.parse_args()
@@ -100,7 +105,12 @@ def main() -> None:
         raise ValueError("require 0 < max_weight <= invested_weight <= 1")
     source = (
         pl.read_parquet(args.predictions)
-        .with_columns(pl.col("trade_date").cast(pl.Date), pl.col("execution_date").cast(pl.Date))
+        .with_columns(
+            pl.col("trade_date").cast(pl.Date),
+            pl.col("execution_date").cast(pl.Date),
+            pl.col("raw_h1").cast(pl.Float64),
+            pl.col("raw_h5").cast(pl.Float64),
+        )
         .filter(
             pl.col("execution_date").is_not_null()
             & pl.col("raw_h1").is_finite()
@@ -114,6 +124,22 @@ def main() -> None:
         source = source.with_columns(pl.lit(0.0).alias("raw_h10"))
     partitions = source.partition_by("trade_date", as_dict=True, maintain_order=True)
     previous: dict[str, float] = {}
+    if args.previous_positions is not None:
+        prior = pl.read_parquet(args.previous_positions)
+        weight_column = (
+            "target_weight" if "target_weight" in prior.columns
+            else "weight" if "weight" in prior.columns
+            else None
+        )
+        if weight_column is None:
+            raise ValueError("previous positions need target_weight or weight")
+        if prior.select(pl.col("ts_code").is_duplicated().any()).item():
+            raise ValueError("previous positions contain duplicate ts_code values")
+        previous = {
+            str(code): float(weight)
+            for code, weight in prior.select("ts_code", weight_column).iter_rows()
+            if weight is not None and np.isfinite(weight) and weight > 0
+        }
     rows: list[dict[str, object]] = []
     diagnostics: list[dict[str, object]] = []
     for day_number, (key, frame) in enumerate(partitions.items()):
@@ -176,6 +202,9 @@ def main() -> None:
                            ["raw_h1", "(raw_h5-raw_h1)/4 repeated for periods 2..5",
                             "(raw_h10-raw_h5)/5 repeated for periods 6..10"]),
         "predictions": str(args.predictions.resolve()),
+        "previous_positions": (
+            str(args.previous_positions.resolve()) if args.previous_positions else None
+        ),
         "buy_bps": args.buy_bps,
         "sell_bps": args.sell_bps,
         "max_weight": args.max_weight,

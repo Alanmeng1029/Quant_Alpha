@@ -12,7 +12,10 @@ const DEFAULT_MINUTE: &str = "A_stock_database/lake/canonical/minute";
 const DEFAULT_FEATURE_MANIFEST: &str = "A_stock_database/lake/derived/predict_features_o2o_raw_daily60_minute45_dos20_csi300_csi500_v1/manifest.json";
 const DEFAULT_MODEL_ROOT: &str =
     "results/predict/research-oos-raw-daily60-minute45-dos20-csi300-csi500-h1-h5-h10-v1/models";
-const DEFAULT_OUTPUT: &str = "results/production/raw_daily60_minute45_dos20_h1_v1";
+const DEFAULT_OUTPUT: &str = "results/production/raw_daily60_minute45_dos20_h1h5_blend_80_20_v1";
+const DEFAULT_PYTHON: &str = "/Users/alanmxy/anaconda3/envs/ml311/bin/python";
+const DEFAULT_STRATEGY: &str = "configs/production_strategy_csi500_h1h5_blend_80_20_2bps_v5.json";
+const DEFAULT_CALENDAR: &str = "A_stock_database/交易日历.csv";
 
 #[derive(Parser)]
 #[command(
@@ -44,6 +47,12 @@ struct RunArgs {
     model_root: PathBuf,
     #[arg(long, default_value = DEFAULT_OUTPUT)]
     output_root: PathBuf,
+    #[arg(long, default_value = DEFAULT_PYTHON)]
+    python_bin: PathBuf,
+    #[arg(long, default_value = DEFAULT_STRATEGY)]
+    strategy_config: PathBuf,
+    #[arg(long, default_value = DEFAULT_CALENDAR)]
+    exchange_calendar: PathBuf,
     /// Directory containing quant-daily-factor, quant-minute-factor,
     /// quant-lgbm-predict-day, and quant-position-day. Defaults to this executable's directory.
     #[arg(long)]
@@ -51,11 +60,11 @@ struct RunArgs {
     /// Force rebuilding already materialized minute-factor day files.
     #[arg(long)]
     replace_minute: bool,
-    /// Override automatic lookup of the latest earlier positions.parquet.
+    /// Override automatic lookup of the latest earlier production day directory.
     #[arg(long)]
-    previous_positions: Option<PathBuf>,
+    previous_production_dir: Option<PathBuf>,
     /// Start deployment from cash instead of carrying any earlier position artifact.
-    #[arg(long, conflicts_with = "previous_positions")]
+    #[arg(long, conflicts_with = "previous_production_dir")]
     start_flat: bool,
 }
 
@@ -79,8 +88,11 @@ struct RunManifest {
     factors: String,
     prediction: String,
     positions: String,
-    selected_model: String,
-    previous_positions: Option<String>,
+    selected_h1_model: String,
+    selected_h5_model: String,
+    strategy_config: String,
+    previous_production_dir: Option<String>,
+    start_flat: bool,
 }
 
 fn quote(path: &Path) -> String {
@@ -328,12 +340,30 @@ fn latest_previous(root: &Path, date: &str) -> Result<Option<PathBuf>> {
         .filter_map(|x| {
             let name = x.file_name().to_string_lossy().to_string();
             let d = name.strip_prefix("date=")?;
-            let file = x.path().join("positions.parquet");
-            (d < date && file.is_file()).then_some((d.to_owned(), file))
+            let directory = x.path();
+            let core = directory.join("sleeves/core/target_weights.parquet");
+            let alpha = directory.join("sleeves/alpha/target_weights.parquet");
+            (d < date && core.is_file() && alpha.is_file()).then_some((d.to_owned(), directory))
         })
         .collect::<Vec<_>>();
     found.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(found.pop().map(|x| x.1))
+}
+
+fn next_execution_date(calendar: &Path, signal_date: &str) -> Result<String> {
+    let text = fs::read_to_string(calendar)
+        .with_context(|| format!("read exchange calendar {}", calendar.display()))?;
+    text.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let mut fields = line.trim_start_matches('\u{feff}').split(',');
+            let exchange = fields.next()?;
+            let date = fields.next()?;
+            let status = fields.next()?;
+            (exchange == "SSE" && status == "交易" && date > signal_date).then_some(date.to_owned())
+        })
+        .min()
+        .with_context(|| format!("exchange calendar has no trading day after {signal_date}"))
 }
 
 fn parquet_rows(conn: &Connection, path: &Path) -> Result<i64> {
@@ -366,7 +396,16 @@ fn run(args: RunArgs) -> Result<()> {
     let daily_bin = executable(&bin_dir, "quant-daily-factor")?;
     let minute_bin = executable(&bin_dir, "quant-minute-factor")?;
     let predict_bin = executable(&bin_dir, "quant-lgbm-predict-day")?;
-    let position_bin = executable(&bin_dir, "quant-position-day")?;
+    if !args.python_bin.is_file() {
+        bail!("Python runtime is missing: {}", args.python_bin.display())
+    }
+    let strategy: Value = serde_json::from_slice(&fs::read(&args.strategy_config)?)?;
+    if strategy["status"] != "active"
+        || strategy["model"]["production_signals"] != serde_json::json!(["H1", "H5"])
+        || strategy["portfolio"]["strategy"] != "netted_target_weight_blend_v1"
+    {
+        bail!("strategy config is not the active H1/H5 netted 80/20 production baseline")
+    }
     let day_dir = args.output_root.join(format!("date={}", args.date));
     fs::create_dir_all(&day_dir)?;
     let daily_file = day_dir.join("daily60.parquet");
@@ -455,46 +494,147 @@ fn run(args: RunArgs) -> Result<()> {
         &indexes,
         &factor_file,
     )?;
+    let h1_file = day_dir.join("prediction_h1.parquet");
+    let h5_file = day_dir.join("prediction_h5.parquet");
+    for (horizon, model_name, output) in [
+        (1_u8, "raw105_000300_SH,000905_SH_h1.txt", &h1_file),
+        (5_u8, "raw105_000300_SH,000905_SH_h5.txt", &h5_file),
+    ] {
+        run_command(
+            &predict_bin,
+            &[
+                "--features".into(),
+                factor_file.display().to_string(),
+                "--manifest".into(),
+                args.feature_manifest.display().to_string(),
+                "--model-root".into(),
+                args.model_root.display().to_string(),
+                "--model-name".into(),
+                model_name.into(),
+                "--horizon".into(),
+                horizon.to_string(),
+                "--output".into(),
+                output.display().to_string(),
+            ],
+        )?;
+    }
+    let execution_date = next_execution_date(&args.exchange_calendar, &args.date)?;
     let prediction_file = day_dir.join("prediction.parquet");
-    run_command(
-        &predict_bin,
-        &[
-            "--features".into(),
-            factor_file.display().to_string(),
-            "--manifest".into(),
-            args.feature_manifest.display().to_string(),
-            "--model-root".into(),
-            args.model_root.display().to_string(),
-            "--output".into(),
-            prediction_file.display().to_string(),
-        ],
-    )?;
-    let previous = match (args.start_flat, args.previous_positions) {
+    let prediction_temp = prediction_file.with_extension("parquet.tmp");
+    conn.execute_batch(&format!(
+        "COPY (SELECT h1.trade_date,DATE '{execution_date}' execution_date,h1.ts_code,h1.raw_h1,h1.pred_h1,h5.raw_h5,h5.pred_h5 FROM read_parquet('{}') h1 JOIN read_parquet('{}') h5 USING(trade_date,ts_code) ORDER BY h1.ts_code) TO '{}' (FORMAT PARQUET,COMPRESSION ZSTD)",
+        quote(&h1_file), quote(&h5_file), quote(&prediction_temp)
+    ))?;
+    if prediction_file.exists() {
+        fs::remove_file(&prediction_file)?;
+    }
+    fs::rename(&prediction_temp, &prediction_file)?;
+    let prediction_rows = parquet_rows(&conn, &prediction_file)?;
+    if prediction_rows != factor_rows {
+        bail!("H1/H5 prediction join has {prediction_rows} rows, expected {factor_rows}")
+    }
+
+    let core_prediction = day_dir.join("prediction_csi500.parquet");
+    let core_temp = core_prediction.with_extension("parquet.tmp");
+    conn.execute_batch(&format!(
+        "COPY (SELECT p.* FROM read_parquet('{}') p JOIN index_monthly_constituents c ON c.ts_code=p.ts_code AND c.index_code='000905.SH' AND c.as_of_date=(SELECT max(c2.as_of_date) FROM index_monthly_constituents c2 WHERE c2.index_code=c.index_code AND c2.as_of_date<=p.trade_date) ORDER BY p.ts_code) TO '{}' (FORMAT PARQUET,COMPRESSION ZSTD)",
+        quote(&prediction_file), quote(&core_temp)
+    ))?;
+    if core_prediction.exists() {
+        fs::remove_file(&core_prediction)?;
+    }
+    fs::rename(&core_temp, &core_prediction)?;
+
+    let previous = match (args.start_flat, args.previous_production_dir) {
         (true, _) => None,
         (false, Some(x)) => Some(x),
         (false, None) => latest_previous(&args.output_root, &args.date)?,
     };
-    let position_file = day_dir.join("positions.parquet");
-    let mut position_args = vec![
-        "--predictions".into(),
-        prediction_file.display().to_string(),
-        "--catalog".into(),
-        catalog.display().to_string(),
-        "--output".into(),
-        position_file.display().to_string(),
-    ];
-    if let Some(path) = &previous {
-        position_args.extend(["--previous-positions".into(), path.display().to_string()]);
+    let sleeves = day_dir.join("sleeves");
+    let core_output = sleeves.join("core");
+    let alpha_output = sleeves.join("alpha");
+    for (name, predictions, output, cap) in [
+        ("core", &core_prediction, &core_output, "0.01"),
+        ("alpha", &prediction_file, &alpha_output, "0.05"),
+    ] {
+        let mut optimizer_args = vec![
+            "scripts/optimize_multiperiod_mu_turnover.py".into(),
+            "--predictions".into(),
+            predictions.display().to_string(),
+            "--output".into(),
+            output.display().to_string(),
+            "--max-weight".into(),
+            cap.into(),
+            "--term-structure".into(),
+            "h1h5".into(),
+            "--buy-bps".into(),
+            "2".into(),
+            "--sell-bps".into(),
+            "2".into(),
+        ];
+        if let Some(root) = &previous {
+            let prior = root.join(format!("sleeves/{name}/target_weights.parquet"));
+            if !prior.is_file() {
+                bail!("previous {name} sleeve is missing: {}", prior.display())
+            }
+            optimizer_args.extend(["--previous-positions".into(), prior.display().to_string()]);
+        }
+        run_command(&args.python_bin, &optimizer_args)?;
     }
-    run_command(&position_bin, &position_args)?;
-    let prediction_rows = parquet_rows(&conn, &prediction_file)?;
+    let blend_output = sleeves.join("blend");
+    run_command(
+        &args.python_bin,
+        &[
+            "scripts/blend_target_weights.py".into(),
+            "--target-weights".into(),
+            core_output
+                .join("target_weights.parquet")
+                .display()
+                .to_string(),
+            "--allocation".into(),
+            "0.8".into(),
+            "--target-weights".into(),
+            alpha_output
+                .join("target_weights.parquet")
+                .display()
+                .to_string(),
+            "--allocation".into(),
+            "0.2".into(),
+            "--output".into(),
+            blend_output.display().to_string(),
+        ],
+    )?;
+    let position_file = day_dir.join("positions.parquet");
+    fs::copy(blend_output.join("target_weights.parquet"), &position_file)?;
     let position_rows = parquet_rows(&conn, &position_file)?;
-    let prediction_manifest: Value =
-        serde_json::from_slice(&fs::read(prediction_file.with_extension("manifest.json"))?)?;
-    let selected_model = prediction_manifest["model"]
+    let h1_manifest: Value =
+        serde_json::from_slice(&fs::read(h1_file.with_extension("manifest.json"))?)?;
+    let h5_manifest: Value =
+        serde_json::from_slice(&fs::read(h5_file.with_extension("manifest.json"))?)?;
+    let selected_h1_model = h1_manifest["model"]
         .as_str()
-        .context("prediction manifest model missing")?
+        .context("H1 prediction manifest model missing")?
         .to_owned();
+    let selected_h5_model = h5_manifest["model"]
+        .as_str()
+        .context("H5 prediction manifest model missing")?
+        .to_owned();
+    let blend_summary: Value =
+        serde_json::from_slice(&fs::read(blend_output.join("optimizer_summary.json"))?)?;
+    fs::write(
+        day_dir.join("positions.manifest.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "engine": "h1h5-five-period-80-20-production-v1",
+            "signal_date": args.date,
+            "execution_date": execution_date,
+            "strategy_config": args.strategy_config,
+            "start_flat": args.start_flat,
+            "previous_production_dir": previous,
+            "core_sleeve": {"allocation": 0.8, "max_weight": 0.01},
+            "alpha_sleeve": {"allocation": 0.2, "max_weight": 0.05},
+            "blend": blend_summary,
+        }))?,
+    )?;
     let manifest = RunManifest {
         engine: "quant-production-rust-v1",
         status: "complete",
@@ -506,8 +646,11 @@ fn run(args: RunArgs) -> Result<()> {
         factors: factor_file.display().to_string(),
         prediction: prediction_file.display().to_string(),
         positions: position_file.display().to_string(),
-        selected_model,
-        previous_positions: previous.map(|x| x.display().to_string()),
+        selected_h1_model,
+        selected_h5_model,
+        strategy_config: args.strategy_config.display().to_string(),
+        previous_production_dir: previous.map(|x| x.display().to_string()),
+        start_flat: args.start_flat,
     };
     fs::write(
         day_dir.join("run_manifest.json"),
