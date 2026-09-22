@@ -53,6 +53,12 @@ struct RunArgs {
     strategy_config: PathBuf,
     #[arg(long, default_value = DEFAULT_CALENDAR)]
     exchange_calendar: PathBuf,
+    /// Account capital used to convert target weights into an indicative order CSV.
+    #[arg(long, default_value_t = 10_000_000.0)]
+    capital: f64,
+    /// Share-lot size used for indicative order rounding.
+    #[arg(long, default_value_t = 100)]
+    lot_size: u32,
     /// Directory containing quant-daily-factor, quant-minute-factor,
     /// quant-lgbm-predict-day, and quant-position-day. Defaults to this executable's directory.
     #[arg(long)]
@@ -88,6 +94,9 @@ struct RunManifest {
     factors: String,
     prediction: String,
     positions: String,
+    orders_csv: String,
+    capital: f64,
+    lot_size: u32,
     selected_h1_model: String,
     selected_h5_model: String,
     strategy_config: String,
@@ -379,6 +388,9 @@ fn run(args: RunArgs) -> Result<()> {
     if args.date.len() != 10 {
         bail!("--date must be YYYY-MM-DD")
     }
+    if !args.capital.is_finite() || args.capital <= 0.0 || args.lot_size == 0 {
+        bail!("require finite positive --capital and positive --lot-size")
+    }
     let catalog = args
         .catalog
         .canonicalize()
@@ -607,6 +619,19 @@ fn run(args: RunArgs) -> Result<()> {
     let position_file = day_dir.join("positions.parquet");
     fs::copy(blend_output.join("target_weights.parquet"), &position_file)?;
     let position_rows = parquet_rows(&conn, &position_file)?;
+    let orders_csv = day_dir.join("orders.csv");
+    let orders_temp = day_dir.join("orders.csv.tmp");
+    conn.execute_batch(&format!(
+        "COPY (SELECT p.trade_date signal_date,p.execution_date,p.ts_code,coalesce(i.name,p.ts_code) stock_name,cast(p.target_weight AS DECIMAL(12,8)) target_weight,cast(p.target_weight::DOUBLE*{capital} AS DECIMAL(18,2)) target_amount_cny,cast(m.close AS DECIMAL(18,4)) reference_close,cast(round((p.target_weight::DOUBLE*{capital}/m.close)/{lot_size})*{lot_size} AS BIGINT) estimated_shares,cast((round((p.target_weight::DOUBLE*{capital}/m.close)/{lot_size})*{lot_size})*m.close AS DECIMAL(18,2)) estimated_amount_cny,cast((round((p.target_weight::DOUBLE*{capital}/m.close)/{lot_size})*{lot_size})*m.close-p.target_weight::DOUBLE*{capital} AS DECIMAL(18,2)) amount_difference_cny FROM read_parquet('{positions}') p JOIN market_daily_aggregated m ON m.ts_code=p.ts_code AND m.trade_date=p.trade_date LEFT JOIN instruments i ON i.ts_code=p.ts_code ORDER BY p.target_weight DESC,p.ts_code) TO '{output}' (FORMAT CSV,HEADER TRUE)",
+        capital = args.capital,
+        lot_size = args.lot_size,
+        positions = quote(&position_file),
+        output = quote(&orders_temp),
+    ))?;
+    if orders_csv.exists() {
+        fs::remove_file(&orders_csv)?;
+    }
+    fs::rename(&orders_temp, &orders_csv)?;
     let h1_manifest: Value =
         serde_json::from_slice(&fs::read(h1_file.with_extension("manifest.json"))?)?;
     let h5_manifest: Value =
@@ -633,6 +658,9 @@ fn run(args: RunArgs) -> Result<()> {
             "core_sleeve": {"allocation": 0.8, "max_weight": 0.01},
             "alpha_sleeve": {"allocation": 0.2, "max_weight": 0.05},
             "blend": blend_summary,
+            "orders_csv": orders_csv,
+            "capital": args.capital,
+            "lot_size": args.lot_size,
         }))?,
     )?;
     let manifest = RunManifest {
@@ -646,6 +674,9 @@ fn run(args: RunArgs) -> Result<()> {
         factors: factor_file.display().to_string(),
         prediction: prediction_file.display().to_string(),
         positions: position_file.display().to_string(),
+        orders_csv: orders_csv.display().to_string(),
+        capital: args.capital,
+        lot_size: args.lot_size,
         selected_h1_model,
         selected_h5_model,
         strategy_config: args.strategy_config.display().to_string(),
